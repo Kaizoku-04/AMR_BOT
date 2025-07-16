@@ -1,0 +1,86 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="open_amr">
+
+    <xacro:property name="M_PI" value="3.1415926535897931" />
+
+     <!-- Define caster wheel parameters -->
+    <xacro:property name="caster_x" value="0.275" />
+    <xacro:property name="caster_y" value="0.215" />
+    <xacro:property name="caster_z" value="-0.05" />
+    <xacro:property name="caster_radius" value="0.05" />
+
+    <xacro:arg name="robot_name" default="open_amr"/>
+    <xacro:arg name="prefix" default=""/>
+    <xacro:arg name="use_gazebo" default="false"/>
+
+
+
+    <xacro:include filename="$(find open_amr_description)/urdf/mech/open_amr_base.urdf.xacro"/>
+    <xacro:include filename="$(find open_amr_description)/urdf/mech/diff_wheel.urdf.xacro"/>
+    <xacro:include filename="$(find open_amr_description)/urdf/sensors/rgbd_camera.urdf.xacro"/>
+    <xacro:include filename="$(find open_amr_description)/urdf/sensors/lidar.urdf.xacro"/>
+    <xacro:include filename="$(find open_amr_description)/urdf/sensors/imu.urdf.xacro"/>
+    <xacro:include filename="$(find open_amr_description)/urdf/mech/caster_wheel.urdf.xacro"/>
+
+    <xacro:open_amr_base prefix="$(arg prefix)"/>
+
+    <xacro:diff_wheel
+      prefix="$(arg prefix)"
+      side="right"
+      y_reflect="-1"/>
+
+    <xacro:diff_wheel
+      prefix="$(arg prefix)"
+      side="left"
+      y_reflect="1"/>
+
+    <!-- Add 4 caster wheels -->
+    <xacro:caster_wheel prefix="$(arg prefix)" parent="base_link" name="front_left"
+        xyz="${caster_x} ${caster_y} ${caster_z}" rpy="0 0 0" radius="${caster_radius}"/>
+    <xacro:caster_wheel prefix="$(arg prefix)" parent="base_link" name="front_right"
+        xyz="${caster_x} ${-caster_y} ${caster_z}" rpy="0 0 0" radius="${caster_radius}"/>
+    <xacro:caster_wheel prefix="$(arg prefix)" parent="base_link" name="rear_left"
+        xyz="${-caster_x} ${caster_y} ${caster_z}" rpy="0 0 0" radius="${caster_radius}"/>
+    <xacro:caster_wheel prefix="$(arg prefix)" parent="base_link" name="rear_right"
+        xyz="${-caster_x} ${-caster_y} ${caster_z}" rpy="0 0 0" radius="${caster_radius}"/>
+
+    <xacro:rgbd_camera
+      prefix="$(arg prefix)"
+      camera_name="cam_1"
+      xyz_offset="0.39 0.02 0.042"
+      rpy_offset="0 0 0"/>
+
+    <xacro:lidar_sensor
+      prefix="$(arg prefix)"
+      parent="base_link"
+      frame_id="laser_frame"
+      xyz_offset="0.320 0 0.12"
+      rpy_offset="0 0 0"
+      mesh_xyz_offset="-0.3 0 -0.22"
+      mesh_rpy_offset="${M_PI/2} 0 0"
+      topic_name="scan"/>
+
+    <xacro:imu_sensor
+      prefix="$(arg prefix)"
+      parent="base_link"
+      frame_id="imu"
+      xyz_offset="0 0 0.006"
+      rpy_offset="0 0 0"
+      update_rate="15.0"
+      topic_name="imu/data"/>
+
+    <xacro:include filename="$(find open_amr_description)/urdf/control/velocity_control_plugin.urdf.xacro" />
+    <xacro:load_velocity_control_plugin use_gazebo="$(arg use_gazebo)"/>
+
+    <xacro:include filename="$(find open_amr_description)/urdf/control/gazebo_sim_ros2_control.urdf.xacro" />
+    <xacro:load_gazebo_sim_ros2_control_plugin
+      robot_name="$(arg robot_name)"
+      use_gazebo="$(arg use_gazebo)"/>
+
+    <xacro:include filename="$(find open_amr_description)/urdf/control/open_amr_ros2_control.urdf.xacro" />
+    <xacro:open_amr_ros2_control
+      prefix="$(arg prefix)"
+      use_gazebo="$(arg use_gazebo)"/>
+
+
+</robot>

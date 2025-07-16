@@ -1,0 +1,55 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="caster_wheel" params="prefix parent name xyz rpy radius">
+    <xacro:property name="M_PI" value="3.1415926535897931"/>
+    <!-- Reduced mass and proper inertia calculation -->
+    <xacro:property name="mass" value="0.1"/>  <!-- Reduced from 4kg -->
+    <xacro:property name="I" value="${(2/5) * mass * radius*radius}"/>  <!-- Sphere inertia formula -->
+
+    <link name="${prefix}${name}_caster">
+      <visual>
+        <geometry>
+          <sphere radius="${radius}"/>
+        </geometry>
+      </visual>
+      <material name="blue">
+        <color rgba="0.2 0.2 1 1"/>
+      </material>
+      <collision>
+        <geometry>
+          <sphere radius="${radius}"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <mass value="${mass}"/>
+        <inertia ixx="${I}" ixy="0" ixz="0"
+                 iyy="${I}" iyz="0"
+                 izz="${I}"/>
+      </inertial>
+    </link>
+
+    <joint name="${prefix}${name}_caster_joint" type="fixed">
+      <parent link="${parent}"/>
+      <child link="${prefix}${name}_caster"/>
+      <origin xyz="${xyz}" rpy="${rpy}"/>
+    </joint>
+
+    <gazebo reference="${prefix}${name}_caster">
+      <surface>
+        <friction>
+          <ode>
+            <mu1>0.001</mu1>
+            <mu2>0.001</mu2>
+          </ode>
+        </friction>
+      </surface>
+      <visual>
+        <material>
+          <ambient>0.2 0.2 1 1</ambient>
+          <diffuse>0.2 0.2 1 1</diffuse>
+          <specular>0.2 0.2 1 1</specular>
+        </material>
+      </visual>
+    </gazebo>
+  </xacro:macro>
+</robot>
