@@ -44,12 +44,12 @@ def process_ros2_controllers_config(context):
     # Define both source and install paths
     src_config_path = os.path.join(
         home,
-        'ros2_ws/src/open_amr/open_amr_description/config',
+        'open_amr_ws/src/open_amr/open_amr_description/config',
         robot_name
     )
     install_config_path = os.path.join(
         home,
-        'ros2_ws/install/open_amr_description/share/open_amr_description/config',
+        'open_amr_ws/install/open_amr_description/share/open_amr_description/config',
         robot_name
     )
 

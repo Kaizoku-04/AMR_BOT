@@ -13,7 +13,7 @@
   <xacro:property name="centered_length" value="0.78" />
   
   <!-- Calculated properties -->
-  <xacro:property name="base_x_offset" value="${(centered_length - base_length) / 2}" />
+  <xacro:property name="base_x_offset" value="${(base_length - centered_length) / 2}" />
   <xacro:property name="chassis_height" value="${total_height - wheel_radius}" />
   <xacro:property name="base_mass" value="15" />
   
@@ -57,25 +57,25 @@
         <geometry>
           <box size="${base_length} ${(inner_width - 0.004) / 2} ${chassis_height - 0.002}"/>
         </geometry>
-        <origin xyz="${base_x_offset} 0 ${chassis_height/2 + wheel_radius + clearance -wheel_radius}" rpy="0 0 0"/>
+        <origin xyz="${base_x_offset} 0 ${chassis_height/2 + clearance}" rpy="0 0 0"/>
       </collision>
       
       <collision>
         <geometry>
           <box size="${base_length} ${(side_width - 0.002)/2} ${chassis_height / 4}"/>
         </geometry>
-        <origin xyz="${base_x_offset} ${(inner_width/2 + side_width/2) + (side_width - 0.002)/2} ${chassis_height/2 + wheel_radius + clearance + 0.001 - wheel_radius}" rpy="0 0 0"/>
+        <origin xyz="${base_x_offset} ${(inner_width/2 + side_width/2) + (side_width - 0.002)/2} ${chassis_height/2 + clearance + 0.001}" rpy="0 0 0"/>
       </collision>
       
       <collision>
         <geometry>
           <box size="${base_length} ${(side_width - 0.002)/2} ${chassis_height/4}"/>
         </geometry>
-        <origin xyz="${base_x_offset} ${-(inner_width/2 + side_width/2) - (side_width - 0.002)/2} ${chassis_height/2 + wheel_radius + clearance + 0.001 - wheel_radius}" rpy="0 0 0"/>
+        <origin xyz="${base_x_offset} ${-(inner_width/2 + side_width/2) - (side_width - 0.002)/2} ${chassis_height/2 + clearance + 0.001}" rpy="0 0 0"/>
       </collision>
 
       <inertial>
-        <origin xyz="${base_x_offset} 0 ${chassis_height/2 + wheel_radius + clearance + 0.001 - wheel_radius}" rpy="0 0 0"/>
+        <origin xyz="${base_x_offset} 0 ${chassis_height/2 + clearance + 0.001}" rpy="0 0 0"/>
         <mass value="${base_mass}"/>
         <inertia
           ixx="${(1/12) * base_mass * (inner_width*inner_width + chassis_height*chassis_height)}" 

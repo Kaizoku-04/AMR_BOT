@@ -38,7 +38,7 @@ ros2 launch open_amr_bringup open_amr_navigation.launch.py \
     pitch:=0.0 \
     yaw:=0.0 \
     "$SLAM_ARG" \
-    map:=/home/kaizoku/ros2_ws/src/open_amr/open_amr_navigation/maps/cafe_world_map.yaml &
+    map:=/home/kaizoku/ros2_lab/open_amr_ws/src/open_amr/open_amr_navigation/maps/cafe_world_map.yaml &
 
 echo "Waiting 25 seconds for simulation to initialize..."
 sleep 25
