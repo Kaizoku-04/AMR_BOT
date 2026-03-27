@@ -18,7 +18,7 @@ from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitut
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
-
+from ament_index_python.packages import get_package_share_directory
 
 def process_ros2_controllers_config(context):
     """Process the ROS 2 controller configuration yaml file before loading the URDF.
@@ -44,14 +44,14 @@ def process_ros2_controllers_config(context):
     # Define both source and install paths
     src_config_path = os.path.join(
         home,
-        'open_amr_ws/src/open_amr/open_amr_description/config',
+        'ros2_lab/open_amr_ws/src/open_amr/open_amr_description/config',
         robot_name
     )
     install_config_path = os.path.join(
         home,
-        'open_amr_ws/install/open_amr_description/share/open_amr_description/config',
+        'ros2_lab/open_amr_ws/install/open_amr_description/share/open_amr_description/config',
         robot_name
-    )
+    )   
 
     # Read from source template
     template_path = os.path.join(src_config_path, 'ros2_controllers_template.yaml')

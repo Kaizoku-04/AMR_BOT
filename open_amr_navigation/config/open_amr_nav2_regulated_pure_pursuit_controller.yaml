@@ -41,7 +41,7 @@ amcl:
 bt_navigator:
   ros__parameters:
     global_frame: map
-    robot_base_frame: base_link
+    robot_base_frame: base_footprint
     odom_topic: /odometry/filtered
     bt_loop_duration: 10
     default_server_timeout: 20
@@ -137,12 +137,12 @@ local_costmap:
       update_frequency: 5.0
       publish_frequency: 5.0
       global_frame: odom
-      robot_base_frame: base_link
+      robot_base_frame: base_footprint
       rolling_window: true
       width: 5
       height: 5
-      resolution: 0.05s
-      robot_radius: 0.291  # Based on half of the robot's width (300mm / 2 = 150mm)
+      resolution: 0.05
+      robot_radius: 0.291  # Based on half of the robot's width (0.582 / 2 = 0.291)
       plugins: ["obstacle_layer", "denoise_layer", "inflation_layer"]
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
@@ -198,7 +198,7 @@ global_costmap:
       update_frequency: 5.0
       publish_frequency: 5.0
       global_frame: map
-      robot_base_frame: base_link
+      robot_base_frame: base_footprint
       robot_radius: 0.291  # Robot width is 300mm
       resolution: 0.05
       track_unknown_space: true
@@ -292,7 +292,7 @@ behavior_server:
       plugin: "nav2_behaviors::AssistedTeleop"
     local_frame: odom
     global_frame: map
-    robot_base_frame: base_link
+    robot_base_frame: base_footprint
     transform_tolerance: 0.1
     simulate_ahead_time: 2.0
     max_rotational_vel: 0.50
@@ -364,7 +364,7 @@ docking_server:
     undock_linear_tolerance: 0.05
     undock_angular_tolerance: 0.1
     max_retries: 3
-    base_frame: "base_link"
+    base_frame: "base_footprint"
     fixed_frame: "odom"
     dock_backwards: true
     dock_prestaging_tolerance: 0.5
