@@ -1,0 +1,106 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- COMMON PROPERTIES -->
+  <xacro:property name="wheel_radius" value="0.1" />
+  <xacro:property name="wheel_width" value="0.05" />
+  <xacro:property name="wheel_separation" value="0.4" />
+  
+  <!-- CHASSIS PROPERTIES (Measure in Fusion 360) -->
+  <xacro:property name="total_width" value="0.582" />
+  <xacro:property name="total_height" value="0.304" />
+  <xacro:property name="base_length" value="0.806" />
+  <xacro:property name="centered_length" value="0.78" />
+  
+  <!-- Calculated properties -->
+  <xacro:property name="base_x_offset" value="${(base_length - centered_length) / 2}" />
+  <xacro:property name="chassis_height" value="${total_height - wheel_radius}" />
+  <xacro:property name="base_mass" value="15" />
+  
+  <!-- Collision geometry parameters -->
+  <xacro:property name="inner_width" value="${wheel_separation - wheel_width - 0.002}" />
+  <xacro:property name="side_width" value="${(total_width - inner_width)/2}" />
+  <xacro:property name="clearance" value="0.001" />
+
+  <!-- PROFESSIONAL MATERIAL DEFINITIONS -->
+
+  
+  <material name="carbon_fiber">
+    <color rgba="0.15 0.15 0.15 1.0"/>
+  </material>
+  
+  <material name="accents_blue">
+    <color rgba="0.0 0.4 0.75 1.0"/>
+  </material>
+  
+  <material name="rubber_black">
+    <color rgba="0.05 0.05 0.05 1.0"/>
+  </material>
+
+
+  <!-- BASE LINK MACRO -->
+  <xacro:macro name="open_amr_base" params="prefix">
+    <link name="${prefix}base_footprint"/>
+    <link name="${prefix}base_link">
+      <visual>
+        <geometry>
+          <mesh filename="file://$(find open_amr_description)/meshes/open_amr/visual/base_link.stl" scale="0.001 0.001 0.001"/>
+        </geometry>
+        <material name="brushed_aluminum">
+          <color rgba="0.85 0.85 0.88 1.0"/>
+        </material>
+        <origin xyz="0 0 ${-wheel_radius}" rpy="0 0 0"/>
+      </visual>
+      
+      <!-- Optimized collision geometry (3 boxes) -->
+      <collision>
+        <geometry>
+          <box size="${base_length} ${(inner_width - 0.004) / 2} ${chassis_height - 0.002}"/>
+        </geometry>
+        <origin xyz="${base_x_offset} 0 ${chassis_height/2 + clearance}" rpy="0 0 0"/>
+      </collision>
+      
+      <collision>
+        <geometry>
+          <box size="${base_length} ${(side_width - 0.002)/2} ${chassis_height / 4}"/>
+        </geometry>
+        <origin xyz="${base_x_offset} ${(inner_width/2 + side_width/2) + (side_width - 0.002)/2} ${chassis_height/2 + clearance + 0.001}" rpy="0 0 0"/>
+      </collision>
+      
+      <collision>
+        <geometry>
+          <box size="${base_length} ${(side_width - 0.002)/2} ${chassis_height/4}"/>
+        </geometry>
+        <origin xyz="${base_x_offset} ${-(inner_width/2 + side_width/2) - (side_width - 0.002)/2} ${chassis_height/2 + clearance + 0.001}" rpy="0 0 0"/>
+      </collision>
+
+      <inertial>
+        <origin xyz="${base_x_offset} 0 ${chassis_height/2 + clearance + 0.001}" rpy="0 0 0"/>
+        <mass value="${base_mass}"/>
+        <inertia
+          ixx="${(1/12) * base_mass * (inner_width*inner_width + chassis_height*chassis_height)}" 
+          ixy="0.0" ixz="0.0"
+          iyy="${(1/12) * base_mass * (base_length*base_length + chassis_height*chassis_height)}" 
+          iyz="0.0"
+          izz="${(1/12) * base_mass * (base_length*base_length + inner_width*inner_width)}"/>
+      </inertial>
+    </link>
+    
+    <gazebo reference="${prefix}base_link">
+      <visual>
+        <material>
+          <ambient>0.85 0.85 0.88 1.0</ambient>
+          <diffuse>0.85 0.85 0.88 1.0</diffuse>
+          <specular>0.85 0.85 0.88 1.0</specular>
+        </material>
+      </visual>
+    </gazebo>
+    
+    <joint name="${prefix}base_joint" type="fixed">
+      <parent link="${prefix}base_footprint"/>
+      <child link="${prefix}base_link"/>
+      <origin xyz="0 0 ${wheel_radius}" rpy="0 0 0"/>
+    </joint>
+  </xacro:macro>
+
+</robot>
