@@ -10,23 +10,26 @@ message with header information and pose data.
 :date: Mars 30, 2026
 """
 
-from rclpy.node import Node
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped, Pose, Point, Quaternion
 from std_msgs.msg import Header
 
 
-class PoseStampedGenerator(Node):
-    """A ROS 2 node that generates PoseStamped messages."""
+class PoseStampedGenerator:
+    """Helper that builds PoseStamped messages stamped with a given ROS clock.
 
-    def __init__(self, node_name='pose_stamped_generator'):
-        """
-        Initialize the ROS 2 node.
+    Not a Node: pass the clock of the node that uses it (e.g. ``node.get_clock()``),
+    so no extra node is created just to read the time.
+    """
 
-        :param node_name: Name of the node
-        :type node_name: str
+    def __init__(self, clock):
         """
-        super().__init__(node_name)
+        Initialize the generator.
+
+        :param clock: clock used to stamp the messages (sim time aware)
+        :type clock: rclpy.clock.Clock
+        """
+        self._clock = clock
 
     def create_pose_stamped(self, x=0.0, y=0.0, z=0.0,
                             qx=0.0, qy=0.0, qz=0.0, qw=1.0,
@@ -61,7 +64,7 @@ class PoseStampedGenerator(Node):
         header.frame_id = frame_id
 
         # Get current ROS time and convert to Time message
-        now = self.get_clock().now()
+        now = self._clock.now()
         header.stamp = Time(
             sec=now.seconds_nanoseconds()[0],
             nanosec=now.seconds_nanoseconds()[1]

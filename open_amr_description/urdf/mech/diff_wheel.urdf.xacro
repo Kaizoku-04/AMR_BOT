@@ -44,14 +44,9 @@
     </joint>
 
     <gazebo reference="${prefix}${side}_wheel_link">
-      <surface>
-        <friction>
-          <ode>
-              <mu>1.0</mu>
-              <mu2>0.0</mu2>
-          </ode>
-        </friction>
-      </surface>
+      <!-- <mu1>/<mu2> directly under <gazebo reference> (a <surface> block is dropped by the URDF->SDF parser) -->
+      <mu1>1.0</mu1>
+      <mu2>1.0</mu2>
       <visual>
           <material>
               <ambient>0.05 0.05 0.05 1.0</ambient>

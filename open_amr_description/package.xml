@@ -3,7 +3,7 @@
 <package format="3">
   <name>open_amr_description</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>URDF/xacro model of the OpenAMR differential-drive robot (meshes, LiDAR, RGBD camera, IMU, ros2_control), prefix-aware for multi-robot use.</description>
   <maintainer email="dodorapapah@gmail.com">kaizoku</maintainer>
   <license>BSD-3-Clause</license>
 

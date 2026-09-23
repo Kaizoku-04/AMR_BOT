@@ -14,50 +14,52 @@ date: Mars 30, 2026
 """
 
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess, RegisterEventHandler, TimerAction
+from launch.actions import DeclareLaunchArgument, RegisterEventHandler
 from launch.event_handlers import OnProcessExit
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
 
 
 def generate_launch_description():
     """Generate a launch description for sequentially starting robot controllers.
 
-    The function creates a launch sequence that ensures controllers are started
-    in the correct order.
+    The controller_manager `spawner` waits for the controller manager to come up
+    (instead of a fixed start-up delay), then the diff drive controller is started
+    once the joint state broadcaster is active.
 
     Returns:
         LaunchDescription: Launch description containing sequenced controller starts
     """
-    # Start diff drive controller
-    start_diff_drive_controller_cmd = ExecuteProcess(
-        cmd=['ros2', 'control', 'load_controller', '--set-state', 'active',
-             'diff_drive_controller'],
-        output='screen'
-    )
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    controller_manager = LaunchConfiguration('controller_manager')
+    timeout = LaunchConfiguration('controller_manager_timeout')
 
-    # Start joint state broadcaster
-    start_joint_state_broadcaster_cmd = ExecuteProcess(
-        cmd=['ros2', 'control', 'load_controller', '--set-state', 'active',
-             'joint_state_broadcaster'],
-        output='screen'
-    )
+    def spawner(controller):
+        return Node(
+            package='controller_manager',
+            executable='spawner',
+            arguments=[controller,
+                       '--controller-manager', controller_manager,
+                       '--controller-manager-timeout', timeout],
+            parameters=[{'use_sim_time': use_sim_time}],
+            output='screen')
 
-    # Add delay to joint state broadcaster (if necessary)
-    delayed_start = TimerAction(
-        period=25.0,
-        actions=[start_joint_state_broadcaster_cmd]
-    )
+    start_joint_state_broadcaster_cmd = spawner('joint_state_broadcaster')
+    start_diff_drive_controller_cmd = spawner('diff_drive_controller')
 
-    # Register event handler for sequencing
-    load_joint_state_broadcaster_cmd = RegisterEventHandler(
+    # Start the diff drive controller only after the joint state broadcaster is active
+    load_diff_drive_after_jsb_cmd = RegisterEventHandler(
         event_handler=OnProcessExit(
             target_action=start_joint_state_broadcaster_cmd,
             on_exit=[start_diff_drive_controller_cmd]))
 
-    # Create and populate the launch description
-    ld = LaunchDescription()
-
-    # Add the actions to the launch description in sequence
-    ld.add_action(delayed_start)
-    ld.add_action(load_joint_state_broadcaster_cmd)
-
-    return ld
+    return LaunchDescription([
+        DeclareLaunchArgument('use_sim_time', default_value='true',
+                              description='Use simulation clock if true'),
+        DeclareLaunchArgument('controller_manager', default_value='/controller_manager',
+                              description='Controller manager node (namespaced for multi-robot)'),
+        DeclareLaunchArgument('controller_manager_timeout', default_value='120',
+                              description='Seconds to wait for the controller manager'),
+        start_joint_state_broadcaster_cmd,
+        load_diff_drive_after_jsb_cmd,
+    ])

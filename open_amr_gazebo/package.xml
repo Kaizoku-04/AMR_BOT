@@ -3,7 +3,7 @@
 <package format="3">
   <name>open_amr_gazebo</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Gazebo Sim (Harmonic) worlds, models and ros_gz_bridge configuration for simulating OpenAMR.</description>
   <maintainer email="dodorapapah@gmail.com">kaizoku</maintainer>
   <license>BSD-3-Clause</license>
 

@@ -3,7 +3,7 @@
 <package format="3">
   <name>open_amr_docking</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>AprilTag-based autonomous docking for OpenAMR: dock pose publisher and Nav2 docking server configuration.</description>
   <maintainer email="dodorapapah@gmail.com">kaizoku</maintainer>
   <license>BSD-3-Clause</license>
 

@@ -10,9 +10,10 @@ author: Mohannad Rababah
 date: Mars 30, 2026
 """
 import os
-from pathlib import Path
+import re
+import tempfile
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetLaunchConfiguration
 from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -21,56 +22,40 @@ from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
 
 def process_ros2_controllers_config(context):
-    """Process the ROS 2 controller configuration yaml file before loading the URDF.
+    """Render the ros2_control config for this robot instance before loading the URDF.
 
-    This function reads a template configuration file, replaces placeholder values
-    with actual configuration, and writes the processed file to both source and
-    install directories.
+    Reads the installed template, substitutes the joint prefix and enable_odom_tf,
+    and writes the result to a per-robot runtime file (never into the source tree),
+    so several robots with different prefixes can be launched side by side.
 
     Args:
         context: Launch context containing configuration values
 
     Returns:
-        list: Empty list as required by OpaqueFunction
+        list: SetLaunchConfiguration pointing `controllers_file` at the rendered file
     """
-
-    # Get the configuration values
     prefix = LaunchConfiguration('prefix').perform(context)
     robot_name = LaunchConfiguration('robot_name').perform(context)
     enable_odom_tf = LaunchConfiguration('enable_odom_tf').perform(context)
 
-    home = str(Path.home())
-
-    # Define both source and install paths
-    src_config_path = os.path.join(
-        home,
-        'ros2_lab/open_amr_ws/src/open_amr/open_amr_description/config',
-        robot_name
-    )
-    install_config_path = os.path.join(
-        home,
-        'ros2_lab/open_amr_ws/install/open_amr_description/share/open_amr_description/config',
-        robot_name
-    )   
-
-    # Read from source template
-    template_path = os.path.join(src_config_path, 'ros2_controllers_template.yaml')
+    template_path = os.path.join(
+        get_package_share_directory('open_amr_description'),
+        'config', robot_name, 'ros2_controllers_template.yaml')
     with open(template_path, 'r', encoding='utf-8') as file:
         template_content = file.read()
 
-    # Create processed content (leaving template untouched)
     processed_content = template_content.replace('${prefix}', prefix)
-    processed_content = processed_content.replace(
-        'enable_odom_tf: true', f'enable_odom_tf: {enable_odom_tf}')
+    processed_content = re.sub(
+        r'enable_odom_tf:\s*\w+', f'enable_odom_tf: {enable_odom_tf}', processed_content)
 
-    # Write processed content to both source and install directories
-    for config_path in [src_config_path, install_config_path]:
-        os.makedirs(config_path, exist_ok=True)
-        output_path = os.path.join(config_path, 'ros2_controllers.yaml')
-        with open(output_path, 'w', encoding='utf-8') as file:
-            file.write(processed_content)
+    instance = robot_name + (f'_{prefix.strip("_/")}' if prefix else '')
+    output_dir = os.path.join(tempfile.gettempdir(), 'open_amr', instance)
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, 'ros2_controllers.yaml')
+    with open(output_path, 'w', encoding='utf-8') as file:
+        file.write(processed_content)
 
-    return []
+    return [SetLaunchConfiguration('controllers_file', output_path)]
 
 
 # Define the arguments for the XACRO file
@@ -157,7 +142,8 @@ def generate_launch_description():
         'xacro', ' ', urdf_model, ' ',
         'robot_name:=', LaunchConfiguration('robot_name'), ' ',
         'prefix:=', LaunchConfiguration('prefix'), ' ',
-        'use_gazebo:=', LaunchConfiguration('use_gazebo')
+        'use_gazebo:=', LaunchConfiguration('use_gazebo'), ' ',
+        'controllers_file:=', LaunchConfiguration('controllers_file')
     ]), value_type=str)
 
     # Subscribe to the joint states of the robot, and publish the 3D pose of each link.

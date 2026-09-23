@@ -1,10 +1,15 @@
 #!/bin/bash
 # Single script to launch the OpenAMR with Gazebo and ROS 2 Controllers
 
+# Stop only what this script started (the launch process group), instead of
+# pattern-killing every process whose command line contains "ros2" or "gz".
 cleanup() {
     echo "Cleaning up..."
-    sleep 5.0
-    pkill -9 -f "ros2|gazebo|gz|nav2|amcl|bt_navigator|nav_to_pose|rviz2|assisted_teleop|cmd_vel_relay|robot_state_publisher|joint_state_publisher|move_to_free|mqtt|autodock|cliff_detection|moveit|move_group|basic_navigator"
+    if [ -n "$LAUNCH_PID" ]; then
+        kill -INT -- "-$LAUNCH_PID" 2>/dev/null
+        sleep 5.0
+        kill -KILL -- "-$LAUNCH_PID" 2>/dev/null
+    fi
 }
 
 # Set up cleanup trap
@@ -14,7 +19,8 @@ trap 'cleanup' SIGINT SIGTERM
 # For house.world -> z:=0.05
 # To change Gazebo camera pose: gz service -s /gui/move_to/pose --reqtype gz.msgs.GUICamera --reptype gz.msgs.Boolean --timeout 2000 --req "pose: {position: {x: 0.0, y: -2.0, z: 2.0} orientation: {x: -0.2706, y: 0.2706, z: 0.6533, w: 0.6533}}"
 echo "Launching Gazebo simulation..."
-ros2 launch open_amr_gazebo open_amr.gazebo.launch.py \
+# setsid -> own process group, so cleanup can signal the whole launch tree
+setsid ros2 launch open_amr_gazebo open_amr.gazebo.launch.py \
     enable_odom_tf:=true \
     headless:=False \
     load_controllers:=true \
@@ -28,6 +34,7 @@ ros2 launch open_amr_gazebo open_amr.gazebo.launch.py \
     roll:=0.0 \
     pitch:=0.0 \
     yaw:=0.0 &
+LAUNCH_PID=$!
 
 echo "Waiting 25 seconds for simulation to initialize..."
 sleep 25

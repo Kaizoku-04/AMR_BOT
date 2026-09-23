@@ -70,6 +70,11 @@
                 <always_on>${always_on}</always_on>
                 <visualize>${visualize}</visualize>
                 <gz_frame_id>${prefix}${frame_id}_link</gz_frame_id>
+                <!-- Gaussian noise (typical MEMS IMU) so the EKF isn't fed a perfect sensor -->
+                <imu>
+                    <angular_velocity><x><noise type="gaussian"><mean>0.0</mean><stddev>0.0002</stddev></noise></x><y><noise type="gaussian"><mean>0.0</mean><stddev>0.0002</stddev></noise></y><z><noise type="gaussian"><mean>0.0</mean><stddev>0.0002</stddev></noise></z></angular_velocity>
+                    <linear_acceleration><x><noise type="gaussian"><mean>0.0</mean><stddev>0.017</stddev></noise></x><y><noise type="gaussian"><mean>0.0</mean><stddev>0.017</stddev></noise></y><z><noise type="gaussian"><mean>0.0</mean><stddev>0.017</stddev></noise></z></linear_acceleration>
+                </imu>
             </sensor>
         </gazebo>
     </xacro:macro>

@@ -29,13 +29,15 @@
   direction: GZ_TO_ROS
   lazy: false
 
-# Sending velocity commands from ROS 2 to Gazebo
-- ros_topic_name: "diff_drive_controller/cmd_vel"
-  gz_topic_name: "diff_drive_controller/cmd_vel"
-  ros_type_name: "geometry_msgs/msg/TwistStamped"
-  gz_type_name: "gz.msgs.Twist"
-  direction: ROS_TO_GZ
-  lazy: false
+# Velocity commands are consumed by ros2_control's diff_drive_controller directly (ROS topic).
+# Only re-enable this bridge together with xacro arg use_velocity_control_plugin:=true,
+# otherwise the robot is actuated twice (kinematic body twist + wheel joints).
+# - ros_topic_name: "diff_drive_controller/cmd_vel"
+#   gz_topic_name: "diff_drive_controller/cmd_vel"
+#   ros_type_name: "geometry_msgs/msg/TwistStamped"
+#   gz_type_name: "gz.msgs.Twist"
+#   direction: ROS_TO_GZ
+#   lazy: false
 
 # Clock configuration
 - ros_topic_name: "clock"

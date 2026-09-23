@@ -29,20 +29,17 @@
     </link>
 
     <joint name="${prefix}${name}_caster_joint" type="fixed">
-      <parent link="${parent}"/>
+      <parent link="${prefix}${parent}"/>
       <child link="${prefix}${name}_caster"/>
       <origin xyz="${xyz}" rpy="${rpy}"/>
     </joint>
 
     <gazebo reference="${prefix}${name}_caster">
-      <surface>
-        <friction>
-          <ode>
-            <mu>0.001</mu>
-            <mu2>0.001</mu2>
-          </ode>
-        </friction>
-      </surface>
+      <!-- URDF->SDF friction must be given as <mu1>/<mu2> directly under <gazebo reference>;
+           a <surface> block here is silently dropped (the caster then brakes with default mu=1).
+           Casters are fixed spheres, so they must be near-frictionless. -->
+      <mu1>0.001</mu1>
+      <mu2>0.001</mu2>
       <visual>
         <material>
           <ambient>0.2 0.2 1 1</ambient>

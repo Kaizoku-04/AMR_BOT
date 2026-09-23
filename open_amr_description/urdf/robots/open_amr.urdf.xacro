@@ -6,12 +6,19 @@
      <!-- Define caster wheel parameters -->
     <xacro:property name="caster_x" value="0.275" />
     <xacro:property name="caster_y" value="0.215" />
-    <xacro:property name="caster_z" value="-0.05" />
+    <!-- 2 mm caster clearance: with all 6 contacts exactly on the ground the base rests on the rigid
+         casters and the drive wheels get ~zero normal force (no traction). Lifting the casters
+         puts the weight on the wheels; the robot rocks <0.5 deg onto one caster pair. -->
+    <xacro:property name="caster_z" value="-0.048" />
     <xacro:property name="caster_radius" value="0.05" />
 
     <xacro:arg name="robot_name" default="open_amr"/>
     <xacro:arg name="prefix" default=""/>
     <xacro:arg name="use_gazebo" default="false"/>
+    <!-- Rendered by robot_state_publisher.launch.py per robot instance; default = checked-in un-prefixed config -->
+    <xacro:arg name="controllers_file" default="$(find open_amr_description)/config/open_amr/ros2_controllers.yaml"/>
+    <!-- Kinematic body-twist plugin. OFF by default: it double-actuates the robot together with ros2_control -->
+    <xacro:arg name="use_velocity_control_plugin" default="false"/>
 
 
 
@@ -66,15 +73,18 @@
       frame_id="imu"
       xyz_offset="0 0 0.006"
       rpy_offset="0 0 0"
-      update_rate="15.0"
+      update_rate="50.0"
       topic_name="imu/data"/>
 
     <xacro:include filename="$(find open_amr_description)/urdf/control/velocity_control_plugin.urdf.xacro" />
-    <xacro:load_velocity_control_plugin use_gazebo="$(arg use_gazebo)"/>
+    <xacro:if value="$(arg use_velocity_control_plugin)">
+      <xacro:load_velocity_control_plugin use_gazebo="$(arg use_gazebo)"/>
+    </xacro:if>
 
     <xacro:include filename="$(find open_amr_description)/urdf/control/gazebo_sim_ros2_control.urdf.xacro" />
     <xacro:load_gazebo_sim_ros2_control_plugin
       robot_name="$(arg robot_name)"
+      controllers_file="$(arg controllers_file)"
       use_gazebo="$(arg use_gazebo)"/>
 
     <xacro:include filename="$(find open_amr_description)/urdf/control/open_amr_ros2_control.urdf.xacro" />

@@ -45,7 +45,7 @@ class GoalPublisher(Node):
         self.get_logger().info('Goal Publisher node has been initialized')
 
         # Initialize the PoseStamped message generator
-        self.pose_generator = PoseStampedGenerator('pose_generator')
+        self.pose_generator = PoseStampedGenerator(self.get_clock())
 
         # Dictionary storing the x,y coordinates for each table
         self.locations = {

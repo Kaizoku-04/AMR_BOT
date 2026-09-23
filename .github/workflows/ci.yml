@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ws/src/open_amr
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          cd ws
+          rosdep update
+          rosdep install --from-paths src --ignore-src -r -y
+
+      - name: Build
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          cd ws
+          colcon build --symlink-install --event-handlers console_direct-
+
+      - name: Validate URDF (single robot and prefixed swarm robot)
+        run: |
+          source ws/install/setup.bash
+          XACRO=$(ros2 pkg prefix --share open_amr_description)/urdf/robots/open_amr.urdf.xacro
+          xacro "$XACRO" > /tmp/open_amr.urdf && check_urdf /tmp/open_amr.urdf
+          xacro "$XACRO" use_gazebo:=true prefix:=amr_1_ > /tmp/amr_1.urdf && check_urdf /tmp/amr_1.urdf
+
+      - name: Tests (lint is informational until the codebase is lint-clean)
+        continue-on-error: true
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          cd ws
+          colcon test --event-handlers console_direct-
+          colcon test-result --verbose

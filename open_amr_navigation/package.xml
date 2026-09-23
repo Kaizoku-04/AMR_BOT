@@ -3,7 +3,7 @@
 <package format="3">
   <name>open_amr_navigation</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>Nav2 configuration, maps and navigation helpers (goal navigation, assisted teleop, cmd_vel relay) for OpenAMR.</description>
   <maintainer email="dodorapapah@gmail.com">kaizoku</maintainer>
   <license>BSD-3-Clause</license>
 

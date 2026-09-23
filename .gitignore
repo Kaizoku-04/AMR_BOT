@@ -1,1 +1,6 @@
 open_amr_analysis.md
+.stignore
+.stfolder/
+.stversions/
+__pycache__/
+*.pyc

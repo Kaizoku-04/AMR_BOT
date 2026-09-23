@@ -8,11 +8,19 @@
  * commands.
  *
  * Subscription Topics:
- *     /cmd_vel (geometry_msgs/Twist): Raw velocity commands
+ *     cmd_vel (geometry_msgs/Twist): Raw velocity commands
  *
  * Publishing Topics:
- *     /diff_drive_controller/cmd_vel (geometry_msgs/TwistStamped):
+ *     diff_drive_controller/cmd_vel (geometry_msgs/TwistStamped):
  *     Timestamped velocity commands
+ *
+ * Parameters:
+ *     input_topic (string, default "cmd_vel")
+ *     output_topic (string, default "diff_drive_controller/cmd_vel")
+ *     frame_id (string, default "base_footprint"): must match the controller's base_frame_id
+ *
+ * Topic names are relative, so running the node in a namespace (e.g. /amr_3) relays
+ * /amr_3/cmd_vel -> /amr_3/diff_drive_controller/cmd_vel.
  *
  * @author Mohannad Rababah
  * @date Mars 30, 2026
@@ -20,6 +28,7 @@
 
 // Include necessary header files
 #include <memory>  // For smart pointers
+#include <string>
 #include "rclcpp/rclcpp.hpp"  // Main ROS2 C++ library
 #include "geometry_msgs/msg/twist.hpp"  // For Twist messages
 #include "geometry_msgs/msg/twist_stamped.hpp"  // For TwistStamped messages
@@ -39,19 +48,20 @@ public:
      * and sets up a publisher for the output topic.
      */
     CmdVelRelay() : Node("cmd_vel_relay") {
-        // Create subscription to /cmd_vel topic
+        const auto input_topic = this->declare_parameter<std::string>("input_topic", "cmd_vel");
+        const auto output_topic = this->declare_parameter<std::string>(
+            "output_topic", "diff_drive_controller/cmd_vel");
+        frame_id_ = this->declare_parameter<std::string>("frame_id", "base_footprint");
+
         // The '10' represents the queue size - how many messages to store if we can't process them fast enough
         subscription_ = this->create_subscription<geometry_msgs::msg::Twist>(
-            "/cmd_vel", 10,
+            input_topic, 10,
             std::bind(&CmdVelRelay::cmd_vel_callback, this, std::placeholders::_1));
 
-        // Create publisher for /diff_drive_controller/cmd_vel topic
-        // Again, '10' is the queue size for outgoing messages
-        publisher_ = this->create_publisher<geometry_msgs::msg::TwistStamped>(
-            "/diff_drive_controller/cmd_vel", 10);
+        publisher_ = this->create_publisher<geometry_msgs::msg::TwistStamped>(output_topic, 10);
 
-        // Log a message indicating the node has started
-        RCLCPP_INFO(this->get_logger(), "Velocity relay node started");
+        RCLCPP_INFO(this->get_logger(), "Velocity relay started: %s -> %s (frame '%s')",
+            subscription_->get_topic_name(), publisher_->get_topic_name(), frame_id_.c_str());
     }
 
 private:
@@ -71,7 +81,7 @@ private:
         // Set the timestamp to current time
         stamped_msg->header.stamp = this->now();
         // Set the frame ID (coordinate frame this velocity is expressed in)
-        stamped_msg->header.frame_id = "base_link";
+        stamped_msg->header.frame_id = frame_id_;
 
         // Copy the twist message content (linear and angular velocities)
         stamped_msg->twist = *msg;
@@ -84,6 +94,7 @@ private:
     // Declare class member variables for the subscriber and publisher
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr subscription_;
     rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr publisher_;
+    std::string frame_id_;
 };
 
 /**
