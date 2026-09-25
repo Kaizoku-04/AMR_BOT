@@ -28,7 +28,7 @@ from rclpy.time import Time
 import tf2_ros
 
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import Pose2D
+from geometry_msgs.msg import Pose2D, PoseStamped
 from nav2_msgs.action import ComputeRoute, FollowPath
 from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap, DynamicEdges
@@ -36,7 +36,8 @@ from nav_msgs.msg import Path
 from sensor_msgs.msg import BatteryState
 from open_amr_msgs.msg import Bid, Claim, RobotState, Task
 
-from .energy import ChargeParams, ChargerPeer, DrainEstimator, bid_penalty_s, can_take, pick_charger, task_need
+from .energy import (ChargeParams, ChargerPeer, DrainEstimator, bid_penalty_s, can_take, evictions, pick_charger,
+                     task_need, waiting_for_charger)
 from .lane_graph import LaneGraph
 from .traffic import Peer, TrafficParams, plan_reservations, wait_chain
 
@@ -60,21 +61,30 @@ class SwarmAgent(Node):
         dp = self.declare_parameter
         self.rid = dp('robot_id', 'amr_0').value
         self.graph = LaneGraph(dp('graph', '').value)
+        # chargers in service (default: every charger in the graph) and parking spots
         self.chargers = [self.graph.id(c) for c in dp('chargers', ['']).value if c] or self.graph.of_kind('charger')
+        self.parking = self.graph.of_kind('parking')
+        self.top_up_below = dp('top_up_below', 0.90).value   # a parked robot moves to a free charger below this
         self.speed = dp('nominal_speed', 0.5).value
         self.bid_window = dp('bid_window_s', 1.5).value
         self.station_dwell = dp('station_dwell_s', 8.0).value
         self.bin_dwell = dp('bin_dwell_s', 4.0).value
         self.peer_timeout = dp('peer_timeout_s', 3.0).value
+        # fleet roster (launch passes every robot id): don't act before hearing every peer (DDS discovery can take
+        # seconds, and a robot it can't hear is invisible to reservations and charger claims), warn when one goes quiet
+        self.fleet = [r for r in dp('fleet', ['']).value if r and r != self.rid]
+        self.sync_timeout = dp('sync_timeout_s', 60.0).value
+        self.synced, self.t_up, self.missing = not self.fleet, wallclock.monotonic(), None
         self.idle_home_delay = dp('idle_home_delay_s', 3.0).value
         self.idle_park_s = dp('idle_park_s', 20.0).value    # idle off a charger this long: park anyway (don't block a bay)
         # speed zones by lane type, % of the controller's max speed (1.0 m/s): full on streets, slower where
         # people/racks are close (aisles) and where precision matters (docks, queues, chargers)
         dock_pct = dp('zone_dock_pct', 35.0).value
         self.zones = {'street': dp('zone_street_pct', 100.0).value, 'aisle': dp('zone_aisle_pct', 50.0).value,
-                      'dock': dock_pct, 'charging': dock_pct, 'charger': dock_pct}
+                      'dock': dock_pct, 'charging': dock_pct, 'charger': dock_pct, 'parking': dock_pct, 'park': dock_pct}
         self.zone_lookahead = dp('zone_lookahead_m', 1.5).value
         self.arrive_tol = dp('arrive_tol_m', 0.3).value
+        self.arrive_tol_parking = dp('arrive_tol_parking_m', 0.5).value   # a parked robot needs no precision
         self.deadlock_s = dp('deadlock_after_s', 15.0).value
         self.blocked_reroute_s = dp('reroute_blocked_after_s', 60.0).value
         self.edges_client, self.last_reroute, self.reopen_edge = None, -1e9, None
@@ -173,6 +183,25 @@ class SwarmAgent(Node):
             self.must_charge = False
             self.get_logger().info(f'{self.rid}: battery {100 * self.battery:.0f} %: back to work')
 
+    def check_peers(self):
+        """Roster check. False while still waiting for the first contact with every peer (max sync_timeout_s)."""
+        if not self.fleet:
+            return True
+        t = wallclock.monotonic()
+        missing = [r for r in self.fleet if r not in self.peers or t - self.peers[r][1] >= self.peer_timeout]
+        if missing != self.missing:
+            if missing:
+                self.get_logger().warn(f'{self.rid}: can\'t hear {missing} '
+                                       f'({"waiting before acting" if not self.synced else "they are invisible to traffic control"})')
+            elif self.missing is not None:
+                self.get_logger().info(f'{self.rid}: hears all {len(self.fleet)} peers'
+                                       f'{f" after {t - self.t_up:.0f} s" if not self.synced else ""}')
+            self.missing = missing
+        if not self.synced and (not missing or t - self.t_up > self.sync_timeout):
+            self.synced = True
+            self.idle_since = self.now()
+        return self.synced
+
     def live_peers(self):
         t = wallclock.monotonic()
         return [Peer(s.robot_id, s.pose.x, s.pose.y, list(s.reserved_nodes), s.wait_s)
@@ -186,6 +215,9 @@ class SwarmAgent(Node):
             self.last_node = self.graph.nearest(*self.pose[:2])
             self.reserved = [self.last_node]
             self.idle_since = self.now()
+        if not self.check_peers():
+            self.publish_state()           # heartbeat only until every peer is heard
+            return
         self.auction()
         if self.phase == 'driving':
             self.drive()
@@ -349,10 +381,33 @@ class SwarmAgent(Node):
             return
         self.route = [n.nodeid for n in res.route.nodes]
         self.path = res.path
-        self.node_idx = self.index_nodes(self.route, res.path)
+        if self.route[0] != self.last_node and self.pose is not None:
+            self.prepend_lead_in(self.route[0])
+        self.node_idx = self.index_nodes(self.route, self.path)
         self.stop_at = self.stop_nodes(self.route)
         self.next_idx = 1 if self.route[0] == self.last_node else 0
         self.phase, self.follow_end, self.wait_s = 'driving', None, 0.0
+
+    def prepend_lead_in(self, n):
+        """The route starts at the node ahead (re-planned while driving): prepend a straight stretch from where the
+        robot is to that node, so the controller's path starts at the robot. Without it the first node counted as
+        reached at once, and a route that doubled back past the robot on the other lane pulled MPPI onto that stretch
+        (facing the wrong way: 'Failed to make progress' forever, 2026-09-25)."""
+        x0, y0, _ = self.pose
+        x1, y1 = self.graph.pos[n]
+        L = math.hypot(x1 - x0, y1 - y0)
+        if L < 0.1:
+            return
+        yaw = math.atan2(y1 - y0, x1 - x0)
+        tmpl = self.path.poses[0] if self.path.poses else None
+        lead = []
+        for i in range(int(L / 0.05)):
+            p = PoseStamped()
+            p.header = tmpl.header if tmpl is not None else self.path.header
+            p.pose.position.x, p.pose.position.y = x0 + (x1 - x0) * i * 0.05 / L, y0 + (y1 - y0) * i * 0.05 / L
+            p.pose.orientation.z, p.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+            lead.append(p)
+        self.path.poses = lead + list(self.path.poses)
 
     def stop_nodes(self, route):
         """Route indices where the controller's path must end so the robot stops and turns in place: sharp turns
@@ -363,6 +418,14 @@ class SwarmAgent(Node):
             a, b, c = route[k - 1], route[k], route[k + 1]
             turn = abs(math.remainder(self.graph.heading(b, c) - self.graph.heading(a, b), math.tau))
             if turn >= math.radians(80) and min(self.graph.dist(a, b), self.graph.dist(b, c)) < 1.5:
+                out.add(k)
+            # turning into a nose-in spur (charger / parking bay): stop on the lane, turn, drive straight in. Taking
+            # the smoothed corner put the robot into the 1.7 m spur at an angle; forward-only, it can't remove that
+            # offset in 1.7 m: 26 cm off a charger, 41 cm off a parking bay, final approach retried forever (2026-09-25)
+            # same for any final approach that starts with a sharp turn less than 2.5 m before the goal: the first bay
+            # of an aisle is 1.5 m past the turn off the street (0.32 m off at aisle_0_bay_0, 2026-09-25)
+            elif turn >= math.radians(60) and k == len(route) - 2 and (
+                    self.graph.kind.get(c) in ('charger', 'parking') or self.graph.dist(b, c) < 2.5):
                 out.add(k)
         return out
 
@@ -387,18 +450,15 @@ class SwarmAgent(Node):
         x, y, _ = self.pose
         # progress: the robot's nearest path index tells which nodes are behind it
         pts = self.path.poses
-        lo = self.node_idx[max(self.next_idx - 1, 0)]
+        lo = self.node_idx[self.next_idx - 1] if self.next_idx > 0 else 0   # node 0 may lie ahead (lead-in)
         hi = min(len(pts), self.node_idx[min(self.next_idx + 1, len(self.route) - 1)] + 1)
         ridx = min(range(lo, max(hi, lo + 1)), key=lambda j: math.hypot(pts[j].pose.position.x - x, pts[j].pose.position.y - y))
-        while self.next_idx < len(self.route) and (
-                ridx >= self.node_idx[self.next_idx] or
-                math.hypot(self.graph.pos[self.route[self.next_idx]][0] - x, self.graph.pos[self.route[self.next_idx]][1] - y) < 0.25 or
-                # the controller finished a segment ending here (hold point / turn stop): it stopped within tolerance
-                (self.follow_state == GoalStatus.STATUS_SUCCEEDED and self.follow_end == self.route[self.next_idx])):
+        while self.next_idx < len(self.route) and self.node_reached(self.next_idx, ridx, x, y):
             if self.next_idx == len(self.route) - 1 and not self.final_reached(x, y):
                 break   # the final node counts only when the controller reports arrival (or see final_reached)
             self.last_node = self.route[self.next_idx]
             self.next_idx += 1
+            self.leg_fail = 0          # controller failures count per node
         if self.next_idx >= len(self.route):
             if self.follow_state == GoalStatus.STATUS_EXECUTING:
                 self.stop_following()
@@ -431,8 +491,26 @@ class SwarmAgent(Node):
                 if self.leg_fail > 8:
                     self.status = RobotState.STUCK
                     self.get_logger().warn(f'{self.rid}: controller keeps failing near {self.graph.name[self.route[self.next_idx]]}')
-            self.send_path(ridx, self.node_idx[end_k], final and self.leg.precise)
+            # precise stop also where the robot turns in place right before a precise final approach: stopping
+            # 0.25 m past the turn node (loose checker, arriving at street speed) carried a 0.3 m sideways offset
+            # straight into the first bay of an aisle (2026-09-25)
+            pre_final = end_k == len(self.route) - 2 and end_k in self.stop_at
+            self.send_path(ridx, self.node_idx[end_k], (final or pre_final) and self.leg.precise)
             self.follow_end = end_node
+
+    def node_reached(self, k, ridx, x, y):
+        n = self.route[k]
+        if self.follow_state == GoalStatus.STATUS_SUCCEEDED and self.follow_end == n:
+            return True     # the controller finished a segment ending here (hold point / turn stop)
+        d = math.hypot(self.graph.pos[n][0] - x, self.graph.pos[n][1] - y)
+        if k in self.stop_at and k < len(self.route) - 1:
+            # a turn stop counts only once the robot has actually stopped there — passing within 0.25 m while still
+            # braking used to drop the stop, so the robot turned on the move (0.3 m off into aisle_0_bay_0)
+            # ... or, after the controller gave up on it 3 times, anyway: a turn stop only exists so the robot turns in
+            # place, never worth getting stuck on (0.36 m off park_5_access, facing away, retried forever, 2026-09-25)
+            return self.follow_end == n and self.follow_state == GoalStatus.STATUS_ABORTED and (
+                d < self.arrive_tol or self.leg_fail >= 3)
+        return ridx >= self.node_idx[k] or d < 0.25
 
     def final_reached(self, x, y):
         """Arrival at the leg's last node: the controller succeeded; or the precise final approach gave up while the
@@ -443,7 +521,8 @@ class SwarmAgent(Node):
             return True
         n = self.route[-1]
         d = math.hypot(self.graph.pos[n][0] - x, self.graph.pos[n][1] - y)
-        if self.follow_state == GoalStatus.STATUS_ABORTED and d < self.arrive_tol:
+        tol = self.arrive_tol_parking if n in self.parking else self.arrive_tol
+        if self.follow_state == GoalStatus.STATUS_ABORTED and d < tol:
             self.get_logger().info(f'{self.rid}: at {self.graph.name[n]} within {100 * d:.0f} cm (final approach gave up)')
             return True
         return self.bms and self.charging and n in self.chargers and d < 0.4
@@ -566,12 +645,20 @@ class SwarmAgent(Node):
         self.task, self.leg = None, None
         self.phase, self.status, self.idle_since = 'idle', RobotState.IDLE, self.now()
 
-    # ------------------------------------------------------------------ charging
-    def pick(self, start, current=None):
+    # ------------------------------------------------------------------ charging & parking
+    def robots_view(self, with_me=False):
         t = wallclock.monotonic()
-        peers = [ChargerPeer(s.robot_id, s.goal_node, list(s.reserved_nodes), s.battery)
-                 for s, rx in self.peers.values() if t - rx < self.peer_timeout]
-        return pick_charger(self.graph, start, self.chargers, self.rid, self.battery, peers, current, self.cp)
+        out = [ChargerPeer(m.robot_id, m.goal_node, list(m.reserved_nodes), m.battery, bool(m.task_id))
+               for m, rx in self.peers.values() if t - rx < self.peer_timeout]
+        if with_me:
+            out.append(ChargerPeer(self.rid, self.goal_node(), list(self.reserved), self.battery, self.task is not None))
+        return out
+
+    def pick(self, start, spots, current=None):
+        if spots is self.chargers and self.bms and not self.must_charge and \
+                waiting_for_charger(self.chargers, self.robots_view(), self.cp):
+            return None                       # a robot low on battery waits for a charger: it goes first
+        return pick_charger(self.graph, start, spots, self.rid, self.battery, self.robots_view(), current, self.cp)
 
     def set_charger(self, c):
         """Announce charger claims/releases on /swarm/claims (for observers; the heartbeat's goal_node is what
@@ -584,25 +671,50 @@ class SwarmAgent(Node):
                                              resource_id=self.graph.name[node], robot_id=self.rid, action=action))
         self.charger = c
 
-    def go_charge(self, c, redock=False):
-        self.set_charger(c)
-        st = RobotState.TO_CHARGE if self.must_charge else RobotState.IDLE
-        legs = [Leg(c, 0.0, st)]
+    def go_spot(self, c, why='', redock=False):
+        """Drive to a charger or a parking spot (no task)."""
+        is_charger = c in self.chargers
+        self.set_charger(c if is_charger else None)
+        st = RobotState.TO_CHARGE if self.must_charge and is_charger else RobotState.IDLE
+        legs = [Leg(c, 0.0, st, final_precise=is_charger)]
         if redock:     # contacts didn't close: back out to the dock's access node and drive in again
             access = next(a for a, succ in self.graph.succ.items() if c in succ)
             legs.insert(0, Leg(access, 0.0, st, final_precise=False))
-        self.get_logger().info(f'{self.rid}: {"re-docking at" if redock else "to"} {self.graph.name[c]} '
-                               f'(battery {100 * self.battery:.0f} %{", must charge" if self.must_charge else ""})')
+        verb = 're-docking at' if redock else 'to' if is_charger else 'parking at'
+        self.get_logger().info(f'{self.rid}: {verb} {self.graph.name[c]} (battery {100 * self.battery:.0f} %'
+                               f'{", must charge" if self.must_charge else ""}{", " + why if why else ""})')
         self.start_legs(legs, task=None)
 
+    def go_park(self, start, why):
+        spot = self.pick(start, self.parking)
+        if spot is None:
+            if not self.no_charger_logged:
+                self.get_logger().warn(f'{self.rid}: no free charger or parking spot ({why})')
+                self.no_charger_logged = True
+            return False
+        self.no_charger_logged = False
+        self.go_spot(spot, why)
+        return True
+
+    def must_give_way(self):
+        """Idle on (or heading for) a charger, charged >= resume, and a robot below `low` has none: the fullest
+        such robots leave for parking (energy.evictions — every robot computes the same set)."""
+        if not self.bms or self.must_charge or self.battery < self.cp.resume or not self.parking:
+            return False
+        return self.rid in evictions(self.chargers, self.robots_view(with_me=True), self.cp)
+
     def idle_energy(self):
-        """Idle: park on a free charger (top up; still available for work), or go charge because the battery
-        is low. On a charger: make sure the contacts actually closed."""
+        """Idle: top up on a free charger (still available for work), go charge because the battery is low, or wait
+        on a parking spot when no charger is free. On a charger: make sure the contacts actually closed; give way
+        to a waiting low robot once charged enough."""
         if self.task is not None:
             return
         now = self.now()
         if self.last_node in self.chargers:
             self.set_charger(self.last_node)
+            if self.must_give_way():
+                self.go_park(self.last_node, 'giving the charger to a robot low on battery')
+                return
             if not self.bms or self.charging:
                 self.dock_check_at, self.redocks = None, 0
             elif self.dock_check_at is None:
@@ -611,7 +723,15 @@ class SwarmAgent(Node):
                 self.get_logger().warn(f'{self.rid}: on {self.graph.name[self.last_node]} but not charging')
                 self.redocks += 1
                 self.dock_check_at = None
-                self.go_charge(self.last_node, redock=True)
+                self.go_spot(self.last_node, redock=True)
+            return
+        self.set_charger(None)
+        if self.last_node in self.parking:
+            # parked: move to a charger as soon as one is free, if charging would help
+            if self.bms and (self.must_charge or self.battery < self.top_up_below):
+                c = self.pick(self.last_node, self.chargers)
+                if c is not None:
+                    self.go_spot(c, 'a charger came free')
             return
         pending = self.pending_tasks()
         idle_for = now - self.idle_since
@@ -619,13 +739,12 @@ class SwarmAgent(Node):
                 (idle_for > self.idle_home_delay and
                  (not pending or (self.bms and not any(can_take(self.battery, self.task_need(t), self.cp) for t in pending))))):
             return
-        c = self.pick(self.last_node)
-        if c is None:
-            if not self.no_charger_logged:
-                self.get_logger().warn(f'{self.rid}: no free charger'); self.no_charger_logged = True
-            return
-        self.no_charger_logged = False
-        self.go_charge(c)
+        c = self.pick(self.last_node, self.chargers)
+        if c is not None:
+            self.no_charger_logged = False
+            self.go_spot(c)
+        else:
+            self.go_park(self.last_node, 'no free charger')
 
     def energy_status(self):
         if not self.bms:
@@ -635,20 +754,32 @@ class SwarmAgent(Node):
             self.stop_following(); self.phase, self.status = 'empty', RobotState.STUCK
             return
         leg = self.leg
-        to_charger = self.task is None and leg is not None and leg.target in self.chargers and \
-            self.phase in ('routing', 'driving')
-        if to_charger:
+        to_spot = self.task is None and leg is not None and self.phase in ('routing', 'driving') and not self.legs
+        if to_spot and leg.target in self.chargers:
             leg.drive_status = RobotState.TO_CHARGE if self.must_charge else RobotState.IDLE
             if self.status in (RobotState.IDLE, RobotState.TO_CHARGE):
                 self.status = leg.drive_status
-            if self.phase == 'driving' and not self.legs:
-                c = self.pick(self.start_node(), current=leg.target)
-                if c is not None and c != leg.target:     # lost a same-instant race for it
-                    self.go_charge(c)
+            if self.phase == 'driving':
+                if self.must_give_way():
+                    self.go_park(self.start_node(), 'giving the charger to a robot low on battery')
+                    return
+                c = self.pick(self.start_node(), self.chargers, current=leg.target)
+                if c is None:                             # lost a same-instant race and nothing else is free
+                    self.go_park(self.start_node(), 'lost the charger')
+                elif c != leg.target:
+                    self.go_spot(c, 'lost the race for the other one')
+        elif to_spot and leg.target in self.parking and self.phase == 'driving':
+            spot = self.pick(self.start_node(), self.parking, current=leg.target)
+            if spot is not None and spot != leg.target:
+                self.go_spot(spot, 'lost the race for the other one')
         elif self.phase == 'idle' and self.task is None:
             self.status = RobotState.CHARGING if self.charging and self.battery < 0.999 else RobotState.IDLE
 
     # ------------------------------------------------------------------ heartbeat
+    def goal_node(self):
+        moving = self.leg is not None and self.phase in ('routing', 'driving', 'rerouting')
+        return self.leg.target if moving else self.legs[0].target if self.legs else self.last_node
+
     def publish_state(self):
         m = RobotState()
         m.stamp = self.get_clock().now().to_msg()
@@ -661,8 +792,7 @@ class SwarmAgent(Node):
         m.route = [int(n) for n in self.route[self.next_idx:]] if self.phase == 'driving' else []
         m.reserved_nodes = [int(n) for n in self.reserved]
         m.wait_s = float(self.wait_s)
-        moving = self.leg is not None and self.phase in ('routing', 'driving', 'rerouting')
-        m.goal_node = int(self.leg.target if moving else self.legs[0].target if self.legs else self.last_node)
+        m.goal_node = int(self.goal_node())
         self.pub_state.publish(m)
 
 

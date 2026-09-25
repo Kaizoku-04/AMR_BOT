@@ -13,7 +13,8 @@ Rules, identical on every robot so both sides of a conflict reach the same decis
   3. Deadlocks (a cycle of robots each waiting for the next) are broken by the highest robot id in the cycle,
      which re-routes around its blocked lane (see wait_chain and the agent).
   4. Look-ahead: hold nodes along the route until `horizon_m` of path is reserved (or `max_nodes`), so the
-     controller cruises instead of stopping at every node; release a node once `release_dist` past it.
+     controller cruises instead of stopping at every node, but never a node beyond horizon + `overreach_m` unless
+     it is the very next one; release a node once `release_dist` past it.
 """
 import math
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ class TrafficParams:
     max_nodes: int = 5
     commit_dist: float = 1.0      # inside this a robot can't stop before the node any more
     release_dist: float = 1.0     # drop a passed node once this far beyond it
+    overreach_m: float = 2.0      # never hold a node further than horizon + this, except the very next one
     occupy_dist: float = 0.9      # a robot standing this close to a node blocks it even without a reservation
     age_bucket_s: float = 10.0
 
@@ -72,6 +74,8 @@ def plan_reservations(graph, route, next_idx, me, peers, held, p: TrafficParams 
         n = route[k]
         dist_ahead += d_to(n) if prev is None else graph.dist(prev, n)
         prev = n
+        if dist_ahead > p.horizon_m + p.overreach_m and any(m not in route[:next_idx] for m in reserved):
+            break      # a stuck robot 6.6 m short of a node held it and blocked the parking exit (2026-09-25)
         holders = [q for q in peers if n in q.reserved]
         # physical presence only counts for peers that hold no reservations (not cooperating / not an agent):
         # an agent's body is always covered by its own held nodes, and at compact junctions (lanes 1.1 m apart)

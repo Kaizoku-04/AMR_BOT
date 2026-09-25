@@ -32,7 +32,8 @@ class BatterySim(Node):
         self.tol = dp('contact_tol_m', 0.3).value
         # charger pose + the heading a robot has when it's in the dock (along its incoming lane)
         self.docks = []
-        for c in graph.of_kind('charger'):
+        in_service = [c for c in dp('chargers', ['']).value if c]      # default: every charger in the graph
+        for c in ([graph.id(n) for n in in_service] or graph.of_kind('charger')):
             inc = [a for a, succ in graph.succ.items() if c in succ]
             self.docks.append((graph.pos[c], graph.heading(inc[0], c) if inc else None))
         self.v = self.w = 0.0

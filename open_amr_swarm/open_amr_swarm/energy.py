@@ -18,6 +18,11 @@ Charging policy (every agent runs the same rules; no charging coordinator):
   - Chargers are claimed through the heartbeat (`goal_node`): a charger is free if no live peer stands on it
     (holds it) or heads for it. Two robots picking the same one in the same instant: the one below `low`
     keeps it, else the lower id — every robot computes the same answer.
+  - Fewer chargers than robots (or one out of service): an idle robot with no free charger waits on a parking
+    spot (claimed the same way), never in a bay or a lane. While a robot below `low` waits for a charger, robots
+    that only want to top up don't take one (a charger given up for the low robot went to a 52 % one, 2026-09-25). A robot below `low` with no free charger makes the
+    idle, already-charged (>= `resume`) robots on chargers give way: the fullest ones leave for parking, as many
+    as there are such waiting robots (`evictions`) — again a rule every robot evaluates identically.
 """
 import math
 from dataclasses import dataclass
@@ -93,11 +98,13 @@ class ChargerPeer:
     goal_node: int
     reserved: list
     battery: float
+    busy: bool = False           # has a task
 
 
 def pick_charger(graph, start, chargers, me_id, me_battery, peers, current=None, p: ChargeParams = ChargeParams()):
-    """Nearest free charger from `start` (lane-graph length), or None if all are taken. `current`: the charger I
-    already head for — kept unless a peer that outranks me heads for it too (race within one heartbeat)."""
+    """Nearest free spot among `chargers` (any claimable spots: chargers or parking) from `start` (lane-graph
+    length), or None if all are taken. `current`: the spot I already head for — kept unless a peer that outranks me
+    heads for it too (race within one heartbeat)."""
     rank = lambda rid, soc: (0 if soc < p.low else 1, rid)
     mine = rank(me_id, me_battery)
     free = []
@@ -134,3 +141,29 @@ class DrainEstimator:
             if r > 0:
                 self.rate = 0.6 * self.rate + 0.4 * r
             self.t0, self.soc0 = t, soc
+
+
+def free_count(spots, peers):
+    return sum(1 for c in spots if not any(c in q.reserved or q.goal_node == c for q in peers))
+
+
+def waiting_for_charger(chargers, robots, p: ChargeParams = ChargeParams()):
+    """Robots below `low`, idle, without a charger (heading for one counts as having one)."""
+    return [r for r in robots if r.battery < p.low and not r.busy and r.goal_node not in chargers]
+
+
+def evictions(chargers, robots, p: ChargeParams = ChargeParams()):
+    """Robot ids that must leave their charger for parking. `robots`: every live robot as the caller sees it,
+    itself included. Waiting = below `low`, idle, not heading for a charger. Candidates = idle, on (or heading for) a
+    charger, charged to >= `resume`. As many candidates leave as there are waiting robots beyond the free chargers:
+    fullest first (5 % buckets, so robots reading heartbeats a moment apart still agree), then higher id first."""
+    waiting = waiting_for_charger(chargers, robots, p)
+    # a charger counts as free once no robot has it as its goal — including one still pulling out (else a second
+    # robot would be evicted while the first one clears the dock)
+    k = len(waiting) - sum(1 for c in chargers if not any(r.goal_node == c for r in robots))
+    if k <= 0:
+        return set()
+    cands = [r for r in robots if not r.busy and r.goal_node in chargers and r.battery >= p.resume]
+    cands.sort(key=lambda r: r.robot_id, reverse=True)      # stable sorts: higher id first within a bucket
+    cands.sort(key=lambda r: -int(r.battery * 20))
+    return {r.robot_id for r in cands[:k]}

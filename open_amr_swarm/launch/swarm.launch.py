@@ -7,6 +7,8 @@ and the lane graph from OpenAMR sim/scripts/generate_route_graph.py; files are f
 battery:=true adds a simulated BMS per robot (battery_sim -> /amr_i/battery_state); battery_time_scale compresses
 battery time for demos (20 = an 8 h shift in 24 min); battery_start = comma-separated start charges, default a
 spread 90 % .. 40 % (a fleet mid-shift, so robots don't all need a charger at once).
+chargers:=charge_0,charge_1,charge_2 puts only those chargers in service (the rest are dead docks): fleets with
+fewer chargers than robots park idle robots on the parking row and hand chargers to robots low on battery.
 """
 import os
 
@@ -26,9 +28,11 @@ def spawn(context):
     start = [float(v) for v in lc('battery_start').split(',') if v.strip()] or \
         [round(0.9 - 0.5 * i / max(n - 1, 1), 2) for i in range(n)]
     tf = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
+    chargers = [c.strip() for c in lc('chargers').split(',') if c.strip()] or ['']
     actions = [Node(package='open_amr_swarm', executable='swarm_agent', namespace=f'amr_{i}', name='swarm_agent',
                     output='screen',
                     parameters=[{'robot_id': f'amr_{i}', 'graph': graph, 'drain_prior_per_h': 0.15 * scale,
+                                 'chargers': chargers, 'fleet': [f'amr_{k}' for k in range(n)],
                                  'use_sim_time': True}],
                     remappings=tf)
                for i in range(n)]
@@ -36,7 +40,7 @@ def spawn(context):
         actions += [Node(package='open_amr_swarm', executable='battery_sim', namespace=f'amr_{i}', name='battery_sim',
                          output='screen',
                          parameters=[{'graph': graph, 'time_scale': scale, 'initial_soc': start[i % len(start)],
-                                      'use_sim_time': True}],
+                                      'chargers': chargers, 'use_sim_time': True}],
                          remappings=tf)
                     for i in range(n)]
     if lc('mode') != 'none':
@@ -58,6 +62,7 @@ def generate_launch_description():
         DeclareLaunchArgument('battery', default_value='true', description='simulated BMS per robot'),
         DeclareLaunchArgument('battery_time_scale', default_value='1.0'),
         DeclareLaunchArgument('battery_start', default_value='', description='e.g. 0.9,0.5,...; default spread 90..40 %'),
+        DeclareLaunchArgument('chargers', default_value='', description='chargers in service, e.g. charge_0,charge_1; default all'),
         DeclareLaunchArgument('graph', default_value=''),
         DeclareLaunchArgument('graph_nodes', default_value=''),
         OpaqueFunction(function=spawn),

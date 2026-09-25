@@ -32,7 +32,7 @@ def test_nodes_construct(graph_files, tmp_path):
         a, m, b = SwarmAgent(), MissionGenerator(), BatterySim()
         assert len(b.docks) == 1 and b.docks[0][1] is not None
         assert a.graph.edge_kind[(0, 1)] == 'street' and a.zones['charger'] == 35.0
-        assert a.chargers == [0] and not a.bms
+        assert a.chargers == [0] and a.parking == [] and not a.bms
         assert len(m.bays) == 1
         a.destroy_node(); m.destroy_node(); b.destroy_node()
     finally:

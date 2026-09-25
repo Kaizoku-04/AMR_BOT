@@ -4,7 +4,8 @@ import math
 
 import pytest
 
-from open_amr_swarm.energy import (BatteryParams, ChargeParams, ChargerPeer, DrainEstimator, bid_penalty_s,
+from open_amr_swarm.energy import (BatteryParams, ChargeParams, ChargerPeer, DrainEstimator, bid_penalty_s, evictions,
+                                   waiting_for_charger,
                                    can_take, pick_charger, step_soc, task_need)
 from open_amr_swarm.lane_graph import LaneGraph
 
@@ -117,3 +118,48 @@ def test_drain_estimator_learns_while_working():
     r = d.rate
     d.update(400.0, 0.2, working=False); d.update(500.0, 0.9, working=True)   # charging gaps don't count
     assert d.rate == r
+
+
+def test_parking_spot_is_picked_like_a_charger(bank):
+    # the same claim rules serve parking spots: nearest free, standing robots and heading robots excluded
+    taken = [ChargerPeer('amr_1', 10, [10], 0.9), ChargerPeer('amr_2', 11, [1], 0.9)]
+    assert pick_charger(bank, 0, CH, 'amr_0', 0.9, taken) == 12
+
+
+def test_evictions_fullest_idle_leaves_for_a_waiting_low_robot():
+    cp = ChargeParams()
+    on = lambda rid, c, soc, busy=False: ChargerPeer(rid, c, [c], soc, busy)
+    robots = [on('amr_0', 10, 0.95), on('amr_1', 11, 0.70), on('amr_2', 12, 0.50),      # all chargers taken
+              ChargerPeer('amr_3', 20, [20], 0.25)]                                      # low, parked, waiting
+    assert evictions(CH, robots, cp) == {'amr_0'}
+    robots.append(ChargerPeer('amr_4', 21, [21], 0.20))                                  # a second waiting robot
+    assert evictions(CH, robots, cp) == {'amr_0', 'amr_1'}                               # amr_2 < 60 %: stays
+    robots.append(ChargerPeer('amr_5', 22, [22], 0.10))
+    assert evictions(CH, robots, cp) == {'amr_0', 'amr_1'}                               # nobody else eligible
+
+
+def test_evictions_none_when_a_charger_is_free_or_being_vacated():
+    cp = ChargeParams()
+    robots = [ChargerPeer('amr_0', 10, [10], 0.95), ChargerPeer('amr_1', 11, [11], 0.9),
+              ChargerPeer('amr_3', 20, [20], 0.25)]
+    assert evictions(CH, robots, cp) == set()                                            # charger 12 free
+    robots.append(ChargerPeer('amr_2', 30, [12], 0.9))                                   # pulling out of 12
+    assert evictions(CH, robots, cp) == set()
+    robots.append(ChargerPeer('amr_4', 12, [2], 0.9))                                    # someone heads for 12
+    assert evictions(CH, robots, cp) == {'amr_0'}
+
+
+def test_evictions_tie_goes_to_higher_id_and_busy_robots_are_exempt():
+    cp = ChargeParams()
+    robots = [ChargerPeer('amr_0', 10, [10], 0.91), ChargerPeer('amr_1', 11, [11], 0.93),
+              ChargerPeer('amr_2', 12, [12], 0.99, busy=True), ChargerPeer('amr_3', 20, [20], 0.2)]
+    assert evictions(CH, robots, cp) == {'amr_1'}                                        # same 5 % bucket
+
+
+def test_waiting_for_charger_only_counts_idle_low_robots_without_one():
+    cp = ChargeParams()
+    robots = [ChargerPeer('amr_0', 20, [20], 0.25),                 # low, parked: waiting
+              ChargerPeer('amr_1', 10, [1], 0.20),                  # low, heading for a charger: not waiting
+              ChargerPeer('amr_2', 21, [21], 0.25, busy=True),      # low but finishing a task
+              ChargerPeer('amr_3', 22, [22], 0.52)]                 # not low
+    assert [r.robot_id for r in waiting_for_charger(CH, robots, cp)] == ['amr_0']

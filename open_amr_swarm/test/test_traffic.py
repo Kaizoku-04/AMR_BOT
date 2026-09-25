@@ -90,3 +90,18 @@ def test_wait_chain_finds_cycle():
     assert chain == ['amr_1', 'amr_2'] and cycle == []
     chain, cycle = wait_chain('amr_0', {'amr_0': 'amr_1', 'amr_1': 'amr_2', 'amr_2': 'amr_1'})
     assert cycle == ['amr_1', 'amr_2']               # I'm behind a cycle, not in it
+
+
+def test_no_far_node_beyond_horizon_plus_overreach(tmp_path):
+    """A node 6.6 m ahead isn't held while a nearer one is (a stuck robot must not block a merge far away)."""
+    feats = [{'type': 'Feature', 'properties': {'id': i, 'metadata': {'name': f'n{i}'}},
+              'geometry': {'type': 'Point', 'coordinates': [x, 0.0]}} for i, x in enumerate([0.0, 0.5, 7.1])]
+    feats += [{'type': 'Feature', 'properties': {'id': 100 + i, 'startid': i, 'endid': i + 1},
+               'geometry': {'type': 'MultiLineString', 'coordinates': [[[0, 0], [1, 0]]]}} for i in range(2)]
+    p = tmp_path / 'far.geojson'
+    p.write_text(json.dumps({'features': feats}))
+    g = LaneGraph(str(p))
+    res, blocked = plan_reservations(g, [0, 1, 2], 1, Peer('amr_0', 0.0, 0.0), [], held=[], p=P)
+    assert res == [0, 1] and not blocked
+    res, _ = plan_reservations(g, [0, 1, 2], 2, Peer('amr_0', 0.6, 0.0), [], held=[], p=P)
+    assert 2 in res                                  # once it's the very next node it is held, however far
