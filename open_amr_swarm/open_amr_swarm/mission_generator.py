@@ -7,9 +7,10 @@ Offers tasks on /swarm/tasks and learns the outcome from /swarm/claims; the swar
   mode=goto_random  plain GOTO tasks to random aisle bays: a traffic stress test.
 Unclaimed tasks are re-offered (round + 1) until someone takes them.
 
-Metrics (logged every `report_s` and at the end; per-task CSV in `out_dir`): tasks done and per hour by type,
-mean/max latency (offer -> done), robot time shares (driving / yielding / at station / idle), closest approach
-between two robots, longest continuous yield (deadlock watch).
+Metrics (logged every `report_s` and at the end; per-task CSV and a 10 s battery timeline in `out_dir`): tasks
+done and per hour by type, mean/max latency (offer -> done), robot time shares (driving / yielding / at station /
+charging / idle), closest approach between two robots, longest continuous yield (deadlock watch), energy: lowest
+state of charge any robot reached, charge sessions, robots that ran empty.
 """
 import csv
 import itertools
@@ -20,7 +21,6 @@ import random
 import rclpy
 import rclpy.executors
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 import yaml
 from open_amr_msgs.msg import Claim, RobotState, Task
@@ -51,11 +51,16 @@ class MissionGenerator(Node):
         self.tasks, self.meta, self.seq = {}, {}, 0
         self.robots, self.shares, self.yield_run, self.max_yield = {}, {}, {}, (0.0, '')
         self.closest = (1e9, '')
+        self.min_soc, self.sessions, self.empty = (1.0, ''), 0, set()
         self.t0 = None
         os.makedirs(self.out_dir, exist_ok=True)
         self.csv = open(os.path.join(self.out_dir, 'tasks.csv'), 'w', newline='')
         self.writer = csv.writer(self.csv)
         self.writer.writerow(['task_id', 'type', 'origin', 'dest', 'offered_s', 'claimed_s', 'done_s', 'robot', 'rounds'])
+        self.soc_csv = open(os.path.join(self.out_dir, 'battery.csv'), 'w', newline='')
+        self.soc_writer = csv.writer(self.soc_csv)
+        self.soc_writer.writerow(['t_s', 'robot', 'soc', 'status'])
+        self.create_timer(10.0, self.log_battery)
         self.create_timer(0.5, self.tick)
         self.create_timer(self.report_s, self.report)
         self.get_logger().info(f'mission generator: mode={self.mode}, {len(self.bays)} aisle bays, '
@@ -131,18 +136,32 @@ class MissionGenerator(Node):
                                   f"{(m['claimed'] or m['done']) - self.t0:.1f}", f"{m['done'] - self.t0:.1f}", c.robot_id, t.round])
             self.csv.flush()
 
+    def log_battery(self):
+        if self.t0 is None:
+            return
+        for rid, r in sorted(self.robots.items()):
+            self.soc_writer.writerow([f'{self.now() - self.t0:.0f}', rid, f'{r.battery:.3f}', r.status])
+        self.soc_csv.flush()
+
     # ------------------------------------------------------------------ fleet metrics
     def on_state(self, s):
         prev = self.robots.get(s.robot_id)
         self.robots[s.robot_id] = s
         dt = 0.2
-        sh = self.shares.setdefault(s.robot_id, dict(driving=0.0, yielding=0.0, station=0.0, idle=0.0, dist=0.0))
-        key = {RobotState.YIELDING: 'yielding', RobotState.AT_STATION: 'station', RobotState.IDLE: 'idle'}.get(s.status, 'driving')
+        sh = self.shares.setdefault(s.robot_id, dict(driving=0.0, yielding=0.0, station=0.0, charging=0.0, idle=0.0, dist=0.0))
+        key = {RobotState.YIELDING: 'yielding', RobotState.AT_STATION: 'station', RobotState.IDLE: 'idle',
+               RobotState.CHARGING: 'charging', RobotState.TO_CHARGE: 'charging'}.get(s.status, 'driving')
         if s.status == RobotState.IDLE and s.speed > 0.05:
             key = 'driving'
         sh[key] += dt
         if prev is not None:
             sh['dist'] += math.hypot(s.pose.x - prev.pose.x, s.pose.y - prev.pose.y)
+            if s.status == RobotState.CHARGING and prev.status != RobotState.CHARGING:
+                self.sessions += 1
+        if self.t0 is not None and s.battery < self.min_soc[0]:
+            self.min_soc = (s.battery, s.robot_id)
+        if s.status == RobotState.STUCK and s.battery < 0.05:
+            self.empty.add(s.robot_id)
         run = self.yield_run.get(s.robot_id, 0.0) + dt if s.status == RobotState.YIELDING else 0.0
         self.yield_run[s.robot_id] = run
         if run > self.max_yield[0]:
@@ -160,16 +179,19 @@ class MissionGenerator(Node):
         done = [m for m in self.meta.values() if m['done'] is not None]
         by = {k: sum(1 for m in done if m['kind'] == k) for k in ('inbound', 'outbound', 'goto')}
         lat = [m['done'] - m['offered'] for m in done]
-        tot = {k: sum(sh[k] for sh in self.shares.values()) for k in ('driving', 'yielding', 'station', 'idle')}
+        tot = {k: sum(sh[k] for sh in self.shares.values()) for k in ('driving', 'yielding', 'station', 'charging', 'idle')}
         T = max(sum(tot.values()), 1e-6)
         line = (f"[metrics{' FINAL' if final else ''}] t={el:.0f}s done={len(done)} "
                 + ' '.join(f'{k}={v}' for k, v in by.items() if v)
                 + f" rate={len(done) / el * 3600:.0f}/h latency mean={sum(lat) / max(len(lat), 1):.0f}s "
                 + f"max={max(lat, default=0):.0f}s | fleet time: driving {100 * tot['driving'] / T:.0f}% "
                 + f"yielding {100 * tot['yielding'] / T:.0f}% station {100 * tot['station'] / T:.0f}% "
-                + f"idle {100 * tot['idle'] / T:.0f}% | closest approach {self.closest[0]:.2f} m ({self.closest[1]}) "
+                + f"charging {100 * tot['charging'] / T:.0f}% idle {100 * tot['idle'] / T:.0f}% | closest approach {self.closest[0]:.2f} m ({self.closest[1]}) "
                 + f"| longest yield {self.max_yield[0]:.0f}s ({self.max_yield[1]}) "
-                + f"| distance {sum(sh['dist'] for sh in self.shares.values()):.0f} m")
+                + f"| distance {sum(sh['dist'] for sh in self.shares.values()):.0f} m "
+                + f"| battery now {' '.join(f'{100 * r.battery:.0f}' for _, r in sorted(self.robots.items()))} % "
+                + f"min {100 * self.min_soc[0]:.0f}% ({self.min_soc[1]}) charge sessions {self.sessions} "
+                + f"ran empty {len(self.empty)}")
         self.get_logger().info(line)
 
 
@@ -181,4 +203,4 @@ def main():
     except (KeyboardInterrupt, SystemExit, rclpy.executors.ExternalShutdownException):
         pass
     finally:
-        node.csv.close()
+        node.csv.close(); node.soc_csv.close()

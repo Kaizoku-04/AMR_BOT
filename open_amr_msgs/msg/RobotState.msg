@@ -14,10 +14,12 @@ string robot_id
 uint8 status
 geometry_msgs/Pose2D pose          # map frame
 float32 speed
-float32 battery                    # 0..1
+float32 battery                    # state of charge 0..1 (from the robot's BatteryState)
 string task_id                     # empty when idle
 string mission_id
 uint32 last_node                   # lane-graph node most recently reached
 uint32[] route                     # remaining route (lane-graph node ids)
 uint32[] reserved_nodes            # nodes this robot holds (traffic control): peers must not enter them
 float32 wait_s                     # seconds spent waiting for the current reservation (ageing priority)
+uint32 goal_node                   # node the current leg ends at (or where it stands when idle): chargers are
+                                   # claimed through it, so two robots never head for the same one

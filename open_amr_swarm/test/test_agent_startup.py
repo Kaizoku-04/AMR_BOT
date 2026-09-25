@@ -7,6 +7,7 @@ import rclpy
 import yaml
 
 from open_amr_swarm.agent import SwarmAgent
+from open_amr_swarm.battery_sim import BatterySim
 from open_amr_swarm.mission_generator import MissionGenerator
 
 
@@ -26,12 +27,13 @@ def graph_files(tmp_path):
 
 def test_nodes_construct(graph_files, tmp_path):
     g, n = graph_files
-    rclpy.init(args=['--ros-args', '-p', f'graph:={g}', '-p', 'home_node:=charge_0',
-                     '-p', f'graph_nodes:={n}', '-p', f'out_dir:={tmp_path}'])
+    rclpy.init(args=['--ros-args', '-p', f'graph:={g}', '-p', f'graph_nodes:={n}', '-p', f'out_dir:={tmp_path}'])
     try:
-        a, m = SwarmAgent(), MissionGenerator()
+        a, m, b = SwarmAgent(), MissionGenerator(), BatterySim()
+        assert len(b.docks) == 1 and b.docks[0][1] is not None
         assert a.graph.edge_kind[(0, 1)] == 'street' and a.zones['charger'] == 35.0
+        assert a.chargers == [0] and not a.bms
         assert len(m.bays) == 1
-        a.destroy_node(); m.destroy_node()
+        a.destroy_node(); m.destroy_node(); b.destroy_node()
     finally:
         rclpy.shutdown()

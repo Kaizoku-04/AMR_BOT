@@ -3,6 +3,7 @@
 Loads the route_server geojson written by OpenAMR's sim/scripts/generate_route_graph.py: nodes carry
 metadata {name, kind}, edges are directed (startid -> endid). Pure Python, no ROS, so it is unit-testable.
 """
+import heapq
 import json
 import math
 
@@ -13,6 +14,7 @@ class LaneGraph:
             features = json.load(f)['features']
         self.pos, self.name, self.kind, self.by_name = {}, {}, {}, {}
         self.succ, self.edge_kind, self.edge_id = {}, {}, {}
+        self._dist_from = {}
         for ft in features:
             p = ft['properties']
             if ft['geometry']['type'] == 'Point':
@@ -47,3 +49,23 @@ class LaneGraph:
 
     def route_length(self, nodes):
         return sum(self.dist(a, b) for a, b in zip(nodes, nodes[1:]))
+
+    def of_kind(self, kind):
+        return sorted(n for n, k in self.kind.items() if k == kind)
+
+    def travel(self, a, b):
+        """Length of the shortest directed route a -> b along the lanes (inf if unreachable). Local Dijkstra,
+        cached per source: cheap estimates (energy budgets, charger choice) without a route_server round trip."""
+        if a not in self._dist_from:
+            d, pq = {a: 0.0}, [(0.0, a)]
+            while pq:
+                du, u = heapq.heappop(pq)
+                if du > d[u]:
+                    continue
+                for v in self.succ.get(u, []):
+                    dv = du + self.dist(u, v)
+                    if dv < d.get(v, math.inf):
+                        d[v] = dv
+                        heapq.heappush(pq, (dv, v))
+            self._dist_from[a] = d
+        return self._dist_from[a].get(b, math.inf)

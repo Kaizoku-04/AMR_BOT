@@ -21,5 +21,6 @@ setup(
     entry_points={'console_scripts': [
         'swarm_agent = open_amr_swarm.agent:main',
         'mission_generator = open_amr_swarm.mission_generator:main',
+        'battery_sim = open_amr_swarm.battery_sim:main',
     ]},
 )
