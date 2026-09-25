@@ -8,10 +8,18 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(builtin_interfaces REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/TimedRotation.action"
   "srv/SetCleaningState.srv"
+  "msg/RobotState.msg"
+  "msg/Task.msg"
+  "msg/Bid.msg"
+  "msg/Claim.msg"
+  "msg/StationState.msg"
+  DEPENDENCIES builtin_interfaces geometry_msgs
 )
 
 if(BUILD_TESTING)
