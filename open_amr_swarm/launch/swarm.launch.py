@@ -9,6 +9,10 @@ battery time for demos (20 = an 8 h shift in 24 min); battery_start = comma-sepa
 spread 90 % .. 40 % (a fleet mid-shift, so robots don't all need a charger at once).
 chargers:=charge_0,charge_1,charge_2 puts only those chargers in service (the rest are dead docks): fleets with
 fewer chargers than robots park idle robots on the parking row and hand chargers to robots low on battery.
+mode:=mission also starts a station_agent per arm (arm_receiving at receiving_bay, arm_outbound at outbound_bay):
+receiving_pallets / outbound_pallets = boxes on each staged pallet at start (default a dock mid-shift: receiving 8 and 24
+boxes, outbound 16 and 0, so a pallet runs empty / fills up early in a run), pallet_swap_s = truck restock / pickup
+time, arm_cycle_s = one transfer; fault:=arm_receiving:300:120 takes that arm out of service at 300 s for 120 s.
 """
 import os
 
@@ -43,6 +47,18 @@ def spawn(context):
                                       'chargers': chargers, 'use_sim_time': True}],
                          remappings=tf)
                     for i in range(n)]
+    if lc('mode') == 'mission':
+        fault = lc('fault').split(':') if lc('fault') else ['', '0', '0']
+        for sid, role, bay, pallets in (('arm_receiving', 'receiving', 'receiving_bay', lc('receiving_pallets')),
+                                        ('arm_outbound', 'outbound', 'outbound_bay', lc('outbound_pallets'))):
+            f = fault[0] == sid
+            actions.append(Node(package='open_amr_swarm', executable='station_agent', name=f'station_{sid}',
+                                output='screen',
+                                parameters=[{'station_id': sid, 'role': role, 'bay': bay, 'graph': graph,
+                                             'pallets': [int(v) for v in pallets.split(',')],
+                                             'cycle_s': float(lc('arm_cycle_s')), 'swap_s': float(lc('pallet_swap_s')),
+                                             'fault_at_s': float(fault[1]) if f else 0.0,
+                                             'fault_for_s': float(fault[2]) if f else 0.0, 'use_sim_time': True}]))
     if lc('mode') != 'none':
         actions.append(Node(package='open_amr_swarm', executable='mission_generator', name='mission_generator',
                             output='screen',
@@ -63,6 +79,11 @@ def generate_launch_description():
         DeclareLaunchArgument('battery_time_scale', default_value='1.0'),
         DeclareLaunchArgument('battery_start', default_value='', description='e.g. 0.9,0.5,...; default spread 90..40 %'),
         DeclareLaunchArgument('chargers', default_value='', description='chargers in service, e.g. charge_0,charge_1; default all'),
+        DeclareLaunchArgument('receiving_pallets', default_value='8,24'),
+        DeclareLaunchArgument('outbound_pallets', default_value='16,0'),
+        DeclareLaunchArgument('pallet_swap_s', default_value='180'),
+        DeclareLaunchArgument('arm_cycle_s', default_value='8.0'),
+        DeclareLaunchArgument('fault', default_value='', description='station:start_s:duration_s, e.g. arm_receiving:300:120'),
         DeclareLaunchArgument('graph', default_value=''),
         DeclareLaunchArgument('graph_nodes', default_value=''),
         OpaqueFunction(function=spawn),

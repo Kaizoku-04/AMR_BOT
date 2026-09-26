@@ -5,25 +5,31 @@ Offers tasks on /swarm/tasks and learns the outcome from /swarm/claims; the swar
                     outbound bay: FETCH_FROM_BIN) run concurrently; a bin registry makes sure a bin is only ever
                     promised to one task (Mission Design §8).
   mode=goto_random  plain GOTO tasks to random aisle bays: a traffic stress test.
-Unclaimed tasks are re-offered (round + 1) until someone takes them.
+Unclaimed tasks are re-offered (round + 1) until someone takes them; a task a robot gives back (RELEASE, its arm out
+of service) is re-offered too. Arm stations (station_agent heartbeats on /swarm/stations) gate the offers like a WMS
+would: inbound work only for boxes actually staged at receiving, outbound only for free pallet slots, and nothing for
+an arm that is out of service (FAULT) — offers resume when it's back. Inventory (occupied bins) on /wms/inventory.
 
 Metrics (logged every `report_s` and at the end; per-task CSV and a 10 s battery timeline in `out_dir`): tasks
 done and per hour by type, mean/max latency (offer -> done), robot time shares (driving / yielding / at station /
 charging / idle), closest approach between two robots, longest continuous yield (deadlock watch), energy: lowest
-state of charge any robot reached, charge sessions, robots that ran empty.
+state of charge any robot reached, charge sessions, robots that ran empty; docks: boxes in / out per hour, each arm's
+time busy / idle / starved / in fault, and bay dwell (robot standing at the arm's bay, mean / max).
 """
 import csv
 import itertools
 import math
 import os
 import random
+import time as wallclock
 
 import rclpy
 import rclpy.executors
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 import yaml
-from open_amr_msgs.msg import Claim, RobotState, Task
+from open_amr_msgs.msg import Claim, Inventory, RobotState, StationState, Task, Transfer
 
 from .agent import EVENT_QOS, STATE_QOS, stamp_s
 
@@ -42,10 +48,19 @@ class MissionGenerator(Node):
         self.rng = random.Random(dp('seed', 7).value)
         fill = dp('initial_fill', 0.5).value
         self.bays = sorted(n for n, v in nodes.items() if v['kind'] == 'aisle_bay')
+        self.dock_bays = {v['id']: n for n, v in nodes.items() if v['kind'] == 'bay'}   # arm bays: node id -> name
+        self.stations = {}               # bay node name -> (StationState, receive wall time)
+        self.station_timeout = dp('station_timeout_s', 3.0).value
+        self.dock = {}                   # bay name -> dict(state time shares, dwell list)
+        self.bay_since = {}              # robot -> (bay name, time it started standing there)
         # bin registry: each aisle bay node serves a west and an east bin
         self.bins = {f'{bay}:{side}': self.rng.random() < fill for bay in self.bays for side in ('W', 'E')}
         self.promised = set()
         self.pub_task = self.create_publisher(Task, '/swarm/tasks', EVENT_QOS)
+        self.pub_inv = self.create_publisher(Inventory, '/wms/inventory', QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+        self.create_subscription(StationState, '/swarm/stations', self.on_station, STATE_QOS)
+        self.create_subscription(Transfer, '/swarm/transfers', self.on_transfer, EVENT_QOS)
         self.create_subscription(Claim, '/swarm/claims', self.on_claim, EVENT_QOS)
         self.create_subscription(RobotState, '/swarm/state', self.on_state, STATE_QOS)
         self.tasks, self.meta, self.seq = {}, {}, 0
@@ -56,13 +71,15 @@ class MissionGenerator(Node):
         os.makedirs(self.out_dir, exist_ok=True)
         self.csv = open(os.path.join(self.out_dir, 'tasks.csv'), 'w', newline='')
         self.writer = csv.writer(self.csv)
-        self.writer.writerow(['task_id', 'type', 'origin', 'dest', 'offered_s', 'claimed_s', 'done_s', 'robot', 'rounds'])
+        self.writer.writerow(['task_id', 'type', 'origin', 'dest', 'bin', 'offered_s', 'claimed_s', 'done_s', 'robot', 'rounds',
+                              'releases'])
         self.soc_csv = open(os.path.join(self.out_dir, 'battery.csv'), 'w', newline='')
         self.soc_writer = csv.writer(self.soc_csv)
         self.soc_writer.writerow(['t_s', 'robot', 'soc', 'status'])
         self.create_timer(10.0, self.log_battery)
         self.create_timer(0.5, self.tick)
         self.create_timer(self.report_s, self.report)
+        self.publish_inventory()
         self.get_logger().info(f'mission generator: mode={self.mode}, {len(self.bays)} aisle bays, '
                                f'{sum(self.bins.values())}/{len(self.bins)} bins occupied')
 
@@ -78,21 +95,54 @@ class MissionGenerator(Node):
             kind, binid = 'goto', None
         else:
             inbound = self.seq % 2 == 1
-            pool = [b for b, full in self.bins.items() if full != inbound and b not in self.promised]
+            pool = self.pool(inbound)
             if not pool:
                 inbound = not inbound
-                pool = [b for b, full in self.bins.items() if full != inbound and b not in self.promised]
+                pool = self.pool(inbound)
             if not pool:
+                self.seq -= 1
                 return None
             binid = self.rng.choice(pool)
             self.promised.add(binid)
             bay = binid.split(':')[0]
+            t.bin_id = binid
             if inbound:
                 t.type, t.origin_id, t.dest_id, kind = Task.FETCH_FROM_STATION, 'receiving_bay', bay, 'inbound'
             else:
                 t.type, t.origin_id, t.dest_id, kind = Task.FETCH_FROM_BIN, bay, 'outbound_bay', 'outbound'
-        self.meta[t.task_id] = dict(kind=kind, bin=binid, offered=self.now(), claimed=None, done=None, robot='')
+        self.meta[t.task_id] = dict(kind=kind, bin=binid, offered=self.now(), claimed=None, done=None, robot='',
+                                    at_arm=False, releases=0)
         return t
+
+    def pool(self, inbound):
+        """Bins a new inbound (empty bins) or outbound (full bins) task could use, [] if its arm can't take more work."""
+        if self.arm_room('receiving_bay' if inbound else 'outbound_bay', 'inbound' if inbound else 'outbound') <= 0:
+            return []
+        return [b for b, full in self.bins.items() if full != inbound and b not in self.promised]
+
+    def station(self, bay):
+        m = self.stations.get(bay)
+        return m[0] if m and wallclock.monotonic() - m[1] < self.station_timeout else None
+
+    def arm_room(self, bay, kind):
+        """How many more tasks of `kind` the arm at `bay` can take: its stock / free slots minus the open tasks that
+        haven't been served there yet. Unlimited while no station was ever heard (runs without station agents)."""
+        if bay not in self.stations:
+            return 1 << 30
+        st = self.station(bay)
+        if st is None or st.state == StationState.FAULT:
+            return 0
+        pending = sum(1 for m in self.meta.values() if m['kind'] == kind and m['done'] is None and not m['at_arm'])
+        return st.boxes_available - pending
+
+    def offerable(self, t):
+        """Re-offers wait while the task's arm is out of service."""
+        for n in (t.origin_id, t.dest_id):
+            if n in self.stations:
+                st = self.station(n)
+                if st is None or st.state == StationState.FAULT:
+                    return False
+        return True
 
     def offer(self, t):
         t.stamp = self.get_clock().now().to_msg()
@@ -116,7 +166,7 @@ class MissionGenerator(Node):
             self.offer(t); open_.append(t.task_id)
         for tid, t in self.tasks.items():
             m = self.meta[tid]
-            if m['claimed'] is None and now - stamp_s(t.stamp) > self.reoffer_s:
+            if m['claimed'] is None and m['done'] is None and now - stamp_s(t.stamp) > self.reoffer_s and self.offerable(t):
                 t.round += 1
                 self.offer(t)
 
@@ -126,15 +176,36 @@ class MissionGenerator(Node):
             return
         if c.action == Claim.CLAIM and m['claimed'] is None:
             m['claimed'], m['robot'] = self.now(), c.robot_id
+        elif c.action == Claim.RELEASE and m['done'] is None and m['robot'] == c.robot_id:
+            m['claimed'], m['robot'] = None, ''
+            m['releases'] += 1
+            self.get_logger().info(f'{c.robot_id} gave {c.resource_id} back; re-offered when its arm is available')
         elif c.action == Claim.DONE and m['done'] is None:
             m['done'] = self.now()
             if m['bin']:
                 self.bins[m['bin']] = m['kind'] == 'inbound'
                 self.promised.discard(m['bin'])
+                self.publish_inventory()
             t = self.tasks[c.resource_id]
-            self.writer.writerow([c.resource_id, m['kind'], t.origin_id, t.dest_id, f"{m['offered'] - self.t0:.1f}",
-                                  f"{(m['claimed'] or m['done']) - self.t0:.1f}", f"{m['done'] - self.t0:.1f}", c.robot_id, t.round])
+            self.writer.writerow([c.resource_id, m['kind'], t.origin_id, t.dest_id, m['bin'] or '', f"{m['offered'] - self.t0:.1f}",
+                                  f"{(m['claimed'] or m['done']) - self.t0:.1f}", f"{m['done'] - self.t0:.1f}", c.robot_id, t.round,
+                                  m['releases']])
             self.csv.flush()
+
+    def publish_inventory(self):
+        self.pub_inv.publish(Inventory(stamp=self.get_clock().now().to_msg(),
+                                       occupied_bins=sorted(b for b, full in self.bins.items() if full)))
+
+    def on_station(self, s):
+        self.stations[s.bay_node] = (s, wallclock.monotonic())
+        if self.t0 is not None:
+            d = self.dock.setdefault(s.bay_node, dict(idle=0.0, busy=0.0, fault=0.0, starved=0.0, dwell=[]))
+            d[{StationState.BUSY: 'busy', StationState.FAULT: 'fault', StationState.STARVED: 'starved'}.get(s.state, 'idle')] += 0.2
+
+    def on_transfer(self, x):
+        m = self.meta.get(x.task_id)
+        if m is not None and x.kind in (Transfer.PALLET_TO_ROBOT, Transfer.ROBOT_TO_PALLET):
+            m['at_arm'] = True               # the arm's stock / free slots now account for it
 
     def log_battery(self):
         if self.t0 is None:
@@ -162,6 +233,14 @@ class MissionGenerator(Node):
             self.min_soc = (s.battery, s.robot_id)
         if s.status == RobotState.STUCK and s.battery < 0.05:
             self.empty.add(s.robot_id)
+        at_bay = self.dock_bays.get(s.last_node) if s.status == RobotState.AT_STATION else None
+        cur = self.bay_since.get(s.robot_id)
+        if cur and cur[0] != at_bay:
+            if self.t0 is not None:
+                self.dock.setdefault(cur[0], dict(idle=0.0, busy=0.0, fault=0.0, starved=0.0, dwell=[]))['dwell'].append(self.now() - cur[1])
+            del self.bay_since[s.robot_id]
+        if at_bay and s.robot_id not in self.bay_since:
+            self.bay_since[s.robot_id] = (at_bay, self.now())
         run = self.yield_run.get(s.robot_id, 0.0) + dt if s.status == RobotState.YIELDING else 0.0
         self.yield_run[s.robot_id] = run
         if run > self.max_yield[0]:
@@ -193,6 +272,20 @@ class MissionGenerator(Node):
                 + f"min {100 * self.min_soc[0]:.0f}% ({self.min_soc[1]}) charge sessions {self.sessions} "
                 + f"ran empty {len(self.empty)}")
         self.get_logger().info(line)
+        docks = []
+        for bay in sorted(self.dock):
+            d = self.dock[bay]
+            T = max(d['idle'] + d['busy'] + d['fault'] + d['starved'], 1e-6)
+            st = self.station(bay)
+            dw = d['dwell']
+            docks.append(f"{bay.replace('_bay', '')}: busy {100 * d['busy'] / T:.0f}% idle {100 * d['idle'] / T:.0f}% "
+                         f"starved {100 * d['starved'] / T:.0f}% fault {100 * d['fault'] / T:.0f}% "
+                         f"bay dwell mean {sum(dw) / max(len(dw), 1):.0f}s max {max(dw, default=0):.0f}s "
+                         f"({len(dw)} visits){f', pallets {list(st.pallets)}' if st else ''}")
+        if docks or by['inbound'] or by['outbound']:
+            self.get_logger().info(f"[metrics{' FINAL' if final else ''} docks] boxes in {by['inbound']} "
+                                   f"({by['inbound'] / el * 3600:.0f}/h) out {by['outbound']} ({by['outbound'] / el * 3600:.0f}/h) | "
+                                   + ' | '.join(docks))
 
 
 def main():

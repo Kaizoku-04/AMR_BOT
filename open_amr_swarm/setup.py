@@ -22,5 +22,6 @@ setup(
         'swarm_agent = open_amr_swarm.agent:main',
         'mission_generator = open_amr_swarm.mission_generator:main',
         'battery_sim = open_amr_swarm.battery_sim:main',
+        'station_agent = open_amr_swarm.station_agent:main',
     ]},
 )

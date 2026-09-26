@@ -10,6 +10,7 @@ string mission_id
 uint8 type
 string origin_id               # lane-graph node name (bay, bin bay, charger ...)
 string dest_id                 # lane-graph node name, empty for GOTO
+string bin_id                  # storage slot the box goes to / comes from ('<aisle bay node>:W' / ':E'), empty for GOTO
 uint8 priority                 # higher = more urgent
 uint32 round                   # re-offer counter (the WMS re-offers unclaimed tasks with round+1)
 builtin_interfaces/Time deadline

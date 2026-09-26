@@ -9,8 +9,10 @@ Behaviours (design: OpenAMR notes/Swarm Design.md, notes/Mission Design.md):
   traffic     The agent routes on the lane graph through its own route_server (node ids, never "nearest node"),
               holds lane-graph nodes via traffic.plan_reservations and gives the controller (FollowPath) only
               the stretch of path it holds. Blocked -> it stops before the taken node (YIELDING).
-  execution   GOTO / FETCH_FROM_STATION / FETCH_FROM_BIN as legs: drive, dwell (simulated transfer), next leg;
-              DONE on /swarm/claims; then to a free charger unless it wins another task.
+  execution   GOTO / FETCH_FROM_STATION / FETCH_FROM_BIN as legs: drive, transfer, next leg; DONE on /swarm/claims;
+              then to a free charger unless it wins another task. At an arm bay the robot waits for the station's
+              heartbeat (/swarm/stations) to report its task served; at a bin its own conveyor deck takes bin_dwell_s.
+              An empty robot gives its task back (RELEASE) when the arm stays out of service; a loaded one waits.
   energy      Reads the robot's BMS (`battery_state`, sensor_msgs/BatteryState). Bids only on tasks it can finish
               with reserve to spare, charges below `low` until `resume`, tops up whenever idle; chargers claimed
               through `goal_node` in the heartbeat. Rules: energy.py.
@@ -34,7 +36,7 @@ from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap, DynamicEdges
 from nav_msgs.msg import Path
 from sensor_msgs.msg import BatteryState
-from open_amr_msgs.msg import Bid, Claim, RobotState, Task
+from open_amr_msgs.msg import Bid, Claim, RobotState, StationState, Task, Transfer
 
 from .energy import (ChargeParams, ChargerPeer, DrainEstimator, bid_penalty_s, can_take, evictions, pick_charger,
                      task_need, waiting_for_charger)
@@ -51,8 +53,10 @@ def stamp_s(t):
 
 
 class Leg:
-    def __init__(self, target, dwell_s, drive_status, final_precise=True):
+    def __init__(self, target, dwell_s, drive_status, final_precise=True, station=False, transfer=None):
         self.target, self.dwell_s, self.drive_status, self.precise = target, dwell_s, drive_status, final_precise
+        self.station = station           # an arm bay: the transfer ends when the station reports the task served
+        self.transfer = transfer         # Transfer kind the robot's own deck performs here (bins), announced on arrival
 
 
 class SwarmAgent(Node):
@@ -69,6 +73,10 @@ class SwarmAgent(Node):
         self.bid_window = dp('bid_window_s', 1.5).value
         self.station_dwell = dp('station_dwell_s', 8.0).value
         self.bin_dwell = dp('bin_dwell_s', 4.0).value
+        # arm bays: wait for the station's handshake (False: a fixed station_dwell_s, for runs without station agents)
+        self.handshake = dp('station_handshake', True).value
+        self.station_giveup = dp('station_giveup_s', 30.0).value   # empty robot: arm out of service this long -> give the task back
+        self.station_timeout = dp('station_timeout_s', 3.0).value  # heartbeat older than this = station down
         self.peer_timeout = dp('peer_timeout_s', 3.0).value
         # fleet roster (launch passes every robot id): don't act before hearing every peer (DDS discovery can take
         # seconds, and a robot it can't hear is invisible to reservations and charger claims), warn when one goes quiet
@@ -100,11 +108,13 @@ class SwarmAgent(Node):
         self.pub_bid = self.create_publisher(Bid, '/swarm/bids', EVENT_QOS)
         self.pub_claim = self.create_publisher(Claim, '/swarm/claims', EVENT_QOS)
         self.pub_speed = self.create_publisher(SpeedLimit, 'speed_limit', 10)
+        self.pub_transfer = self.create_publisher(Transfer, '/swarm/transfers', EVENT_QOS)
         self.speed_pct, self.speed_sent_at = None, 0.0
         self.create_subscription(RobotState, '/swarm/state', self.on_state, STATE_QOS)
         self.create_subscription(Task, '/swarm/tasks', self.on_task, EVENT_QOS)
         self.create_subscription(Bid, '/swarm/bids', self.on_bid, EVENT_QOS)
         self.create_subscription(Claim, '/swarm/claims', self.on_claim, EVENT_QOS)
+        self.create_subscription(StationState, '/swarm/stations', self.on_station, STATE_QOS)
         self.route_client = ActionClient(self, ComputeRoute, 'compute_route')
         self.follow_client = ActionClient(self, FollowPath, 'follow_path')
         self.clear_local = self.create_client(ClearEntireCostmap, 'local_costmap/clear_entirely_local_costmap')
@@ -112,6 +122,8 @@ class SwarmAgent(Node):
 
         # world knowledge
         self.peers = {}                  # robot_id -> (RobotState, receive wall time)
+        self.stations = {}               # bay node id -> (StationState, receive wall time)
+        self.station_down_since = None
         self.tasks, self.claims, self.done = {}, {}, set()
         self.bids = {}                   # (task_id, round) -> {robot_id: cost}
         self.decided, self.my_bids = set(), {}
@@ -169,6 +181,21 @@ class SwarmAgent(Node):
                 self.abort_task()
         elif m.action == Claim.DONE:
             self.done.add(m.resource_id)
+        elif m.action == Claim.RELEASE and self.claims.get(m.resource_id) == m.robot_id:
+            del self.claims[m.resource_id]        # given back: open again when the WMS re-offers it
+
+    def on_station(self, m):
+        if m.bay_node in self.graph.by_name:
+            self.stations[self.graph.by_name[m.bay_node]] = (m, wallclock.monotonic())
+
+    def station_state(self, bay):
+        """Latest heartbeat of the station serving `bay`, None if unheard or stale."""
+        m = self.stations.get(bay)
+        return m[0] if m and wallclock.monotonic() - m[1] < self.station_timeout else None
+
+    def station_down(self, bay):
+        st = self.station_state(bay)
+        return st is None or st.state == StationState.FAULT
 
     def on_battery(self, m):
         self.bms, self.battery = True, float(m.percentage)
@@ -219,10 +246,11 @@ class SwarmAgent(Node):
             self.publish_state()           # heartbeat only until every peer is heard
             return
         self.auction()
+        self.check_station()
         if self.phase == 'driving':
             self.drive()
-        elif self.phase == 'dwelling' and self.now() >= self.dwell_until:
-            self.next_leg()
+        elif self.phase == 'dwelling':
+            self.dwell()
         elif self.phase == 'retry' and self.now() >= self.retry_at:
             self.next_leg(first=True)
         elif self.phase == 'idle':
@@ -283,6 +311,9 @@ class SwarmAgent(Node):
                 continue
             if self.bms and not can_take(self.battery, self.task_need(t), self.cp):
                 continue                                  # can't finish it and still reach a charger
+            if self.handshake and any(self.graph.kind.get(self.graph.id(n)) == 'bay' and self.station_down(self.graph.id(n))
+                                      for n in (t.origin_id, t.dest_id) if n):
+                continue                                  # its arm is out of service
             self.bid_pending = True
             self.estimate(self.start_node(), self.graph.id(t.origin_id), lambda cost, t=t: self.send_bid(t, cost))
             return
@@ -328,9 +359,11 @@ class SwarmAgent(Node):
         if t.type == Task.GOTO:
             legs = [Leg(o, 0.0, RobotState.TO_PICK)]
         elif t.type == Task.FETCH_FROM_STATION:
-            legs = [Leg(o, self.station_dwell, RobotState.TO_PICK), Leg(self.graph.id(t.dest_id), self.bin_dwell, RobotState.TO_DROP)]
+            legs = [Leg(o, self.station_dwell, RobotState.TO_PICK, station=True),
+                    Leg(self.graph.id(t.dest_id), self.bin_dwell, RobotState.TO_DROP, transfer=Transfer.ROBOT_TO_BIN)]
         else:
-            legs = [Leg(o, self.bin_dwell, RobotState.TO_PICK), Leg(self.graph.id(t.dest_id), self.station_dwell, RobotState.TO_DROP)]
+            legs = [Leg(o, self.bin_dwell, RobotState.TO_PICK, transfer=Transfer.BIN_TO_ROBOT),
+                    Leg(self.graph.id(t.dest_id), self.station_dwell, RobotState.TO_DROP, station=True)]
         self.get_logger().info(f'{self.rid}: won {t.task_id} ({t.origin_id} -> {t.dest_id or "-"})')
         self.start_legs(legs, task=t)
 
@@ -633,8 +666,49 @@ class SwarmAgent(Node):
         if self.leg and self.leg.dwell_s > 0:
             self.phase, self.status = 'dwelling', RobotState.AT_STATION
             self.dwell_until = self.now() + self.leg.dwell_s
+            if self.leg.transfer is not None and self.task is not None:
+                self.pub_transfer.publish(Transfer(stamp=self.get_clock().now().to_msg(), kind=self.leg.transfer,
+                                                   task_id=self.task.task_id, robot_id=self.rid, pallet=-1, slot=-1,
+                                                   bin_id=self.task.bin_id, duration_s=float(self.leg.dwell_s)))
         else:
             self.next_leg()
+
+    def dwell(self):
+        """At a bin: the deck's fixed transfer time. At an arm bay: until the station reports this task served."""
+        if not (self.leg.station and self.handshake):
+            if self.now() >= self.dwell_until:
+                self.next_leg()
+            return
+        st = self.station_state(self.leg.target)
+        if st is not None and self.task is not None and st.served_task == self.task.task_id:
+            self.next_leg()
+
+    def check_station(self):
+        """An empty robot whose arm stays out of service (fault, or no heartbeat) gives its task back instead of
+        blocking the bay or its queue; the WMS re-offers it once the arm is back. A loaded robot keeps waiting: it
+        can't put the box anywhere else."""
+        leg = self.leg
+        if not (self.handshake and self.task is not None and leg is not None and leg.station
+                and leg.drive_status == RobotState.TO_PICK):
+            self.station_down_since = None
+            return
+        if not self.station_down(leg.target):
+            self.station_down_since = None
+            return
+        now = self.now()
+        if self.station_down_since is None:
+            self.station_down_since = now
+            self.get_logger().warn(f'{self.rid}: {self.graph.name[leg.target]} is out of service')
+        elif now - self.station_down_since > self.station_giveup:
+            t = self.task
+            self.get_logger().warn(f'{self.rid}: {self.graph.name[leg.target]} out of service for '
+                                   f'{now - self.station_down_since:.0f} s: giving {t.task_id} back')
+            self.pub_claim.publish(Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.TASK,
+                                         resource_id=t.task_id, robot_id=self.rid, action=Claim.RELEASE))
+            self.claims.pop(t.task_id, None)
+            self.station_down_since = None
+            self.leg, self.legs = None, []
+            self.abort_task()
 
     def finish_task(self):
         t = self.task

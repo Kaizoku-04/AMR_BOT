@@ -19,6 +19,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Bid.msg"
   "msg/Claim.msg"
   "msg/StationState.msg"
+  "msg/Transfer.msg"
+  "msg/Inventory.msg"
   DEPENDENCIES builtin_interfaces geometry_msgs
 )
 
