@@ -1,0 +1,119 @@
+<?xml version="1.0"?>
+<!-- UR10e palletizing cell: pedestal + UR10e (UR's own ur_description, unmodified) + vacuum area gripper.
+     Root link `world` = the cell frame of open_amr_arm_cell/cell_geometry.py (floor under the arm's axis, x towards
+     the AMR bay). The same description serves MoveIt, the Isaac arm (imported from this URDF) and the real cell.
+     hardware: topic = sim (ros2_control <-> Isaac articulation over JointState topics, sim time; plugin
+                       open_amr_isaac_hardware/IsaacJointSystem)
+               mock  = mock_components/GenericSystem (tests without a simulator)
+               none  = no ros2_control block (MoveIt only, e.g. the reach study)
+               real  = no ros2_control block here: ur_robot_driver brings its own. -->
+<robot xmlns:xacro="http://wiki.ros.org/xacro" name="arm_cell">
+  <xacro:arg name="ur_type" default="ur10e"/>
+  <xacro:arg name="pedestal_height" default="1.1"/>
+  <xacro:arg name="pedestal_size" default="0.5"/>
+  <xacro:arg name="tool_length" default="0.20"/>
+  <xacro:arg name="hardware" default="none"/>
+  <xacro:arg name="arm_id" default="arm"/>
+  <xacro:arg name="force_abs_paths" default="false"/>   <!-- true: mesh file:// paths (Isaac's URDF importer) -->
+
+  <xacro:property name="ur_type" value="$(arg ur_type)"/>
+  <xacro:property name="H" value="$(arg pedestal_height)"/>
+  <xacro:property name="P" value="$(arg pedestal_size)"/>
+  <xacro:property name="L" value="$(arg tool_length)"/>
+  <xacro:property name="hw" value="$(arg hardware)"/>
+  <xacro:property name="cfg" value="$(find ur_description)/config/${ur_type}"/>
+
+  <xacro:include filename="$(find ur_description)/urdf/ur_macro.xacro"/>
+
+  <link name="world"/>
+
+  <!-- steel pedestal with a base plate; UR base_link on its top face -->
+  <link name="pedestal">
+    <visual>
+      <origin xyz="0 0 ${H / 2}"/>
+      <geometry><box size="${P} ${P} ${H}"/></geometry>
+      <material name="pedestal_grey"><color rgba="0.35 0.37 0.4 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${H / 2}"/>
+      <geometry><box size="${P} ${P} ${H}"/></geometry>
+    </collision>
+  </link>
+  <joint name="world_to_pedestal" type="fixed">
+    <parent link="world"/>
+    <child link="pedestal"/>
+  </joint>
+
+  <xacro:ur_robot name="ur" tf_prefix="" parent="pedestal"
+      joint_limits_parameters_file="${cfg}/joint_limits.yaml"
+      kinematics_parameters_file="${cfg}/default_kinematics.yaml"
+      physical_parameters_file="${cfg}/physical_parameters.yaml"
+      visual_parameters_file="${cfg}/visual_parameters.yaml"
+      force_abs_paths="$(arg force_abs_paths)">
+    <origin xyz="0 0 ${H}" rpy="0 0 0"/>
+  </xacro:ur_robot>
+
+  <!-- vacuum area gripper (Schmalz FXCB / Piab piCOBOT class): quick changer + body + foam pad, 0.30 x 0.30 so it
+       never touches the neighbouring boxes of a 0.35 m pattern. tool0 z points out of the flange. -->
+  <link name="vacuum_gripper">
+    <visual>
+      <origin xyz="0 0 ${L / 2}"/>
+      <geometry><box size="0.30 0.30 ${L}"/></geometry>
+      <material name="gripper_blue"><color rgba="0.1 0.35 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${L / 2}"/>
+      <geometry><box size="0.30 0.30 ${L}"/></geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 ${L / 2}"/>
+      <mass value="2.0"/>
+      <inertia ixx="0.02" iyy="0.02" izz="0.03" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="tool0_to_gripper" type="fixed">
+    <parent link="tool0"/>
+    <child link="vacuum_gripper"/>
+  </joint>
+  <!-- TCP: centre of the suction face, z out of the pad (points down when picking) -->
+  <link name="tcp"/>
+  <joint name="gripper_to_tcp" type="fixed">
+    <parent link="vacuum_gripper"/>
+    <child link="tcp"/>
+    <origin xyz="0 0 ${L}"/>
+  </joint>
+
+  <xacro:if value="${hw in ('topic', 'mock')}">
+    <ros2_control name="$(arg arm_id)_hardware" type="system">
+      <hardware>
+        <xacro:if value="${hw == 'topic'}">
+          <!-- commands stamped with the controller's sample time (open_amr_isaac_hardware: why) -->
+          <plugin>open_amr_isaac_hardware/IsaacJointSystem</plugin>
+          <param name="joint_commands_topic">/$(arg arm_id)/isaac_joint_commands</param>
+          <param name="joint_states_topic">/$(arg arm_id)/isaac_joint_states</param>
+        </xacro:if>
+        <xacro:if value="${hw == 'mock'}">
+          <plugin>mock_components/GenericSystem</plugin>
+          <param name="calculate_dynamics">true</param>
+        </xacro:if>
+      </hardware>
+      <!-- initial = the cell's home pose (arm upright over its pedestal, tool down) -->
+      <xacro:macro name="arm_joint" params="name initial">
+        <joint name="${name}">
+          <command_interface name="position"/>
+          <xacro:if value="${hw == 'topic'}">   <!-- velocity feed-forward for the sim bridge (mock: position only) -->
+            <command_interface name="velocity"/>
+          </xacro:if>
+          <state_interface name="position"><param name="initial_value">${initial}</param></state_interface>
+          <state_interface name="velocity"/>
+        </joint>
+      </xacro:macro>
+      <xacro:arm_joint name="shoulder_pan_joint" initial="0.0"/>
+      <xacro:arm_joint name="shoulder_lift_joint" initial="-1.5708"/>
+      <xacro:arm_joint name="elbow_joint" initial="1.5708"/>
+      <xacro:arm_joint name="wrist_1_joint" initial="-1.5708"/>
+      <xacro:arm_joint name="wrist_2_joint" initial="-1.5708"/>
+      <xacro:arm_joint name="wrist_3_joint" initial="0.0"/>
+    </ros2_control>
+  </xacro:if>
+</robot>

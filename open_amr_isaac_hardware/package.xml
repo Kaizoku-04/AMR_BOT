@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>open_amr_isaac_hardware</name>
+  <version>0.1.0</version>
+  <description>ros2_control SystemInterface that bridges joint commands / states to an Isaac Sim articulation over
+    sensor_msgs/JointState topics (OpenAMR sim/scripts/arm_bridge.py). Based on joint_state_topic_hardware_interface
+    1.1.0 (Apache-2.0, ros2_control Development Team), changed where the simulator needs it: commands are stamped with
+    the controller's sample time (write()'s time argument), non-finite commands are never sent, the latest state is
+    handed between threads under a lock, and commands start at the measured state.</description>
+  <maintainer email="dodorapapah@gmail.com">Mohannad Rababah</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>hardware_interface</depend>
+  <depend>pluginlib</depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>sensor_msgs</depend>
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

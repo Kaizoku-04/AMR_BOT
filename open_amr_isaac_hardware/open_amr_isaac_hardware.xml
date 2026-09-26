@@ -1,0 +1,7 @@
+<library path="open_amr_isaac_hardware">
+  <class name="open_amr_isaac_hardware/IsaacJointSystem" type="open_amr_isaac_hardware::IsaacJointSystem"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>Joint commands / states over JointState topics to an Isaac Sim articulation, commands stamped with
+      the controller's sample time.</description>
+  </class>
+</library>

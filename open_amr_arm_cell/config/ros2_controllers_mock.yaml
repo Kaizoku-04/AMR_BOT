@@ -1,0 +1,4 @@
+# Mock hardware (mock_components/GenericSystem) can't take position and velocity commands at once: position only.
+/**/joint_trajectory_controller:
+  ros__parameters:
+    command_interfaces: [position]
