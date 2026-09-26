@@ -62,7 +62,8 @@ def spawn(context):
     if lc('mode') != 'none':
         actions.append(Node(package='open_amr_swarm', executable='mission_generator', name='mission_generator',
                             output='screen',
-                            parameters=[{'mode': lc('mode'), 'graph_nodes': nodes, 'duration_s': float(lc('duration_s')),
+                            parameters=[{'mode': lc('mode'), 'graph_nodes': nodes, 'graph': graph,
+                                         'duration_s': float(lc('duration_s')),
                                          'open_tasks': int(lc('open_tasks') or n + 2), 'out_dir': lc('out_dir'),
                                          'use_sim_time': True}]))
     return actions

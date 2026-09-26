@@ -5,8 +5,14 @@ Offers tasks on /swarm/tasks and learns the outcome from /swarm/claims; the swar
                     outbound bay: FETCH_FROM_BIN) run concurrently; a bin registry makes sure a bin is only ever
                     promised to one task (Mission Design §8).
   mode=goto_random  plain GOTO tasks to random aisle bays: a traffic stress test.
-Unclaimed tasks are re-offered (round + 1) until someone takes them; a task a robot gives back (RELEASE, its arm out
-of service) is re-offered too. Arm stations (station_agent heartbeats on /swarm/stations) gate the offers like a WMS
+Unclaimed tasks are re-offered (round + 1) until someone takes them; a task a robot gives back (RELEASE: its arm out
+of service, it is stuck, or — announced by a peer — it went silent) is re-offered too, unless its box is already on
+that robot's deck (a pickup transfer was seen): then it is STRANDED and needs a person; the original robot can still
+finish it if it comes back. A robot that went silent is taken to still stand where it was last heard (its last node
+and reserved nodes, until heard again or released on /swarm/operator): unclaimed tasks whose bin or bay is there are
+withdrawn (Claim.CANCEL) and no new work is offered there. A robot that comes back from a network cut still doing a
+task that was withdrawn, re-auctioned or done meanwhile (it never heard those events) is told again: its heartbeat
+shows the mismatch, and after `reconcile_s` the WMS re-sends the CANCEL / RELEASE (state repairs lost events). Arm stations (station_agent heartbeats on /swarm/stations) gate the offers like a WMS
 would: inbound work only for boxes actually staged at receiving, outbound only for free pallet slots, and nothing for
 an arm that is out of service (FAULT) — offers resume when it's back. Inventory (occupied bins) on /wms/inventory.
 
@@ -29,9 +35,11 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 import yaml
-from open_amr_msgs.msg import Claim, Inventory, RobotState, StationState, Task, Transfer
+from open_amr_msgs.msg import Claim, Inventory, OperatorCommand, RobotState, StationState, Task, Transfer
 
-from .agent import EVENT_QOS, STATE_QOS, stamp_s
+from .agent import EVENT_QOS, OPERATOR_QOS, STATE_QOS, stamp_s
+from .lane_graph import LaneGraph
+from .liveness import LivenessParams, ghost_hold
 
 
 class MissionGenerator(Node):
@@ -49,6 +57,13 @@ class MissionGenerator(Node):
         fill = dp('initial_fill', 0.5).value
         self.bays = sorted(n for n, v in nodes.items() if v['kind'] == 'aisle_bay')
         self.dock_bays = {v['id']: n for n, v in nodes.items() if v['kind'] == 'bay'}   # arm bays: node id -> name
+        self.node_id = {n: v['id'] for n, v in nodes.items()}
+        gpath = dp('graph', '').value
+        self.graph = LaneGraph(gpath) if gpath else None   # to find dead ends behind a silent robot
+        self.peer_timeout = dp('peer_timeout_s', 3.0).value
+        self.robot_rx, self.released, self.cancelled = {}, {}, 0
+        self.reconcile_s = dp('reconcile_s', 3.0).value
+        self.mismatch = {}               # (robot, task) -> wall time the heartbeat first disagreed with the WMS
         self.stations = {}               # bay node name -> (StationState, receive wall time)
         self.station_timeout = dp('station_timeout_s', 3.0).value
         self.dock = {}                   # bay name -> dict(state time shares, dwell list)
@@ -57,12 +72,14 @@ class MissionGenerator(Node):
         self.bins = {f'{bay}:{side}': self.rng.random() < fill for bay in self.bays for side in ('W', 'E')}
         self.promised = set()
         self.pub_task = self.create_publisher(Task, '/swarm/tasks', EVENT_QOS)
+        self.pub_claim = self.create_publisher(Claim, '/swarm/claims', EVENT_QOS)
         self.pub_inv = self.create_publisher(Inventory, '/wms/inventory', QoSProfile(
             depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL))
         self.create_subscription(StationState, '/swarm/stations', self.on_station, STATE_QOS)
         self.create_subscription(Transfer, '/swarm/transfers', self.on_transfer, EVENT_QOS)
         self.create_subscription(Claim, '/swarm/claims', self.on_claim, EVENT_QOS)
         self.create_subscription(RobotState, '/swarm/state', self.on_state, STATE_QOS)
+        self.create_subscription(OperatorCommand, '/swarm/operator', self.on_operator, OPERATOR_QOS)
         self.tasks, self.meta, self.seq = {}, {}, 0
         self.robots, self.shares, self.yield_run, self.max_yield = {}, {}, {}, (0.0, '')
         self.closest = (1e9, '')
@@ -111,14 +128,130 @@ class MissionGenerator(Node):
             else:
                 t.type, t.origin_id, t.dest_id, kind = Task.FETCH_FROM_BIN, bay, 'outbound_bay', 'outbound'
         self.meta[t.task_id] = dict(kind=kind, bin=binid, offered=self.now(), claimed=None, done=None, robot='',
-                                    at_arm=False, releases=0)
+                                    at_arm=False, releases=0, on_robot=False, stranded=False, reclaims=0,
+                                    cancelled=False)
         return t
 
     def pool(self, inbound):
-        """Bins a new inbound (empty bins) or outbound (full bins) task could use, [] if its arm can't take more work."""
-        if self.arm_room('receiving_bay' if inbound else 'outbound_bay', 'inbound' if inbound else 'outbound') <= 0:
+        """Bins a new inbound (empty bins) or outbound (full bins) task could use, [] if its arm can't take more work or
+        its bay is blocked by a silent robot."""
+        bay = 'receiving_bay' if inbound else 'outbound_bay'
+        blocked = self.blocked_nodes()
+        if self.arm_room(bay, 'inbound' if inbound else 'outbound') <= 0 or self.node_id.get(bay) in blocked:
             return []
-        return [b for b, full in self.bins.items() if full != inbound and b not in self.promised]
+        return [b for b, full in self.bins.items() if full != inbound and b not in self.promised
+                and self.node_id.get(b.split(':')[0]) not in blocked]
+
+    def blocked_nodes(self):
+        """Nodes where a silent robot may still stand (its last node and reserved nodes, until heard or released), plus
+        the dead ends behind them (LaneGraph.trapped)."""
+        t, out = wallclock.monotonic(), set()
+        for rid, s in self.robots.items():
+            if t - self.robot_rx.get(rid, t) < self.peer_timeout:
+                continue
+            if rid in self.released and self.released[rid] >= stamp_s(s.stamp):
+                continue
+            if self.graph is not None:                   # the same frozen view the agents use (liveness rule 1)
+                out.update(ghost_hold(self.graph, list(s.reserved_nodes), list(s.route), s.pose.x, s.pose.y,
+                                      LivenessParams().ghost_extra_m))
+            else:
+                out.add(s.last_node)
+                out.update(s.reserved_nodes)
+        return out | self.graph.cut_off(out) if out and self.graph is not None else out
+
+    def on_operator(self, m):
+        if m.command == OperatorCommand.RELEASE_ROBOT:
+            self.released[m.target] = stamp_s(m.stamp)
+            self.get_logger().warn(f'operator {m.issued_by or "?"} released {m.target}: its nodes are free for work again')
+
+    def reconcile(self, s):
+        """A robot's heartbeat says it works on a task the WMS withdrew, re-auctioned or saw done (events it missed,
+        e.g. during a network cut): after reconcile_s of disagreement, tell it again. A fresh claim whose event hasn't
+        arrived yet agrees within that time."""
+        m = self.meta.get(s.task_id)
+        key = (s.robot_id, s.task_id)
+        if m is not None and m['claimed'] is None and m['done'] is None and not m['cancelled'] and \
+                s.task_round == self.tasks[s.task_id].round:
+            # won in the current offer round, but its CLAIM event never arrived: adopt it (don't take work away)
+            m['claimed'], m['robot'] = self.now(), s.robot_id
+            self.get_logger().info(f'{s.robot_id} holds {s.task_id} (claim event lost; learned from its heartbeat)')
+        stale = m is not None and not m['stranded'] and (m['cancelled'] or m['robot'] != s.robot_id)
+        if not stale:
+            self.mismatch.pop(key, None)
+            return
+        t = wallclock.monotonic()
+        first = self.mismatch.setdefault(key, t)
+        if t - first < self.reconcile_s:
+            return
+        self.mismatch[key] = t                       # repeat every reconcile_s while it persists
+        gone = m['cancelled'] or m['done'] is not None
+        self.pub_claim.publish(Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.TASK,
+                                     resource_id=s.task_id, robot_id=s.robot_id, round=s.task_round, by='wms',
+                                     action=Claim.CANCEL if gone else Claim.RELEASE))
+        self.get_logger().warn(f'{s.robot_id} is still on {s.task_id}, which was '
+                               f'{"withdrawn or done" if gone else "re-auctioned"} while it was out of contact; telling it again')
+
+    def retarget_blocked(self):
+        """A robot carrying an inbound box whose bin is now blocked or cut off by a silent robot: give the box another
+        free bin (re-published Task, same id and round; the claimant drives there instead). Outbound boxes can only go
+        to the outbound arm: those robots wait parked until the way is clear."""
+        blocked = self.blocked_nodes()
+        if not blocked:
+            return
+        for tid, t in self.tasks.items():
+            m = self.meta[tid]
+            if m['kind'] != 'inbound' or m['done'] is not None or not m['on_robot'] or not m['robot'] or \
+                    self.node_id.get(t.dest_id) not in blocked:
+                continue
+            if wallclock.monotonic() - self.robot_rx.get(m['robot'], 0.0) >= self.peer_timeout:
+                continue                             # the carrier itself is silent: stranded, nothing to re-target
+            free = [b for b, full in self.bins.items() if not full and b not in self.promised
+                    and self.node_id.get(b.split(':')[0]) not in blocked]
+            if not free:
+                continue
+            old = m['bin']
+            new = self.rng.choice(free)
+            self.promised.discard(old); self.promised.add(new)
+            m['bin'] = new
+            t.bin_id, t.dest_id = new, new.split(':')[0]
+            t.stamp = self.get_clock().now().to_msg()
+            self.pub_task.publish(t)
+            self.get_logger().warn(f're-targeted {tid} ({m["robot"]}, box on board): {old} is cut off -> {new}')
+
+    def check_stranded(self):
+        """A claimant silent for reclaim_silent_s with the box on its deck: the agents leave its task with it (nobody
+        else can deliver that box), so the WMS raises the alarm itself."""
+        t = wallclock.monotonic()
+        silent_s = LivenessParams().reclaim_silent_s
+        for tid, m in self.meta.items():
+            if m['done'] is not None or m['stranded'] or not m['robot'] or not m['on_robot']:
+                continue
+            rx = self.robot_rx.get(m['robot'])
+            if rx is not None and t - rx >= silent_s:
+                m['stranded'] = True
+                self.get_logger().error(f'ALARM {tid}: {m["robot"]} silent for {t - rx:.0f} s with the box on its deck '
+                                        f'— recover the robot and box by hand (task stays with it)')
+
+    def withdraw_blocked(self):
+        """Unclaimed tasks whose bin or bay a silent robot blocks can't be done: withdraw them (Claim.CANCEL), free the
+        bin, and let new tasks replace them."""
+        blocked = self.blocked_nodes()
+        if not blocked:
+            return
+        for tid, t in self.tasks.items():
+            m = self.meta[tid]
+            if m['claimed'] is not None or m['done'] is not None or m['stranded']:
+                continue
+            hit = [n for n in (t.origin_id, t.dest_id) if n and self.node_id.get(n) in blocked]
+            if not hit:
+                continue
+            m['done'], m['cancelled'] = self.now(), True
+            self.cancelled += 1
+            if m['bin']:
+                self.promised.discard(m['bin'])
+            self.pub_claim.publish(Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.TASK, resource_id=tid,
+                                         robot_id='', action=Claim.CANCEL, round=t.round, by='wms'))
+            self.get_logger().warn(f'withdrew {tid}: {hit[0]} is blocked by a silent robot')
 
     def station(self, bay):
         m = self.stations.get(bay)
@@ -158,7 +291,10 @@ class MissionGenerator(Node):
         if self.run_s and now - self.t0 > self.run_s:
             self.report(final=True)
             raise SystemExit
-        open_ = [k for k, m in self.meta.items() if m['done'] is None]
+        self.withdraw_blocked()
+        self.retarget_blocked()
+        self.check_stranded()
+        open_ = [k for k, m in self.meta.items() if m['done'] is None and not m['stranded']]   # stranded: nobody can work it
         while len(open_) < self.open_target:
             t = self.new_task()
             if t is None:
@@ -166,7 +302,8 @@ class MissionGenerator(Node):
             self.offer(t); open_.append(t.task_id)
         for tid, t in self.tasks.items():
             m = self.meta[tid]
-            if m['claimed'] is None and m['done'] is None and now - stamp_s(t.stamp) > self.reoffer_s and self.offerable(t):
+            if m['claimed'] is None and m['done'] is None and not m['stranded'] and \
+                    now - stamp_s(t.stamp) > self.reoffer_s and self.offerable(t):
                 t.round += 1
                 self.offer(t)
 
@@ -177,10 +314,23 @@ class MissionGenerator(Node):
         if c.action == Claim.CLAIM and m['claimed'] is None:
             m['claimed'], m['robot'] = self.now(), c.robot_id
         elif c.action == Claim.RELEASE and m['done'] is None and m['robot'] == c.robot_id:
+            by_peer = bool(c.by) and c.by != c.robot_id
+            if m['on_robot']:
+                m['stranded'] = True
+                self.get_logger().error(f'ALARM {c.resource_id}: {c.robot_id} lost with the box on its deck '
+                                        f'(released by {c.by or c.robot_id}); not re-offered — recover the box by hand')
+                return
             m['claimed'], m['robot'] = None, ''
             m['releases'] += 1
-            self.get_logger().info(f'{c.robot_id} gave {c.resource_id} back; re-offered when its arm is available')
-        elif c.action == Claim.DONE and m['done'] is None:
+            m['reclaims'] += by_peer
+            self.get_logger().info(f'{c.robot_id} gave {c.resource_id} back'
+                                   f'{f" (announced by {c.by}: silent robot)" if by_peer else ""}; re-offered')
+        elif c.action == Claim.DONE and (m['done'] is None or m['cancelled']):
+            if m['stranded']:
+                self.get_logger().info(f'{c.resource_id}: stranded box delivered by {c.robot_id} after all')
+            if m['cancelled']:                   # claimed in the same instant it was withdrawn, and done anyway
+                m['cancelled'] = False
+                self.cancelled -= 1
             m['done'] = self.now()
             if m['bin']:
                 self.bins[m['bin']] = m['kind'] == 'inbound'
@@ -206,6 +356,8 @@ class MissionGenerator(Node):
         m = self.meta.get(x.task_id)
         if m is not None and x.kind in (Transfer.PALLET_TO_ROBOT, Transfer.ROBOT_TO_PALLET):
             m['at_arm'] = True               # the arm's stock / free slots now account for it
+        if m is not None and x.kind in (Transfer.PALLET_TO_ROBOT, Transfer.BIN_TO_ROBOT):
+            m['on_robot'] = True             # the box left its pallet / bin: the task can't simply be redone
 
     def log_battery(self):
         if self.t0 is None:
@@ -218,9 +370,12 @@ class MissionGenerator(Node):
     def on_state(self, s):
         prev = self.robots.get(s.robot_id)
         self.robots[s.robot_id] = s
+        self.robot_rx[s.robot_id] = wallclock.monotonic()
+        self.reconcile(s)
         dt = 0.2
         sh = self.shares.setdefault(s.robot_id, dict(driving=0.0, yielding=0.0, station=0.0, charging=0.0, idle=0.0, dist=0.0))
-        key = {RobotState.YIELDING: 'yielding', RobotState.AT_STATION: 'station', RobotState.IDLE: 'idle',
+        key = {RobotState.YIELDING: 'yielding', RobotState.ISOLATED: 'yielding', RobotState.AT_STATION: 'station',
+               RobotState.IDLE: 'idle',
                RobotState.CHARGING: 'charging', RobotState.TO_CHARGE: 'charging'}.get(s.status, 'driving')
         if s.status == RobotState.IDLE and s.speed > 0.05:
             key = 'driving'
@@ -255,7 +410,7 @@ class MissionGenerator(Node):
         if self.t0 is None:
             return
         el = max(self.now() - self.t0, 1e-6)
-        done = [m for m in self.meta.values() if m['done'] is not None]
+        done = [m for m in self.meta.values() if m['done'] is not None and not m['cancelled']]
         by = {k: sum(1 for m in done if m['kind'] == k) for k in ('inbound', 'outbound', 'goto')}
         lat = [m['done'] - m['offered'] for m in done]
         tot = {k: sum(sh[k] for sh in self.shares.values()) for k in ('driving', 'yielding', 'station', 'charging', 'idle')}
@@ -270,7 +425,9 @@ class MissionGenerator(Node):
                 + f"| distance {sum(sh['dist'] for sh in self.shares.values()):.0f} m "
                 + f"| battery now {' '.join(f'{100 * r.battery:.0f}' for _, r in sorted(self.robots.items()))} % "
                 + f"min {100 * self.min_soc[0]:.0f}% ({self.min_soc[1]}) charge sessions {self.sessions} "
-                + f"ran empty {len(self.empty)}")
+                + f"ran empty {len(self.empty)} "
+                + f"| re-auctioned {sum(m['reclaims'] for m in self.meta.values())} "
+                + f"stranded {sum(m['stranded'] and m['done'] is None for m in self.meta.values())} withdrawn {self.cancelled}")
         self.get_logger().info(line)
         docks = []
         for bay in sorted(self.dock):

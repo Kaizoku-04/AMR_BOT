@@ -15,6 +15,7 @@ Rules, identical on every robot so both sides of a conflict reach the same decis
   4. Look-ahead: hold nodes along the route until `horizon_m` of path is reserved (or `max_nodes`), so the
      controller cruises instead of stopping at every node, but never a node beyond horizon + `overreach_m` unless
      it is the very next one; release a node once `release_dist` past it.
+  5. No new nodes on a stale view (`extend=False`, liveness.py rule 3): keep what is held, add nothing.
 """
 import math
 from dataclasses import dataclass, field
@@ -54,13 +55,13 @@ def wait_chain(me_id, waits):
     return chain, (chain[chain.index(cur):] if cur is not None else [])
 
 
-def plan_reservations(graph, route, next_idx, me, peers, held, p: TrafficParams = TrafficParams()):
+def plan_reservations(graph, route, next_idx, me, peers, held, p: TrafficParams = TrafficParams(), extend=True):
     """Decide which nodes this robot holds this cycle.
 
     graph: LaneGraph; route: node ids of the current leg; next_idx: index in `route` of the first node not yet
     reached; me: Peer for this robot (x, y, wait_s, robot_id); peers: live Peers; held: nodes held last cycle.
     Returns (reserved node list in route order, blocked) where blocked means the route continues past the last
-    reserved node but the next node is taken.
+    reserved node but the next node is taken (or, with extend=False, not held already).
     """
     x, y = me.x, me.y
     d_to = lambda n: math.hypot(graph.pos[n][0] - x, graph.pos[n][1] - y)
@@ -82,7 +83,7 @@ def plan_reservations(graph, route, next_idx, me, peers, held, p: TrafficParams 
         # "stands within 0.9 m of a node" made two agents block each other's next node -> deadlock (2026-09-25)
         standing = [q for q in peers if not q.reserved and
                     math.hypot(graph.pos[n][0] - q.x, graph.pos[n][1] - q.y) < p.occupy_dist]
-        if standing:
+        if standing or (not extend and n not in held):
             return reserved, True
         if holders:
             if n not in held:

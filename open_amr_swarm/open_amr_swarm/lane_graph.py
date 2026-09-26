@@ -69,3 +69,63 @@ class LaneGraph:
                         heapq.heappush(pq, (dv, v))
             self._dist_from[a] = d
         return self._dist_from[a].get(b, math.inf)
+
+    def network(self, blocked):
+        """The lane network left when `blocked` nodes (e.g. where a silent robot stands) are removed:
+        (main, out) where main = the largest strongly connected set (every node in it can reach and be reached from
+        every other) and out = the nodes that can still drive into main."""
+        blocked = set(blocked)
+        nodes = [n for n in self.pos if n not in blocked]
+        succ = {n: [m for m in self.succ.get(n, []) if m not in blocked] for n in nodes}
+        pred = {n: [] for n in nodes}
+        for n in nodes:
+            for m in succ[n]:
+                pred[m].append(n)
+        # Kosaraju, iterative: finish order on succ, then components on pred
+        order, seen = [], set()
+        for r in nodes:
+            if r in seen:
+                continue
+            seen.add(r)
+            stack = [(r, iter(succ[r]))]
+            while stack:
+                n, it = stack[-1]
+                nxt = next((m for m in it if m not in seen), None)
+                if nxt is None:
+                    stack.pop(); order.append(n)
+                else:
+                    seen.add(nxt); stack.append((nxt, iter(succ[nxt])))
+        comp, main = {}, set()
+        for r in reversed(order):
+            if r in comp:
+                continue
+            cur, stack = {r}, [r]
+            comp[r] = r
+            while stack:
+                for m in pred[stack.pop()]:
+                    if m not in comp:
+                        comp[m] = r; cur.add(m); stack.append(m)
+            if len(cur) > len(main):
+                main = cur
+        out, stack = set(main), list(main)
+        while stack:
+            for m in pred[stack.pop()]:
+                if m not in out:
+                    out.add(m); stack.append(m)
+        return main, out
+
+    def trapped(self, blocked):
+        """Nodes (not blocked) from which the lane network can no longer be reached: on one-way lanes a stopped robot
+        turns the stretch behind it into a dead end — a robot in there can't get out."""
+        if not blocked:
+            return set()
+        _, out = self.network(blocked)
+        return {n for n in self.pos if n not in blocked and n not in out}
+
+    def cut_off(self, blocked):
+        """Nodes (not blocked) outside the lane network: can't be driven out of (trapped) or can't be driven into
+        (e.g. an aisle whose only entrance a silent robot blocks). Nobody should be sent there."""
+        if not blocked:
+            return set()
+        main, _ = self.network(blocked)
+        return {n for n in self.pos if n not in blocked and n not in main}

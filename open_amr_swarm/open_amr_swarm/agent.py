@@ -16,6 +16,11 @@ Behaviours (design: OpenAMR notes/Swarm Design.md, notes/Mission Design.md):
   energy      Reads the robot's BMS (`battery_state`, sensor_msgs/BatteryState). Bids only on tasks it can finish
               with reserve to spare, charges below `low` until `resume`, tops up whenever idle; chargers claimed
               through `goal_node` in the heartbeat. Rules: energy.py.
+  liveness    A silent peer stays where it was last heard (its reserved nodes stay blocked, its charger taken, routes
+              avoid it) until heard again or released by an operator (/swarm/operator). Without a quorum of the fleet
+              the robot stops at its next held node (ISOLATED). A silent claimant's task is given back by the lowest
+              live id; a robot stuck too long gives its own back — never with a box on the deck. Action goals whose
+              acknowledgement or result is lost are resent / re-requested. Rules: liveness.py.
 Runs in the robot's namespace (/amr_i) with /tf remapped to tf; uses sim time.
 """
 import math
@@ -26,6 +31,7 @@ import rclpy.executors
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.time import Time
 import tf2_ros
 
@@ -36,16 +42,19 @@ from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap, DynamicEdges
 from nav_msgs.msg import Path
 from sensor_msgs.msg import BatteryState
-from open_amr_msgs.msg import Bid, Claim, RobotState, StationState, Task, Transfer
+from open_amr_msgs.msg import Bid, Claim, OperatorCommand, RobotState, StationState, Task, Transfer
 
 from .energy import (ChargeParams, ChargerPeer, DrainEstimator, bid_penalty_s, can_take, evictions, pick_charger,
                      task_need, waiting_for_charger)
 from .lane_graph import LaneGraph
+from .liveness import (LivenessParams, Pending, acked, announcer, ghost_hold, outranks, quorum, reclaimable)
 from .traffic import Peer, TrafficParams, plan_reservations, wait_chain
 
 STATE_QOS = QoSProfile(depth=20, reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST)
 EVENT_QOS = QoSProfile(depth=100, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE,
                        history=HistoryPolicy.KEEP_LAST)
+OPERATOR_QOS = QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                          history=HistoryPolicy.KEEP_LAST)
 
 
 def stamp_s(t):
@@ -78,6 +87,18 @@ class SwarmAgent(Node):
         self.station_giveup = dp('station_giveup_s', 30.0).value   # empty robot: arm out of service this long -> give the task back
         self.station_timeout = dp('station_timeout_s', 3.0).value  # heartbeat older than this = station down
         self.peer_timeout = dp('peer_timeout_s', 3.0).value
+        self.lp = LivenessParams(peer_timeout_s=self.peer_timeout, ghost_extra_m=dp('ghost_extra_m', 2.0).value,
+                                 reclaim_silent_s=dp('reclaim_silent_s', 20.0).value,
+                                 reclaim_stuck_s=dp('reclaim_stuck_s', 120.0).value)
+        # lost acknowledgements (wall s): an action goal not accepted in ack_timeout is resent, a route not computed in
+        # route_timeout is requested again, a result not received result_poll_s after the robot stopped is re-requested
+        self.ack_timeout = dp('ack_timeout_s', 3.0).value
+        self.route_timeout = dp('route_timeout_s', 10.0).value
+        self.result_poll = dp('result_poll_s', 30.0).value   # > Nav2's 10 s progress-checker abort
+        # test hook (fault injection): true = this robot's swarm link is cut, nothing in or out on /swarm/* (its own
+        # Nav2 and sensors keep working, as on a real robot whose Wi-Fi drops). `ros2 param set ... link_down true`
+        self.link_down = dp('link_down', False).value
+        self.add_on_set_parameters_callback(self.on_params)
         # fleet roster (launch passes every robot id): don't act before hearing every peer (DDS discovery can take
         # seconds, and a robot it can't hear is invisible to reservations and charger claims), warn when one goes quiet
         self.fleet = [r for r in dp('fleet', ['']).value if r and r != self.rid]
@@ -115,13 +136,25 @@ class SwarmAgent(Node):
         self.create_subscription(Bid, '/swarm/bids', self.on_bid, EVENT_QOS)
         self.create_subscription(Claim, '/swarm/claims', self.on_claim, EVENT_QOS)
         self.create_subscription(StationState, '/swarm/stations', self.on_station, STATE_QOS)
+        self.create_subscription(OperatorCommand, '/swarm/operator', self.on_operator, OPERATOR_QOS)
         self.route_client = ActionClient(self, ComputeRoute, 'compute_route')
         self.follow_client = ActionClient(self, FollowPath, 'follow_path')
         self.clear_local = self.create_client(ClearEntireCostmap, 'local_costmap/clear_entirely_local_costmap')
         self.create_subscription(BatteryState, 'battery_state', self.on_battery, 10)
 
         # world knowledge
-        self.peers = {}                  # robot_id -> (RobotState, receive wall time)
+        self.peers = {}                  # robot_id -> (RobotState, receive wall time); kept when silent (a ghost)
+        self.released = {}               # robot_id -> sim stamp of the operator's release (silence before it forgiven)
+        self.has_quorum, self.isolated_since, self.ack_waits = True, None, 0
+        self.seq, self.first_seq, self.confirmed = 0, {}, set()   # acknowledged reservations (liveness rule 3)
+        self.ghost_closed = {}           # edge id -> ghost robot: lanes into a silent robot's nodes, closed for routing
+        self.reclaimed = set()           # (task_id, round) given back on a silent claimant's behalf (announce once)
+        self.claim_round = {}            # task_id -> auction round of the claim in self.claims
+        self.stranded = set()            # (robot, task_id): silent with a box on the deck (logged once)
+        self.in_edges = {}               # node -> [(from node, lane id)] of the lanes into it
+        for (a, b), eid in self.graph.edge_id.items():
+            self.in_edges.setdefault(b, []).append((a, eid))
+        self.cut_off_cache, self.trapped_logged = (None, (set(), set())), False
         self.stations = {}               # bay node id -> (StationState, receive wall time)
         self.station_down_since = None
         self.tasks, self.claims, self.done = {}, {}, set()
@@ -134,6 +167,10 @@ class SwarmAgent(Node):
         self.charging, self.must_charge, self.charger = False, False, None
         self.no_charger_logged, self.dock_check_at, self.redocks = False, None, 0
         self.task, self.legs, self.leg = None, [], None
+        self.loaded = False              # a box is on the deck (pickup started .. drop done)
+        self.noroute_since, self.noroute_parked = None, False
+        self.noroute_s = dp('noroute_giveup_s', 30.0).value   # target unreachable this long: give back / wait parked
+        self.stuck_since = None
         self.last_node, self.route, self.path, self.node_idx = None, [], None, []
         self.next_idx, self.reserved, self.blocked = 0, [], False
         self.stop_at = set()
@@ -142,6 +179,8 @@ class SwarmAgent(Node):
         self.dwell_until, self.idle_since = 0.0, 0.0
         self.follow_handle, self.follow_end, self.follow_state = None, None, None
         self.route_pending, self.bid_pending = False, False
+        self.route_req, self.bid_req, self.follow_req = Pending(), Pending(), Pending()
+        self.result_polled_at, self.still_since = 0.0, None
         self.leg_fail = 0
         self.create_timer(0.2, self.tick)
         self.get_logger().info(f'{self.rid}: swarm agent up, {len(self.chargers)} chargers, '
@@ -151,40 +190,108 @@ class SwarmAgent(Node):
     def now(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
+    def on_params(self, params):
+        for prm in params:
+            if prm.name == 'link_down':
+                self.link_down = bool(prm.value)
+                self.get_logger().warn(f'{self.rid}: TEST swarm link {"CUT" if self.link_down else "restored"}')
+        return SetParametersResult(successful=True)
+
     def on_state(self, m):
-        if m.robot_id != self.rid:
-            self.peers[m.robot_id] = (m, wallclock.monotonic())
-            # two winners of one task (bids or claims lost, e.g. while DDS discovery is still settling): the
-            # heartbeat is state, so this repairs itself even when the claim events never arrive — lower id keeps it
-            if self.task is not None and m.task_id == self.task.task_id and m.robot_id < self.rid:
-                self.get_logger().warn(f'{self.rid}: {m.robot_id} is also doing {m.task_id} and wins the tie; dropping it')
-                self.claims[m.task_id] = m.robot_id
-                self.abort_task()
+        if self.link_down or m.robot_id == self.rid:
+            return
+        prev = self.peers.get(m.robot_id)
+        if prev is not None and wallclock.monotonic() - prev[1] >= self.peer_timeout:
+            self.get_logger().info(f'{self.rid}: hears {m.robot_id} again after '
+                                   f'{wallclock.monotonic() - prev[1]:.0f} s')
+        if m.robot_id in self.released and stamp_s(m.stamp) > self.released[m.robot_id]:
+            del self.released[m.robot_id]
+            self.get_logger().warn(f'{self.rid}: released robot {m.robot_id} is back in the fleet')
+        self.peers[m.robot_id] = (m, wallclock.monotonic())
+        # two robots on one task (bids or claims lost, e.g. while DDS discovery is still settling, or a re-auction the
+        # original claimant never heard): the heartbeat is state, so this repairs itself even when the claim events
+        # never arrive — a box on the deck wins, then the newer auction round, then the lower id (liveness.outranks)
+        if self.task is not None and m.task_id == self.task.task_id and \
+                outranks((m.loaded, m.task_round, m.robot_id), (self.loaded, self.task.round, self.rid)):
+            self.get_logger().warn(f'{self.rid}: {m.robot_id} is also doing {m.task_id} (round {m.task_round}) and '
+                                   f'outranks me (round {self.task.round}); dropping it')
+            self.claims[m.task_id], self.claim_round[m.task_id] = m.robot_id, m.task_round
+            self.abort_task()
 
     def on_task(self, m):
+        if self.link_down:
+            return
         cur = self.tasks.get(m.task_id)
         if cur is None or m.round >= cur.round:
             self.tasks[m.task_id] = m
+        # the WMS re-targets my box to another bin (its bin was cut off): drive there instead
+        if self.task is not None and m.task_id == self.task.task_id and m.dest_id and m.dest_id != self.task.dest_id \
+                and self.loaded:
+            self.get_logger().warn(f'{self.rid}: WMS re-targets {m.task_id} to {m.dest_id} (was {self.task.dest_id})')
+            self.task = m
+            new = self.graph.id(m.dest_id)
+            for leg in ([self.leg] if self.leg is not None else []) + self.legs:
+                if leg.drive_status == RobotState.TO_DROP and not leg.station:
+                    leg.target = new
+            if self.phase in ('driving', 'retry') and self.leg is not None and self.leg.target == new:
+                if self.phase == 'driving' and self.next_idx > 0:
+                    self.replan('drop re-targeted')
+                else:
+                    self.stop_following()
+                    self.legs.insert(0, self.leg); self.leg = None
+                    self.phase, self.retry_at = 'retry', self.now()
 
     def on_bid(self, m):
+        if self.link_down:
+            return
         self.bids.setdefault((m.task_id, m.round), {})[m.robot_id] = m.cost
 
     def on_claim(self, m):
-        if m.resource_type != Claim.TASK:
+        if self.link_down or m.resource_type != Claim.TASK:
             return
+        tid = m.resource_id
         if m.action == Claim.CLAIM:
-            prev = self.claims.get(m.resource_id)
-            self.claims[m.resource_id] = m.robot_id if prev is None else min(prev, m.robot_id)
+            prev = self.claims.get(tid)
+            if prev is None or outranks((False, m.round, m.robot_id), (False, self.claim_round.get(tid, 0), prev)):
+                self.claims[tid], self.claim_round[tid] = m.robot_id, m.round
             # conflicting claim (message loss): the same rule decides; the loser drops the task
-            if self.task and self.task.task_id == m.resource_id and m.robot_id != self.rid and m.robot_id < self.rid:
-                self.get_logger().warn(f'{self.rid}: {m.robot_id} also claimed {m.resource_id} and wins the tie; dropping it')
+            if self.task and self.task.task_id == tid and m.robot_id != self.rid and not self.loaded and \
+                    outranks((False, m.round, m.robot_id), (False, self.task.round, self.rid)):
+                self.get_logger().warn(f'{self.rid}: {m.robot_id} also claimed {tid} and outranks me; dropping it')
                 self.abort_task()
-        elif m.action == Claim.DONE:
-            self.done.add(m.resource_id)
-        elif m.action == Claim.RELEASE and self.claims.get(m.resource_id) == m.robot_id:
-            del self.claims[m.resource_id]        # given back: open again when the WMS re-offers it
+        elif m.action in (Claim.DONE, Claim.CANCEL):
+            self.done.add(tid)
+            if m.action == Claim.CANCEL and self.task is not None and self.task.task_id == tid and not self.loaded:
+                self.get_logger().warn(f'{self.rid}: the WMS withdrew {tid}; dropping it')
+                self.claims.pop(tid, None)
+                self.abort_task()
+        elif m.action == Claim.RELEASE:
+            if m.by and m.by != m.robot_id:
+                self.reclaimed.add((tid, m.round))
+            if self.claims.get(tid) == m.robot_id:
+                del self.claims[tid]              # given back: open again when the WMS re-offers it
+            # my own task, given back on my behalf while my peers couldn't hear me: it's being re-auctioned
+            if m.robot_id == self.rid and m.by and m.by != self.rid and self.task is not None and \
+                    self.task.task_id == tid and self.task.round == m.round:
+                if self.loaded:
+                    self.get_logger().error(f'{self.rid}: {m.by} gave my {tid} back while the box is on my deck; '
+                                            f'delivering it anyway')
+                else:
+                    self.get_logger().warn(f'{self.rid}: {m.by} gave {tid} back on my behalf (I was silent); dropping it')
+                    self.abort_task()
+
+    def on_operator(self, m):
+        if self.link_down:
+            return
+        if m.command == OperatorCommand.RELEASE_ROBOT and m.target != self.rid:
+            self.released[m.target] = stamp_s(m.stamp)
+            self.get_logger().warn(f'{self.rid}: operator {m.issued_by or "?"} released {m.target}'
+                                   f'{": " + m.reason if m.reason else ""} — its lanes and charger are free, '
+                                   f'it no longer counts for quorum')
 
     def on_station(self, m):
+        if self.link_down:
+            return
         if m.bay_node in self.graph.by_name:
             self.stations[self.graph.by_name[m.bay_node]] = (m, wallclock.monotonic())
 
@@ -219,7 +326,7 @@ class SwarmAgent(Node):
         if missing != self.missing:
             if missing:
                 self.get_logger().warn(f'{self.rid}: can\'t hear {missing} '
-                                       f'({"waiting before acting" if not self.synced else "they are invisible to traffic control"})')
+                                       f'({"waiting before acting" if not self.synced else "held where last heard"})')
             elif self.missing is not None:
                 self.get_logger().info(f'{self.rid}: hears all {len(self.fleet)} peers'
                                        f'{f" after {t - self.t_up:.0f} s" if not self.synced else ""}')
@@ -229,10 +336,73 @@ class SwarmAgent(Node):
             self.idle_since = self.now()
         return self.synced
 
-    def live_peers(self):
+    def heard(self):
         t = wallclock.monotonic()
-        return [Peer(s.robot_id, s.pose.x, s.pose.y, list(s.reserved_nodes), s.wait_s)
-                for s, rx in self.peers.values() if t - rx < self.peer_timeout]
+        return [r for r, (_, rx) in self.peers.items() if t - rx < self.peer_timeout]
+
+    def ghosts(self):
+        """Silent peers not released by an operator: robot_id -> (last RobotState, silent for s, nodes held)."""
+        t, out = wallclock.monotonic(), {}
+        for rid, (s, rx) in self.peers.items():
+            if t - rx < self.peer_timeout:
+                continue
+            if rid in self.released and self.released[rid] >= stamp_s(s.stamp):
+                continue
+            out[rid] = (s, t - rx, ghost_hold(self.graph, list(s.reserved_nodes), list(s.route), s.pose.x, s.pose.y,
+                                               self.lp.ghost_extra_m))
+        return out
+
+    def cut_off(self, ghosts=None):
+        """(nodes silent robots hold, nodes cut off by them): on one-way lanes a stopped robot can leave a stretch with
+        no way out (trapped) or no way in; nobody is sent there (liveness rule 1, LaneGraph.cut_off)."""
+        ghosts = self.ghosts() if ghosts is None else ghosts
+        held = frozenset(n for _, _, h in ghosts.values() for n in h)
+        if self.cut_off_cache[0] != held:
+            self.cut_off_cache = (held, (set(held), self.graph.cut_off(held), self.graph.trapped(held)))
+        return self.cut_off_cache[1][:2]
+
+    def trapped_nodes(self):
+        self.cut_off()
+        return self.cut_off_cache[1][2]
+
+    def confirm(self):
+        """Liveness rule 3: reserved nodes every peer I hear has acknowledged. Returns the confirmed set."""
+        t = wallclock.monotonic()
+        live = [s for s, rx in self.peers.values() if t - rx < self.peer_timeout]
+        self.confirmed &= set(self.reserved)
+        for n in self.reserved:
+            if n not in self.confirmed and acked(self.first_seq.get(n), self.rid, live):
+                self.confirmed.add(n)
+        return self.confirmed
+
+    def live_peers(self):
+        """Traffic view: peers heard recently, plus silent ones frozen where they were last heard (a ghost holds its
+        reservations and never ages)."""
+        t = wallclock.monotonic()
+        out = [Peer(s.robot_id, s.pose.x, s.pose.y, list(s.reserved_nodes), s.wait_s)
+               for s, rx in self.peers.values() if t - rx < self.peer_timeout]
+        out += [Peer(rid, s.pose.x, s.pose.y, held, 0.0) for rid, (s, _, held) in self.ghosts().items()]
+        return out
+
+    def check_quorum(self):
+        """Liveness rule 2. Logs transitions; while isolated the robot takes no new work and stops at its next node."""
+        q = quorum(self.rid, self.heard(), self.fleet, self.released) if self.fleet else True
+        if q != self.has_quorum:
+            now = self.now()
+            if q:
+                self.get_logger().warn(f'{self.rid}: hears a quorum of the fleet again after '
+                                       f'{now - self.isolated_since:.0f} s isolated; resuming')
+                self.isolated_since = None
+            else:
+                self.isolated_since = now
+                self.get_logger().error(f'{self.rid}: ISOLATED — hears only {sorted(self.heard())} of {self.fleet}; '
+                                        f'stopping at my next held node')
+            self.has_quorum = q
+        return q
+
+    def send(self, pub, msg):
+        if not self.link_down:
+            pub.publish(msg)
 
     # ------------------------------------------------------------------ main loop
     def tick(self):
@@ -245,8 +415,15 @@ class SwarmAgent(Node):
         if not self.check_peers():
             self.publish_state()           # heartbeat only until every peer is heard
             return
-        self.auction()
-        self.check_station()
+        self.check_quorum()
+        self.check_requests()
+        if self.has_quorum:                # isolated: no new work, no re-auctions, no energy moves (liveness rule 2)
+            self.auction()
+            self.check_station()
+            self.reclaim_for_silent()
+            self.update_ghost_edges()
+            self.check_stuck()
+            self.check_noroute()
         if self.phase == 'driving':
             self.drive()
         elif self.phase == 'dwelling':
@@ -255,9 +432,145 @@ class SwarmAgent(Node):
             self.next_leg(first=True)
         elif self.phase == 'idle':
             self.reserved = [self.last_node]
-            self.idle_energy()
+            if self.has_quorum:
+                self.idle_energy()
         self.energy_status()
         self.publish_state()
+
+    def check_requests(self):
+        """Action requests whose answer never came (a response dropped by DDS under load: seen as 'Failed to send goal
+        response (timeout)' in Nav2 at fleet scale): ask again. Late answers to abandoned requests are ignored (tokens)."""
+        t = wallclock.monotonic()
+        if self.phase == 'routing' and self.route_req.overdue(t, self.route_timeout):
+            self.get_logger().warn(f'{self.rid}: no answer from the route server in {self.route_timeout:.0f} s; asking again')
+            self.route_req.clear()
+            self.legs.insert(0, self.leg); self.leg = None
+            self.phase, self.retry_at = 'retry', self.now()
+        if self.bid_pending and self.bid_req.overdue(t, self.ack_timeout):
+            self.bid_req.clear(); self.bid_pending = False     # the bid window has passed anyway
+        if self.follow_req.overdue(t, self.ack_timeout):
+            self.get_logger().warn(f'{self.rid}: FollowPath goal not acknowledged in {self.ack_timeout:.0f} s; resending')
+            self.follow_req.clear()
+            self.follow_end, self.follow_state = None, None    # drive() sends it again
+        # result lost: goal accepted, robot standing still, no result for result_poll_s -> request the result again
+        if self.follow_handle is not None and self.follow_state == GoalStatus.STATUS_EXECUTING and self.speed_est < 0.02:
+            self.still_since = self.still_since or t
+            if t - self.still_since > self.result_poll and t - self.result_polled_at > self.result_poll:
+                self.result_polled_at = t
+                self.get_logger().info(f'{self.rid}: no FollowPath result after {t - self.still_since:.0f} s standing '
+                                       f'still; requesting it again')
+                h = self.follow_handle
+                h.get_result_async().add_done_callback(lambda r, h=h: self.on_follow_done(h, r))
+        else:
+            self.still_since = None
+
+    def edges(self):
+        """This robot's route_server adjust_edges client (None until the service is found)."""
+        if self.edges_client is None:
+            ns = self.get_namespace().rstrip('/')
+            names = [n for n, _ in self.get_service_names_and_types() if n.startswith(ns + '/') and n.endswith('adjust_edges')]
+            if names:
+                self.edges_client = self.create_client(DynamicEdges, names[0])
+        return self.edges_client
+
+    def update_ghost_edges(self):
+        """Routing avoids silent robots: the lanes into the nodes a ghost holds are closed in this robot's route
+        server (reopened when it's heard again or released). A route already passing one is planned again."""
+        ghosts = self.ghosts()
+        held, cut = self.cut_off(ghosts)
+        # lanes into a ghost's nodes, and the entrances of what it cuts off (lanes inside stay open so a robot caught
+        # in there can still finish what it can)
+        want = {eid: 1 for n in held for _, eid in self.in_edges.get(n, ())}
+        want.update({eid: 1 for n in cut for a, eid in self.in_edges.get(n, ()) if a not in cut})
+        trapped = self.trapped_nodes()
+        if self.last_node in trapped and not self.trapped_logged:
+            self.trapped_logged = True
+            self.get_logger().error(f'{self.rid}: TRAPPED at {self.graph.name[self.last_node]}: every way out passes '
+                                    f'silent {sorted(ghosts)} — waiting for an operator')
+        elif self.last_node not in trapped:
+            self.trapped_logged = False
+        if want.keys() == self.ghost_closed.keys() or self.edges() is None:
+            return
+        closed = sorted(set(want) - set(self.ghost_closed))
+        opened = sorted(set(self.ghost_closed) - set(want))
+        self.edges_client.call_async(DynamicEdges.Request(closed_edges=closed, opened_edges=opened))
+        self.ghost_closed = want
+        self.get_logger().info(f'{self.rid}: routing around silent {sorted(ghosts) or "nobody"} '
+                               f'({len(closed)} lanes closed, {len(opened)} reopened, {len(cut)} nodes cut off)')
+        blocked = held | cut
+        if closed and self.phase == 'driving' and self.leg is not None and self.next_idx > 0 and \
+                blocked & set(self.route[self.next_idx:]) and self.route[self.next_idx] not in self.reserved:
+            self.replan(f'my route passes silent {sorted(ghosts)}')
+
+    def replan(self, why):
+        """Plan the current leg again from the node just passed (the route server has changed lanes)."""
+        self.get_logger().warn(f'{self.rid}: {why}; re-planning to {self.graph.name[self.leg.target]}')
+        self.stop_following()
+        self.legs.insert(0, self.leg)
+        self.last_node, self.phase = self.route[self.next_idx - 1], 'rerouting'
+        self.next_leg(first=True)
+
+    def reclaim_for_silent(self):
+        """Liveness rule 4: the task of a claimant silent for reclaim_silent_s (or released by an operator) is given
+        back on its behalf by the lowest-id robot I can hear (myself included) — once per task round."""
+        t = wallclock.monotonic()
+        for rid, (s, rx) in self.peers.items():
+            if t - rx < self.peer_timeout or not s.task_id or s.task_id in self.done:
+                continue
+            released = rid in self.released and self.released[rid] >= stamp_s(s.stamp)
+            if s.loaded and (rid, s.task_id) not in self.stranded:
+                self.stranded.add((rid, s.task_id))
+                self.get_logger().error(f'{self.rid}: {rid} went silent with a box on its deck ({s.task_id}); '
+                                        f'its task stays with it — a person has to recover the box')
+            key = (s.task_id, s.task_round)
+            if key in self.reclaimed or self.claims.get(s.task_id) not in (None, rid) or \
+                    not reclaimable(t - rx, released, s.task_id, s.loaded, self.lp):
+                continue
+            if announcer(self.rid, self.heard()) != self.rid:
+                continue
+            self.reclaimed.add(key)
+            self.claims.pop(s.task_id, None)
+            self.get_logger().warn(f'{self.rid}: {rid} silent for {t - rx:.0f} s{" (released)" if released else ""}: '
+                                   f'giving its task {s.task_id} back for re-auction')
+            self.send(self.pub_claim, Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.TASK,
+                                            resource_id=s.task_id, robot_id=rid, action=Claim.RELEASE,
+                                            round=s.task_round, by=self.rid))
+
+    def check_noroute(self):
+        """The leg's target has been unreachable for noroute_s (a silent robot cut it off): don't wait in the lane.
+        Empty: give the task back (or drop the trip to a charger / parking spot). Loaded: wait on a parking spot and
+        try again from there (the WMS may re-target the box to another bin meanwhile)."""
+        if self.phase != 'retry' or self.noroute_since is None or self.now() - self.noroute_since < self.noroute_s:
+            return
+        target = self.legs[0].target if self.legs else None
+        self.noroute_since = None
+        if self.task is None:
+            self.get_logger().warn(f'{self.rid}: {self.graph.name.get(target, target)} unreachable; choosing another spot')
+            self.legs, self.leg = [], None
+            self.phase, self.status, self.idle_since = 'idle', RobotState.IDLE, self.now() - self.idle_park_s
+        elif not self.loaded:
+            self.give_back(f'{self.graph.name.get(target, target)} unreachable for {self.noroute_s:.0f} s')
+        elif not self.noroute_parked and self.last_node not in self.parking:
+            spot = self.pick(self.last_node, self.parking)
+            if spot is not None:
+                self.noroute_parked = True
+                self.get_logger().warn(f'{self.rid}: loaded, {self.graph.name.get(target, target)} unreachable; waiting at '
+                                       f'{self.graph.name[spot]} out of the lanes')
+                self.legs.insert(0, Leg(spot, 0.0, self.legs[0].drive_status if self.legs else RobotState.TO_DROP,
+                                        final_precise=False))
+                self.next_leg(first=True)
+
+    def check_stuck(self):
+        """Liveness rule 4: an empty robot that can't make progress for reclaim_stuck_s (controller failing, battery
+        empty, blocked, or no route) gives its task back so another robot can do it."""
+        stuck = self.status == RobotState.STUCK or self.wait_s > 0.0 or self.phase == 'retry'
+        if self.task is None or self.loaded or not stuck:
+            self.stuck_since = None
+            return
+        now = self.now()
+        self.stuck_since = self.stuck_since or now
+        if now - self.stuck_since > self.lp.reclaim_stuck_s:
+            self.give_back(f'no progress for {now - self.stuck_since:.0f} s')
 
     def update_pose(self):
         try:
@@ -314,6 +627,8 @@ class SwarmAgent(Node):
             if self.handshake and any(self.graph.kind.get(self.graph.id(n)) == 'bay' and self.station_down(self.graph.id(n))
                                       for n in (t.origin_id, t.dest_id) if n):
                 continue                                  # its arm is out of service
+            if any(self.graph.id(n) in b for n in (t.origin_id, t.dest_id) if n for b in self.cut_off()):
+                continue                                  # a silent robot blocks it (the WMS withdraws it too)
             self.bid_pending = True
             self.estimate(self.start_node(), self.graph.id(t.origin_id), lambda cost, t=t: self.send_bid(t, cost))
             return
@@ -327,15 +642,22 @@ class SwarmAgent(Node):
         g = ComputeRoute.Goal(); g.start_id, g.goal_id, g.use_start, g.use_poses = start, goal, False, False
         if not self.route_client.wait_for_server(timeout_sec=0.0):
             self.bid_pending = False; return
+        tok = self.bid_req.send(wallclock.monotonic())
         fut = self.route_client.send_goal_async(g)
 
         def got_handle(f):
             h = f.result()
+            if not self.bid_req.current(tok):
+                return                                   # abandoned (answer came too late)
             if not h.accepted:
-                self.bid_pending = False; return
-            h.get_result_async().add_done_callback(
-                lambda r: cb(self.graph.route_length([n.nodeid for n in r.result().result.route.nodes]) / self.speed
-                             if r.result().result.error_code == 0 else None))
+                self.bid_req.clear(); self.bid_pending = False; return
+
+            def got_result(r):
+                if self.bid_req.ack(tok):
+                    res = r.result().result
+                    cb(self.graph.route_length([n.nodeid for n in res.route.nodes]) / self.speed
+                       if res.error_code == 0 else None)
+            h.get_result_async().add_done_callback(got_result)
         fut.add_done_callback(got_handle)
 
     def send_bid(self, t, cost):
@@ -348,13 +670,13 @@ class SwarmAgent(Node):
                 cost=float(cost))
         self.my_bids[(t.task_id, t.round)] = cost
         self.on_bid(b)
-        self.pub_bid.publish(b)
+        self.send(self.pub_bid, b)
 
     def claim_and_start(self, t):
-        self.claims[t.task_id] = self.rid
+        self.claims[t.task_id], self.claim_round[t.task_id] = self.rid, t.round
         self.set_charger(None)
-        self.pub_claim.publish(Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.TASK,
-                                     resource_id=t.task_id, robot_id=self.rid, action=Claim.CLAIM))
+        self.send(self.pub_claim, Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.TASK,
+                                     resource_id=t.task_id, robot_id=self.rid, action=Claim.CLAIM, round=t.round))
         o = self.graph.id(t.origin_id)
         if t.type == Task.GOTO:
             legs = [Leg(o, 0.0, RobotState.TO_PICK)]
@@ -368,7 +690,8 @@ class SwarmAgent(Node):
         self.start_legs(legs, task=t)
 
     def abort_task(self):
-        self.task, self.legs = None, []
+        self.task, self.legs, self.loaded, self.stuck_since = None, [], False, None
+        self.noroute_since, self.noroute_parked = None, False
         self.stop_following()
         self.phase = 'idle'; self.status = RobotState.IDLE; self.idle_since = self.now()
 
@@ -378,6 +701,9 @@ class SwarmAgent(Node):
         self.next_leg(first=True)
 
     def next_leg(self, first=False):
+        if not first and self.leg is not None and self.task is not None and self.task.type != Task.GOTO and \
+                self.leg.drive_status == RobotState.TO_PICK:
+            self.loaded = True                 # the pickup leg is done: the box is on the deck
         if not first and self.leg is not None and self.task is not None and not self.legs:
             self.finish_task()
             return
@@ -393,25 +719,38 @@ class SwarmAgent(Node):
         self.phase, self.route_pending, self.leg_fail = 'routing', True, 0
         g = ComputeRoute.Goal(); g.start_id, g.goal_id, g.use_start, g.use_poses = start, self.leg.target, False, False
         self.route_client.wait_for_server(timeout_sec=2.0)
-        self.route_client.send_goal_async(g).add_done_callback(self.on_route_handle)
+        tok = self.route_req.send(wallclock.monotonic())
+        self.route_client.send_goal_async(g).add_done_callback(lambda f, tok=tok: self.on_route_handle(f, tok))
 
-    def on_route_handle(self, f):
+    def on_route_handle(self, f, tok):
         h = f.result()
+        if not self.route_req.current(tok):
+            return                                   # abandoned request (answered too late)
         if not h.accepted:
-            self.get_logger().warn(f'{self.rid}: route request rejected'); self.phase = 'idle'; return
-        h.get_result_async().add_done_callback(self.on_route)
+            self.get_logger().warn(f'{self.rid}: route request rejected, retrying')
+            self.route_req.clear()
+            self.legs.insert(0, self.leg); self.leg = None
+            self.phase, self.retry_at = 'retry', self.now() + 2.0
+            return
+        h.get_result_async().add_done_callback(lambda r, tok=tok: self.on_route(r, tok))
 
-    def on_route(self, f):
+    def on_route(self, f, tok):
+        if not self.route_req.ack(tok):
+            return
         res = f.result().result
         self.route_pending = False
         if self.reopen_edge is not None and self.edges_client is not None:   # the closure was only for this re-route
-            self.edges_client.call_async(DynamicEdges.Request(opened_edges=[self.reopen_edge]))
+            if self.reopen_edge not in self.ghost_closed:
+                self.edges_client.call_async(DynamicEdges.Request(opened_edges=[self.reopen_edge]))
             self.reopen_edge = None
         if res.error_code != 0 or not res.route.nodes:
-            self.get_logger().warn(f'{self.rid}: no route to {self.graph.name[self.leg.target]} (error {res.error_code}), retrying')
+            self.get_logger().warn(f'{self.rid}: no route to {self.graph.name[self.leg.target]} (error {res.error_code}), '
+                                   f'retrying', throttle_duration_sec=30.0)
+            self.noroute_since = self.noroute_since or self.now()
             self.legs.insert(0, self.leg); self.leg = None
             self.phase, self.retry_at = 'retry', self.now() + 2.0     # tick() re-plans the leg
             return
+        self.noroute_since = None
         self.route = [n.nodeid for n in res.route.nodes]
         self.path = res.path
         if self.route[0] != self.last_node and self.pose is not None:
@@ -498,8 +837,23 @@ class SwarmAgent(Node):
             self.arrived(); return
         me = Peer(self.rid, x, y, self.reserved, self.wait_s)
         held = self.reserved
-        self.reserved, self.blocked = plan_reservations(self.graph, self.route, self.next_idx, me, self.live_peers(), held, self.tp)
-        ahead = [n for n in self.reserved if n in self.route[self.next_idx:]]
+        self.reserved, self.blocked = plan_reservations(self.graph, self.route, self.next_idx, me, self.live_peers(), held,
+                                                        self.tp, extend=self.has_quorum)
+        if not self.has_quorum:
+            # isolated: stop at the next node I hold (peers, which can't hear me, keep seeing my last reservation)
+            nxt = self.route[self.next_idx]
+            if nxt in self.reserved:
+                self.reserved = self.reserved[:self.reserved.index(nxt) + 1]
+        # drive only onto nodes my peers have acknowledged (the rest are published, waiting for their acks)
+        ok = self.confirm()
+        ahead = []
+        for n in self.reserved:
+            if n not in self.route[self.next_idx:]:
+                continue
+            if n not in ok:
+                self.ack_waits += 1
+                break
+            ahead.append(n)
         if not ahead:
             # hold: stop before the next node
             if self.follow_end is not None:
@@ -578,42 +932,40 @@ class SwarmAgent(Node):
 
     # ------------------------------------------------------------------ deadlock breaking
     def waits(self):
-        """robot -> robot it waits for, for every yielding robot (from heartbeats + my own state)."""
+        """robot -> robot it waits for, for every yielding robot (from heartbeats + my own state); silent robots
+        (ghosts) hold their frozen nodes and wait for nobody."""
         t = wallclock.monotonic()
         states = {rid: s for rid, (s, rx) in self.peers.items() if t - rx < self.peer_timeout}
         held = {rid: set(s.reserved_nodes) for rid, s in states.items()}
+        ghosts = self.ghosts()
+        held.update({rid: set(h) for rid, (_, _, h) in ghosts.items()})
         held[self.rid] = set(self.reserved)
         holder = lambda n, me: min((r for r, h in held.items() if r != me and n in h), default=None)
         w = {rid: holder(s.route[0], rid) for rid, s in states.items() if s.status == RobotState.YIELDING and s.route}
         if self.phase == 'driving' and self.next_idx < len(self.route):
             w[self.rid] = holder(self.route[self.next_idx], self.rid)
-        return w, states
+        return w, states, ghosts
 
     def maybe_break_deadlock(self):
         """A cycle of robots each waiting for the next never resolves by waiting: the highest id in the cycle
         re-routes around its blocked lane (every member computes the same cycle from the same heartbeats, so
-        exactly one yields). Also re-route after a long block behind a robot that isn't moving (stuck)."""
-        if self.wait_s < self.deadlock_s or self.now() - self.last_reroute < 20.0 or self.next_idx == 0:
+        exactly one yields). Also re-route after a long block behind a robot that isn't moving (stuck), and after
+        deadlock_after_s behind a silent one."""
+        if not self.has_quorum or self.wait_s < self.deadlock_s or self.now() - self.last_reroute < 20.0 or self.next_idx == 0:
             return
-        w, states = self.waits()
+        w, states, ghosts = self.waits()
         chain, cycle = wait_chain(self.rid, w)
         end = states.get(chain[-1])
-        long_block = self.wait_s > self.blocked_reroute_s and end is not None and (
-            end.status == RobotState.STUCK or end.wait_s > self.blocked_reroute_s)
+        long_block = chain[-1] in ghosts or (self.wait_s > self.blocked_reroute_s and end is not None and (
+            end.status == RobotState.STUCK or end.wait_s > self.blocked_reroute_s))
         if (cycle and self.rid in cycle and self.rid == max(cycle)) or long_block:
             why = f'deadlock cycle {cycle}' if cycle else f'blocked {self.wait_s:.0f}s behind {chain[1:]}'
             self.reroute_around(self.route[self.next_idx - 1], self.route[self.next_idx], why)
 
     def reroute_around(self, a, b, why):
         eid = self.graph.edge_id.get((a, b))
-        if eid is None or self.leg is None:
+        if eid is None or self.leg is None or self.edges() is None:
             return
-        if self.edges_client is None:
-            ns = self.get_namespace().rstrip('/')
-            names = [n for n, _ in self.get_service_names_and_types() if n.startswith(ns + '/') and n.endswith('adjust_edges')]
-            if not names:
-                return
-            self.edges_client = self.create_client(DynamicEdges, names[0])
         self.last_reroute = self.now()
         self.get_logger().warn(f'{self.rid}: {why} -> closing {self.graph.name[a]}->{self.graph.name[b]} for me and re-routing')
         self.edges_client.call_async(DynamicEdges.Request(closed_edges=[eid]))
@@ -641,10 +993,16 @@ class SwarmAgent(Node):
         g = FollowPath.Goal(); g.path = p; g.controller_id = 'FollowPath'
         g.goal_checker_id = 'precise_goal_checker' if precise else 'general_goal_checker'
         self.follow_state = GoalStatus.STATUS_EXECUTING
-        self.follow_client.send_goal_async(g).add_done_callback(self.on_follow_handle)
+        self.follow_handle, self.still_since = None, None
+        tok = self.follow_req.send(wallclock.monotonic())
+        self.follow_client.send_goal_async(g).add_done_callback(lambda f, tok=tok: self.on_follow_handle(f, tok))
 
-    def on_follow_handle(self, f):
+    def on_follow_handle(self, f, tok):
         h = f.result()
+        if not self.follow_req.ack(tok):
+            if h.accepted and self.follow_handle is not h:
+                h.cancel_goal_async()        # abandoned (stopped, or resent after a lost ack): must not drive
+            return
         if not h.accepted:
             self.follow_state = GoalStatus.STATUS_ABORTED; return
         self.follow_handle = h
@@ -657,6 +1015,7 @@ class SwarmAgent(Node):
     def stop_following(self):
         if self.follow_handle is not None:
             self.follow_handle.cancel_goal_async()
+        self.follow_req.clear()              # a goal still waiting for its acceptance is cancelled when it arrives
         self.follow_handle, self.follow_end, self.follow_state = None, None, None
 
     def arrived(self):
@@ -667,7 +1026,9 @@ class SwarmAgent(Node):
             self.phase, self.status = 'dwelling', RobotState.AT_STATION
             self.dwell_until = self.now() + self.leg.dwell_s
             if self.leg.transfer is not None and self.task is not None:
-                self.pub_transfer.publish(Transfer(stamp=self.get_clock().now().to_msg(), kind=self.leg.transfer,
+                if self.leg.transfer == Transfer.BIN_TO_ROBOT:
+                    self.loaded = True           # the deck starts pulling the box in
+                self.send(self.pub_transfer, Transfer(stamp=self.get_clock().now().to_msg(), kind=self.leg.transfer,
                                                    task_id=self.task.task_id, robot_id=self.rid, pallet=-1, slot=-1,
                                                    bin_id=self.task.bin_id, duration_s=float(self.leg.dwell_s)))
         else:
@@ -680,6 +1041,9 @@ class SwarmAgent(Node):
                 self.next_leg()
             return
         st = self.station_state(self.leg.target)
+        if st is not None and self.task is not None and st.task_id == self.task.task_id and \
+                st.state == StationState.BUSY and self.leg.drive_status == RobotState.TO_PICK:
+            self.loaded = True                   # the arm is putting the box on the deck
         if st is not None and self.task is not None and st.served_task == self.task.task_id:
             self.next_leg()
 
@@ -689,7 +1053,7 @@ class SwarmAgent(Node):
         can't put the box anywhere else."""
         leg = self.leg
         if not (self.handshake and self.task is not None and leg is not None and leg.station
-                and leg.drive_status == RobotState.TO_PICK):
+                and leg.drive_status == RobotState.TO_PICK and not self.loaded):
             self.station_down_since = None
             return
         if not self.station_down(leg.target):
@@ -700,36 +1064,45 @@ class SwarmAgent(Node):
             self.station_down_since = now
             self.get_logger().warn(f'{self.rid}: {self.graph.name[leg.target]} is out of service')
         elif now - self.station_down_since > self.station_giveup:
-            t = self.task
-            self.get_logger().warn(f'{self.rid}: {self.graph.name[leg.target]} out of service for '
-                                   f'{now - self.station_down_since:.0f} s: giving {t.task_id} back')
-            self.pub_claim.publish(Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.TASK,
-                                         resource_id=t.task_id, robot_id=self.rid, action=Claim.RELEASE))
-            self.claims.pop(t.task_id, None)
             self.station_down_since = None
-            self.leg, self.legs = None, []
-            self.abort_task()
+            self.give_back(f'{self.graph.name[leg.target]} out of service for {self.station_giveup:.0f} s')
+
+    def give_back(self, why):
+        """Hand my (empty-deck) task back to the WMS for re-auction and go idle."""
+        t = self.task
+        self.get_logger().warn(f'{self.rid}: {why}: giving {t.task_id} back')
+        self.send(self.pub_claim, Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.TASK,
+                                        resource_id=t.task_id, robot_id=self.rid, action=Claim.RELEASE, round=t.round))
+        self.claims.pop(t.task_id, None)
+        self.leg, self.legs = None, []
+        self.abort_task()
 
     def finish_task(self):
         t = self.task
-        self.pub_claim.publish(Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.TASK,
-                                     resource_id=t.task_id, robot_id=self.rid, action=Claim.DONE))
+        self.send(self.pub_claim, Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.TASK,
+                                     resource_id=t.task_id, robot_id=self.rid, action=Claim.DONE, round=t.round))
         self.done.add(t.task_id)
         self.get_logger().info(f'{self.rid}: done {t.task_id} at {self.graph.name[self.last_node]}')
-        self.task, self.leg = None, None
+        self.task, self.leg, self.loaded, self.noroute_parked = None, None, False, False
         self.phase, self.status, self.idle_since = 'idle', RobotState.IDLE, self.now()
 
     # ------------------------------------------------------------------ charging & parking
     def robots_view(self, with_me=False):
+        """Charger view: live robots as they report; a silent one keeps the charger it stands on (its held nodes)
+        but heads for none, needs none and can't be asked to give one up (liveness rule 1)."""
         t = wallclock.monotonic()
         out = [ChargerPeer(m.robot_id, m.goal_node, list(m.reserved_nodes), m.battery, bool(m.task_id))
                for m, rx in self.peers.values() if t - rx < self.peer_timeout]
+        out += [ChargerPeer(rid, m.last_node, held, 1.0, True) for rid, (m, _, held) in self.ghosts().items()]
         if with_me:
             out.append(ChargerPeer(self.rid, self.goal_node(), list(self.reserved), self.battery, self.task is not None))
         return out
 
     def pick(self, start, spots, current=None):
-        if spots is self.chargers and self.bms and not self.must_charge and \
+        held, cut = self.cut_off()
+        if held:
+            spots = [c for c in spots if c not in held and c not in cut]   # a silent robot blocks it or its way
+        if set(spots) <= set(self.chargers) and self.bms and not self.must_charge and \
                 waiting_for_charger(self.chargers, self.robots_view(), self.cp):
             return None                       # a robot low on battery waits for a charger: it goes first
         return pick_charger(self.graph, start, spots, self.rid, self.battery, self.robots_view(), current, self.cp)
@@ -741,7 +1114,7 @@ class SwarmAgent(Node):
             return
         for node, action in ((self.charger, Claim.RELEASE), (c, Claim.CLAIM)):
             if node is not None:
-                self.pub_claim.publish(Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.DOCK,
+                self.send(self.pub_claim, Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.DOCK,
                                              resource_id=self.graph.name[node], robot_id=self.rid, action=action))
         self.charger = c
 
@@ -827,6 +1200,8 @@ class SwarmAgent(Node):
             self.get_logger().error(f'{self.rid}: battery empty ({100 * self.battery:.1f} %), stopping here')
             self.stop_following(); self.phase, self.status = 'empty', RobotState.STUCK
             return
+        if not self.has_quorum:
+            return                                 # isolated: no charger decisions on a stale view
         leg = self.leg
         to_spot = self.task is None and leg is not None and self.phase in ('routing', 'driving') and not self.legs
         if to_spot and leg.target in self.chargers:
@@ -857,17 +1232,28 @@ class SwarmAgent(Node):
     def publish_state(self):
         m = RobotState()
         m.stamp = self.get_clock().now().to_msg()
-        m.robot_id, m.status = self.rid, self.status
+        m.robot_id = self.rid
+        m.status = RobotState.ISOLATED if not self.has_quorum else self.status
+        self.seq += 1
+        m.seq = self.seq
+        for n in self.reserved:
+            self.first_seq.setdefault(n, self.seq)       # first heartbeat that lists the node
+        for n in [n for n in self.first_seq if n not in self.reserved]:
+            del self.first_seq[n]                        # released: a new hold of it needs new acks
+        heard = sorted((rid, s.seq) for rid, (s, _) in self.peers.items())
+        m.heard_ids, m.heard_seq = [r for r, _ in heard], [int(q) for _, q in heard]
         m.pose = Pose2D(x=self.pose[0], y=self.pose[1], theta=self.pose[2])
         m.speed, m.battery = float(self.speed_est), float(self.battery)
         m.task_id = self.task.task_id if self.task else ''
         m.mission_id = self.task.mission_id if self.task else ''
+        m.task_round = int(self.task.round) if self.task else 0
+        m.loaded = bool(self.loaded)
         m.last_node = int(self.last_node)
         m.route = [int(n) for n in self.route[self.next_idx:]] if self.phase == 'driving' else []
         m.reserved_nodes = [int(n) for n in self.reserved]
         m.wait_s = float(self.wait_s)
         m.goal_node = int(self.goal_node())
-        self.pub_state.publish(m)
+        self.send(self.pub_state, m)
 
 
 def main():
