@@ -19,16 +19,22 @@ plan_request_params:
   max_velocity_scaling_factor: 1.0
   max_acceleration_scaling_factor: 1.0
 
-# joint-space moves between taught points (transfer pallet <-> deck)
+# Production speeds — the reach study validates, and the cell runs, exactly these (one setting, so the taught
+# pattern's times are the cell's real times):
+# joint-space moves between taught points (transfer pallet <-> deck): 90 % of UR's joint velocity limits (they are
+# safety limits on a real UR, and planning at 100 % leaves the servo no headroom to catch up: the UR30 lagged 2.3 mm at
+# 2.1 m/s in the sim, whose joints are capped at the same limits — 2026-09-26) and 100 % of UR MoveIt's (conservative)
+# 5 rad/s^2 accelerations
 ptp:
   plan_request_params:
     planning_attempts: 1
     planning_pipeline: pilz_industrial_motion_planner
     planner_id: PTP
-    max_velocity_scaling_factor: 0.8
-    max_acceleration_scaling_factor: 0.5
+    max_velocity_scaling_factor: 0.9
+    max_acceleration_scaling_factor: 1.0
 
-# straight-line approach / retreat / lift
+# straight-line approach / retreat / lift at a controlled tool speed (UR MoveL-style: 0.5 m/s, 1.1 m/s^2); at 100 %
+# some lifts ask a wrist for more than its 5 rad/s^2 and Pilz rejects them (gripper test, 2026-09-26)
 lin:
   plan_request_params:
     planning_attempts: 1
@@ -36,3 +42,13 @@ lin:
     planner_id: LIN
     max_velocity_scaling_factor: 0.5
     max_acceleration_scaling_factor: 0.5
+
+# the last centimetres onto a slot or the deck: slow and gentle (at 0.5 m/s cartons landed a few mm off and bumped
+# their neighbours — gripper test, 2026-09-26)
+lin_place:
+  plan_request_params:
+    planning_attempts: 1
+    planning_pipeline: pilz_industrial_motion_planner
+    planner_id: LIN
+    max_velocity_scaling_factor: 0.2
+    max_acceleration_scaling_factor: 0.3

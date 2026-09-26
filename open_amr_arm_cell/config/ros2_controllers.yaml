@@ -12,11 +12,15 @@
 /**/joint_trajectory_controller:
   ros__parameters:
     joints: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]
-    command_interfaces: [position, velocity]
+    command_interfaces: [position, velocity, acceleration]
     state_interfaces: [position, velocity]
     state_publish_rate: 100.0
     action_monitor_rate: 20.0
     allow_partial_joints_goal: false
+    # goal tolerances loose enough for the sim's velocity jitter (0.001 rad / 0.01 rad/s never completed); precision
+    # comes from the cell executor, which waits until the measured joints are within 0.001 rad of a move's end before
+    # planning the next (a plan from a stale state made the controller snap the arm onto the planned start: cartons
+    # landed up to 14 mm off — gripper test, 2026-09-26)
     constraints:
       stopped_velocity_tolerance: 0.05
       goal_time: 0.5

@@ -3,7 +3,7 @@
 <package format="3">
   <name>open_amr_arm_cell</name>
   <version>0.1.0</version>
-  <description>UR10e palletizing / depalletizing cell for the OpenAMR warehouse: cell geometry (pallet pattern, AMR
+  <description>UR30 palletizing / depalletizing cell for the OpenAMR warehouse: cell geometry (pallet pattern, AMR
     deck pose), robot description (pedestal + UR10e from ur_description + vacuum gripper), MoveIt 2 + Pilz
     configuration, reach study, and the per-arm cell controller. One control stack for sim and real.</description>
   <maintainer email="dodorapapah@gmail.com">Mohannad Rababah</maintainer>
@@ -24,6 +24,8 @@
   <exec_depend>joint_state_broadcaster</exec_depend>
   <exec_depend>open_amr_isaac_hardware</exec_depend>
   <exec_depend>open_amr_msgs</exec_depend>
+  <exec_depend>ur_msgs</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <test_depend>python3-pytest</test_depend>

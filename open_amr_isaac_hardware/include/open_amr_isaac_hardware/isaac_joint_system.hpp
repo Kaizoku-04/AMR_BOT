@@ -1,6 +1,7 @@
 // Copyright 2025 ros2_control Development Team (joint_state_topic_hardware_interface 1.1.0), Apache-2.0.
 // Modified 2026 for OpenAMR: sample-time stamps, finite-only commands, locked state hand-over, commands start at the
-// measured state.
+// measured state, commands as a one-point JointTrajectory with the controller's positions, velocities and accelerations
+// (the simulator extrapolates to its physics step with them).
 #pragma once
 
 #include <mutex>
@@ -12,6 +13,7 @@
 #include <rclcpp/publisher.hpp>
 #include <rclcpp/subscription.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
+#include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 namespace open_amr_isaac_hardware
 {
@@ -27,12 +29,13 @@ public:
 
 private:
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr states_sub_;
-  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr commands_pub_;
+  rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr commands_pub_;
   std::mutex state_mutex_;
   sensor_msgs::msg::JointState latest_state_;   // guarded by state_mutex_
   bool have_state_{ false };                    // guarded by state_mutex_
   std::vector<std::string> joints_;
   std::vector<bool> has_velocity_command_;
+  std::vector<bool> has_acceleration_command_;
   std::size_t skipped_non_finite_{ 0 };
 };
 }  // namespace open_amr_isaac_hardware

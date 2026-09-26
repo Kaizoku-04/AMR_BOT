@@ -33,3 +33,16 @@ def test_closest_respects_limits():
     lim = [(-2 * math.pi, 2 * math.pi)] * 2 + [(-math.pi, math.pi)] + [(-2 * math.pi, 2 * math.pi)] * 3
     s = closest(ik(fk(q)), q, lim)
     assert max(abs(a - b) for a, b in zip(s, q)) < 1e-6
+
+
+def test_ur30_round_trip():
+    from open_amr_arm_cell.ur_ik import params
+    p = params('ur30')
+    rng = random.Random(7)
+    for _ in range(200):
+        q = [rng.uniform(-math.pi, math.pi) for _ in range(6)]
+        if abs(math.sin(q[4])) < 0.05:
+            continue
+        T = fk(q, p)
+        sols = ik(T, p)
+        assert sols and all(np.allclose(fk(s, p), T, atol=1e-6) for s in sols)

@@ -1,5 +1,5 @@
 <?xml version="1.0"?>
-<!-- UR10e palletizing cell: pedestal + UR10e (UR's own ur_description, unmodified) + vacuum area gripper.
+<!-- UR palletizing cell (UR30 by default): pedestal + UR arm (UR's own ur_description, unmodified) + vacuum area gripper.
      Root link `world` = the cell frame of open_amr_arm_cell/cell_geometry.py (floor under the arm's axis, x towards
      the AMR bay). The same description serves MoveIt, the Isaac arm (imported from this URDF) and the real cell.
      hardware: topic = sim (ros2_control <-> Isaac articulation over JointState topics, sim time; plugin
@@ -8,7 +8,7 @@
                none  = no ros2_control block (MoveIt only, e.g. the reach study)
                real  = no ros2_control block here: ur_robot_driver brings its own. -->
 <robot xmlns:xacro="http://wiki.ros.org/xacro" name="arm_cell">
-  <xacro:arg name="ur_type" default="ur10e"/>
+  <xacro:arg name="ur_type" default="ur30"/>
   <xacro:arg name="pedestal_height" default="1.1"/>
   <xacro:arg name="pedestal_size" default="0.5"/>
   <xacro:arg name="tool_length" default="0.20"/>
@@ -101,8 +101,9 @@
       <xacro:macro name="arm_joint" params="name initial">
         <joint name="${name}">
           <command_interface name="position"/>
-          <xacro:if value="${hw == 'topic'}">   <!-- velocity feed-forward for the sim bridge (mock: position only) -->
+          <xacro:if value="${hw == 'topic'}">   <!-- the sim bridge extrapolates with them (mock: position only) -->
             <command_interface name="velocity"/>
+            <command_interface name="acceleration"/>
           </xacro:if>
           <state_interface name="position"><param name="initial_value">${initial}</param></state_interface>
           <state_interface name="velocity"/>

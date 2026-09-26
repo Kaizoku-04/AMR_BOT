@@ -11,7 +11,10 @@ import math
 
 import numpy as np
 
+# DH parameters from ur_description <type>/default_kinematics.yaml (nominal, uncalibrated)
 UR10E = dict(d1=0.1807, a2=-0.6127, a3=-0.57155, d4=0.17415, d5=0.11985, d6=0.11655)
+UR30 = dict(d1=0.2363, a2=-0.637, a3=-0.5037, d4=0.201, d5=0.1593, d6=0.1543)
+MODELS = {'ur10e': UR10E, 'ur30': UR30}
 BASE_LINK_TO_BASE = np.diag([-1.0, -1.0, 1.0, 1.0])            # Rz(pi)
 
 
@@ -20,6 +23,12 @@ def _dh(p):
     a = [0.0, p['a2'], p['a3'], 0.0, 0.0, 0.0]
     al = [math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0]
     return d, a, al
+
+
+def params(ur_type):
+    if ur_type not in MODELS:
+        raise ValueError(f'no DH parameters for {ur_type} (have {sorted(MODELS)})')
+    return MODELS[ur_type]
 
 
 def fk(q, p=UR10E):

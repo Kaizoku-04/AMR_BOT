@@ -46,7 +46,8 @@ def moveit_configs(p: CellParams, hardware='none', execution=False):
     from moveit_configs_utils import MoveItConfigsBuilder
     b = MoveItConfigsBuilder('arm_cell', package_name='open_amr_arm_cell')
     b = b.robot_description(file_path='urdf/arm_cell.urdf.xacro',
-                            mappings={'pedestal_height': str(p.pedestal_height), 'pedestal_size': str(p.pedestal_size),
+                            mappings={'ur_type': p.ur_type,
+                                      'pedestal_height': str(p.pedestal_height), 'pedestal_size': str(p.pedestal_size),
                                       'tool_length': str(p.tool_length), 'hardware': hardware})
     b = b.robot_description_semantic(file_path='srdf/arm_cell.srdf.xacro')
     b = b.robot_description_kinematics(file_path='config/kinematics.yaml')
@@ -83,6 +84,35 @@ def moveit_py(node_name, cfg, name_space=''):
     return MoveItPy(node_name=node_name, name_space=name_space, launch_params_filepaths=[f.name])
 
 
+DENSE_STEP_RAD = 0.01                # dense path check: max joint step between checked states
+TRANSFER_MARGIN = 0.02              # m: PTP transfers keep the carried carton this far from everything
+
+
+def dense_collision(psm, jt, step=DENSE_STEP_RAD):
+    """First colliding state of a joint trajectory, checked densely (interpolated between its waypoints so no joint
+    moves more than `step` between checks), with whatever is attached to the tool; None if the path is clear.
+    MoveIt's ValidateSolution checks only the waypoints (Pilz samples ~0.1 s apart): at production speed the carried
+    carton moved ~20 cm between checks and grazed a stacked carton in the sim (gripper test, 2026-09-26)."""
+    names = list(jt.joint_names)
+    pts = [[pt.positions[names.index(j)] for j in JOINTS] for pt in jt.points]
+    with psm.read_write() as scene:
+        state = scene.current_state                      # the scene's own state holds the attached bodies
+        saved = dict(state.joint_positions)
+        try:
+            for a, b in zip(pts, pts[1:]):
+                n = max(1, int(max(abs(x - y) for x, y in zip(a, b)) / step) + 1)
+                for i in range(1, n + 1):
+                    q = [x + (y - x) * i / n for x, y in zip(a, b)]
+                    state.joint_positions = dict(zip(JOINTS, q))
+                    state.update()
+                    if scene.is_state_colliding(joint_model_group_name='arm'):
+                        return q
+        finally:
+            state.joint_positions = saved
+            state.update()
+    return None
+
+
 def taught_ik(pose, ref, p: CellParams):
     """Taught point for a TCP pose (cell frame): closed-form IK (ur_ik), the solution nearest `ref` within UR's joint
     limits — deterministic, unlike KDL's random restarts (the same study gave different configurations and 91 vs 92
@@ -95,7 +125,7 @@ def taught_ik(pose, ref, p: CellParams):
     T[:3, :3] = R
     T[:3, 3] = [pose.position.x, pose.position.y, pose.position.z - p.pedestal_height]   # cell -> base_link
     T[:3, 3] -= R[:, 2] * p.tool_length                                                  # tcp -> tool0
-    return ur_ik.closest(ur_ik.ik(T), ref, LIMITS)
+    return ur_ik.closest(ur_ik.ik(T, ur_ik.params(p.ur_type)), ref, LIMITS)
 
 
 def box_object(name, size, xyz, yaw_deg=0.0, op=CollisionObject.ADD):
@@ -125,7 +155,9 @@ class Study:
         self.model = self.moveit.get_robot_model()
         self.ptp = PlanRequestParameters(self.moveit, 'ptp')
         self.lin = PlanRequestParameters(self.moveit, 'lin')
+        self.lin_place = PlanRequestParameters(self.moveit, 'lin_place')
         self.objects = set()
+        self.carrying = False
 
     def self_check(self):
         """The study is only as good as its collision checking: (1) a move only the carried box collides on must
@@ -142,6 +174,20 @@ class Study:
         if self.plan(start, goal_pose=goal, lin=True) is not None:
             fails.append('carried box NOT collision-checked: a move into the wall planned')
         self.attach(False)
+        self.clear()
+        # (3) the dense path check sees what waypoint checking misses: a post only the mid-swing tool passes
+        from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+        qa, qb = list(HOME), list(HOME)
+        qa[0], qb[0] = -1.0, 1.0
+        jt = JointTrajectory(joint_names=JOINTS, points=[JointTrajectoryPoint(positions=qa),
+                                                         JointTrajectoryPoint(positions=qb)])
+        T = ur_ik.fk(HOME, ur_ik.params(self.p.ur_type))
+        self.apply([box_object('post', (0.08, 0.08, 0.08), (T[0, 3], T[1, 3], T[2, 3] + self.p.pedestal_height
+                                                              + self.p.tool_length * T[2, 2]))])
+        with self.psm.read_only() as scene:
+            ends = [scene.is_state_colliding(robot_state=self.state(q), joint_model_group_name='arm') for q in (qa, qb)]
+        if any(ends) or dense_collision(self.psm, jt) is None:
+            fails.append('dense path check does not catch a collision between waypoints')
         self.clear()
         (x, y, z), yaw = self.cell.slot_cell(0, 7)
         seed = list(HOME)
@@ -161,15 +207,17 @@ class Study:
     def clear(self):
         self.apply([box_object(n, (), (), op=CollisionObject.REMOVE) for n in list(self.objects)])
 
-    def attach(self, attach):
+    def attach(self, attach, pad=0.0):
         """Attach the carried box to the gripper (the TCP is its top centre) or detach it. Detaching makes MoveIt put
         the box back into the world where it hangs (touching the pad): that copy is removed here, the caller adds the
         box where it lands."""
         aco = AttachedCollisionObject()
         aco.link_name = 'tcp'
         aco.touch_links = ['tcp', 'vacuum_gripper', 'wrist_3_link']
-        co = box_object('carried', self.p.box, (0.0, 0.0, self.p.box[2] / 2)) if attach else \
-            box_object('carried', (), (), op=CollisionObject.REMOVE)
+        b = self.p.box
+        co = box_object('carried', (b[0] + 2 * pad, b[1] + 2 * pad, b[2] + pad), (0.0, 0.0, (b[2] + pad) / 2)) if attach \
+            else box_object('carried', (), (), op=CollisionObject.REMOVE)
+        self.carrying = attach
         co.header.frame_id = 'tcp'
         aco.object = co
         with self.psm.read_write() as scene:
@@ -206,7 +254,7 @@ class Study:
     def ik(self, pose, ref):
         return taught_ik(pose, ref, self.p)
 
-    def plan(self, start, goal_q=None, goal_pose=None, lin=False):
+    def plan(self, start, goal_q=None, goal_pose=None, lin=False, place=False):
         """(end joint config, duration s) or None."""
         # start from the scene's own current state (it holds the attached box); a fresh RobotState from joint values
         # carries no attached bodies, and the carried box silently drops out of collision checking (found by
@@ -222,8 +270,16 @@ class Study:
             ps.header.frame_id = 'world'
             ps.pose = goal_pose
             self.arm.set_goal_state(pose_stamped_msg=ps, pose_link='tcp')
-        res = self.arm.plan(single_plan_parameters=self.lin if lin else self.ptp)
+        res = self.arm.plan(single_plan_parameters=self.lin_place if place else self.lin if lin else self.ptp)
         if not res:
+            return None
+        # dense check; PTP transfers with the carried carton padded by TRANSFER_MARGIN
+        if not lin and self.carrying:
+            self.attach(True, pad=TRANSFER_MARGIN)
+        hit = dense_collision(self.psm, res.trajectory.get_robot_trajectory_msg().joint_trajectory)
+        if not lin and self.carrying:
+            self.attach(True)
+        if hit is not None:
             return None
         msg = res.trajectory.get_robot_trajectory_msg().joint_trajectory
         last = msg.points[-1]
@@ -261,13 +317,13 @@ class Study:
         times, q = {}, list(HOME)
         steps = ([('to slot', dict(goal_q=q_slot_above)), ('down to slot', dict(goal_pose=slot_pose, lin=True)),
                   ('attach', None), ('lift', dict(goal_pose=lift_pose, lin=True)),
-                  ('to deck', dict(goal_q=q_deck_above)), ('down to deck', dict(goal_pose=deck_pose, lin=True)),
-                  ('detach deck', None), ('retreat', dict(goal_pose=deck_above, lin=True)), ('home', dict(goal_q=HOME))]
+                  ('to deck', dict(goal_q=q_deck_above)),
+                  ('down to deck', dict(goal_pose=deck_pose, lin=True, place=True)), ('detach deck', None), ('retreat', dict(goal_pose=deck_above, lin=True)), ('home', dict(goal_q=HOME))]
                  if depal else
                  [('to deck', dict(goal_q=q_deck_above)), ('down to deck', dict(goal_pose=deck_pose, lin=True)),
                   ('attach deck', None), ('up from deck', dict(goal_pose=deck_carry, lin=True)),
-                  ('to slot', dict(goal_q=q_slot_above)), ('down to slot', dict(goal_pose=slot_pose, lin=True)),
-                  ('detach', None), ('retreat', dict(goal_pose=lift_pose, lin=True)), ('home', dict(goal_q=HOME))])
+                  ('to slot', dict(goal_q=q_slot_above)),
+                  ('down to slot', dict(goal_pose=slot_pose, lin=True, place=True)), ('detach', None), ('retreat', dict(goal_pose=lift_pose, lin=True)), ('home', dict(goal_q=HOME))])
         try:
             for name, kw in steps:
                 if kw is None:                           # vacuum on / off: scene bookkeeping
@@ -303,9 +359,11 @@ class Study:
             if via and best is not None:
                 break                                    # a direct swing works: no via point needed
             yaw_grip = box_yaw + 90.0 * m
-            # the box turns with the gripper; on the deck any multiple of 90 deg is fine (square footprint): keep the
-            # one closest to the pallet orientation so wrist 3 turns least
-            yaw_deck = yaw_grip
+            # the box turns with the gripper: on the deck it must end square to the AMR (the deck conveyor pushes it
+            # into a bin), i.e. at a multiple of 90 deg from the AMR's heading (180 in the cell frame); take the one
+            # closest to the grip orientation so wrist 3 turns least. (Keeping the grip orientation put boxes on the
+            # deck at the pallet's angle and on the other pallet 30 deg off its pattern: gripper test, 2026-09-26.)
+            yaw_deck = 180.0 + 90.0 * round((yaw_grip - 180.0) / 90.0)
             filled = slot + 1 if depal else slot
             self.set_scene(pallet, filled, deck_box=not depal)
             r = self.sequence(pallet, slot, yaw_grip, yaw_deck, depal, via)
@@ -332,7 +390,7 @@ def main(argv=None):
     cell = Cell((0.0, 0.0, 0.0), p)                  # cell frame: both cells are identical in it
     st = Study(cell)
     fails = st.self_check()
-    print(f'self-check: {"; ".join(fails) if fails else "OK (carried box collision-checked, taught points deterministic)"}',
+    print(f'self-check: {"; ".join(fails) if fails else "OK (carried box collision-checked, paths checked densely, taught points deterministic)"}',
           flush=True)
     if a.check or fails:
         return _exit(1 if fails else 0)

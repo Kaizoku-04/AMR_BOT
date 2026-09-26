@@ -1,4 +1,4 @@
-"""One UR10e cell's control stack, in the cell's namespace (/<arm_id>): robot_state_publisher, ros2_control
+"""One UR30 cell's control stack, in the cell's namespace (/<arm_id>): robot_state_publisher, ros2_control
 (controller_manager + joint_state_broadcaster + joint_trajectory_controller) on the chosen hardware.
 
     ros2 launch open_amr_arm_cell arm_cell.launch.py arm_id:=arm_receiving hardware:=topic   # Isaac (sim time)
@@ -26,7 +26,8 @@ def spawn(context):
     cell = layout.get('arm_cell', {})
     arm, sim = lc('arm_id'), lc('use_sim_time') == 'true'
     desc = xacro.process_file(os.path.join(share, 'urdf', 'arm_cell.urdf.xacro'), mappings={
-        'hardware': lc('hardware'), 'arm_id': arm, 'pedestal_height': str(cell.get('pedestal_height', 1.1)),
+        'hardware': lc('hardware'), 'arm_id': arm, 'ur_type': cell.get('ur_type', 'ur30'),
+        'pedestal_height': str(cell.get('pedestal_height', 1.1)),
         'pedestal_size': str(cell.get('pedestal_size', 0.5)), 'tool_length': str(cell.get('tool_length', 0.2))}).toxml()
     tf = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
     ctrl = os.path.join(share, 'config', 'ros2_controllers.yaml')

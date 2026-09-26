@@ -1,4 +1,4 @@
-"""Geometry of a UR10e palletizing cell: arm on a pedestal, two EUR pallets beside/behind it, the AMR's conveyor deck
+"""Geometry of a UR palletizing cell (UR30): arm on a pedestal, two EUR pallets beside/behind it, the AMR's conveyor deck
 in front. Pure Python (no ROS), the single source for the pallet pattern: the cell controller, the reach study, the
 world builder and the simulator's box drawing all use it, so a box is always where the arm reaches for it.
 
@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 
 @dataclass
 class CellParams:
+    ur_type: str = 'ur30'                # arm model (ur_description type): UR30 since 2026-09-26 — an 8 kg carton on the
+                                         # 2 kg pad (10 kg at 0.28 m CoG offset) is outside the UR10e's payload curve
     pedestal_height: float = 1.1         # UR base mounting face above the floor
     pedestal_size: float = 0.5           # square pedestal footprint
     pallet_radius: float = 0.8           # arm axis -> pallet centre
@@ -30,7 +32,7 @@ class CellParams:
     pallet_size: tuple = (1.2, 0.8, 0.144)   # EUR pallet: long, short, height
     box: tuple = (0.35, 0.35, 0.25)      # carton: along pallet long side, along short side, height
     pattern: tuple = (3, 2, 4)           # boxes along long side, along short side, layers
-    gap: float = 0.005                   # between boxes on a layer
+    gap: float = 0.010                   # between boxes on a layer
     tool_length: float = 0.20            # UR tool flange -> vacuum cup face (the TCP)
     approach: float = 0.10               # TCP above a box top before descending / after releasing
     lift_clearance: float = 0.05         # a lifted box's bottom clears neighbouring box tops by this

@@ -18,11 +18,12 @@ setup(
     zip_safe=True,
     maintainer='Mohannad Rababah',
     maintainer_email='dodorapapah@gmail.com',
-    description='UR10e palletizing cell: geometry, description, MoveIt/Pilz config, reach study, cell controller',
+    description='UR30 palletizing cell: geometry, description, MoveIt/Pilz config, reach study, cell controller',
     license='MIT',
     tests_require=['pytest'],
     entry_points={'console_scripts': [
         'reach_study = open_amr_arm_cell.reach_study:main',
         'tracking_test = open_amr_arm_cell.tracking_test:main',
+        'gripper_test = open_amr_arm_cell.gripper_test:main',
     ]},
 )

@@ -22,16 +22,18 @@ CallbackReturn IsaacJointSystem::on_init(const hardware_interface::HardwareCompo
   for (const auto& joint : get_hardware_info().joints)
   {
     joints_.push_back(joint.name);
-    bool vel = false;
+    bool vel = false, acc = false;
     for (const auto& ci : joint.command_interfaces)
     {
       vel = vel || ci.name == hardware_interface::HW_IF_VELOCITY;
+      acc = acc || ci.name == hardware_interface::HW_IF_ACCELERATION;
     }
     has_velocity_command_.push_back(vel);
+    has_acceleration_command_.push_back(acc);
   }
   // commands: reliable, depth 1 (the latest is all that matters); states: sensor data QoS (the simulator publishes
   // them best effort every physics step)
-  commands_pub_ = get_node()->create_publisher<sensor_msgs::msg::JointState>(
+  commands_pub_ = get_node()->create_publisher<trajectory_msgs::msg::JointTrajectory>(
       param("joint_commands_topic", "/isaac_joint_commands"), rclcpp::QoS(1));
   states_sub_ = get_node()->create_subscription<sensor_msgs::msg::JointState>(
       param("joint_states_topic", "/isaac_joint_states"), rclcpp::SensorDataQoS(),
@@ -86,16 +88,21 @@ hardware_interface::return_type IsaacJointSystem::read(const rclcpp::Time& /*tim
 
 hardware_interface::return_type IsaacJointSystem::write(const rclcpp::Time& time, const rclcpp::Duration& /*period*/)
 {
-  sensor_msgs::msg::JointState cmd;
-  // the controller sampled its trajectory at `time`: the simulator extrapolates from this stamp to its physics step.
-  // (The upstream interface stamps with its own node's clock, which lagged the controller's by one sim step now and
-  // then: the arm then jumped ahead by a step, ~16 mm at 1 m/s — OpenAMR tracking test, 2026-09-26.)
+  trajectory_msgs::msg::JointTrajectory cmd;
+  cmd.points.resize(1);
+  auto& pt = cmd.points[0];
+  // the controller sampled its trajectory at `time`: the simulator extrapolates from this stamp to its physics step
+  // with the commanded velocity and acceleration. (The upstream interface stamps with its own node's clock, which
+  // lagged the controller's by one sim step now and then: the arm then jumped ahead by a step, ~16 mm at 1 m/s; and
+  // without the acceleration the 60 Hz step missed 1/2 a dt^2 at every acceleration step, ~1 mm — OpenAMR, 2026-09-26.)
   cmd.header.stamp = time;
   for (std::size_t i = 0; i < joints_.size(); ++i)
   {
     const double p = get_command(joints_[i] + "/" + hardware_interface::HW_IF_POSITION);
     const double v =
         has_velocity_command_[i] ? get_command(joints_[i] + "/" + hardware_interface::HW_IF_VELOCITY) : 0.0;
+    const double a =
+        has_acceleration_command_[i] ? get_command(joints_[i] + "/" + hardware_interface::HW_IF_ACCELERATION) : 0.0;
     if (!std::isfinite(p))
     {
       ++skipped_non_finite_;
@@ -104,9 +111,10 @@ hardware_interface::return_type IsaacJointSystem::write(const rclcpp::Time& time
                            skipped_non_finite_);
       return hardware_interface::return_type::OK;
     }
-    cmd.name.push_back(joints_[i]);
-    cmd.position.push_back(p);
-    cmd.velocity.push_back(std::isfinite(v) ? v : 0.0);
+    cmd.joint_names.push_back(joints_[i]);
+    pt.positions.push_back(p);
+    pt.velocities.push_back(std::isfinite(v) ? v : 0.0);
+    pt.accelerations.push_back(std::isfinite(a) ? a : 0.0);
   }
   commands_pub_->publish(cmd);
   return hardware_interface::return_type::OK;

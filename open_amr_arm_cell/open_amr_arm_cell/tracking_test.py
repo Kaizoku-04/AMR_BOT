@@ -39,7 +39,7 @@ GATE_POS_M, GATE_ROT_DEG = 0.001, 0.5
 
 def tcp(q, p: CellParams):
     """TCP pose (4x4) in the cell frame for joint positions q."""
-    T = ur_ik.fk(q)
+    T = ur_ik.fk(q, ur_ik.params(p.ur_type))
     T[2, 3] += p.pedestal_height
     T[:3, 3] += T[:3, 2] * p.tool_length
     return T
@@ -58,8 +58,16 @@ class Recorder(Node):
         self.create_subscription(JointState, 'joint_states', self.on_js, 50)
         # the hardware layer (sim): commands in, actual states out, both stamped with sim time
         be = rclpy.qos.QoSProfile(depth=200, reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT)  # matches both
-        self.create_subscription(JointState, 'isaac_joint_commands', lambda m: self.store(m, self.cmds), be)
+        from trajectory_msgs.msg import JointTrajectory
+        self.create_subscription(JointTrajectory, 'isaac_joint_commands', self.store_cmd, be)
         self.create_subscription(JointState, 'isaac_joint_states', lambda m: self.store(m, self.hw), be)
+
+    def store_cmd(self, m):
+        idx = {n: i for i, n in enumerate(m.joint_names)}
+        if m.points and all(j in idx for j in JOINTS) and all(math.isfinite(m.points[0].positions[idx[j]]) for j in JOINTS):
+            with self.lock:
+                self.cmds.append((m.header.stamp.sec + m.header.stamp.nanosec * 1e-9,
+                                  [m.points[0].positions[idx[j]] for j in JOINTS]))
 
     def store(self, m, where):
         idx = {n: i for i, n in enumerate(m.name)}
