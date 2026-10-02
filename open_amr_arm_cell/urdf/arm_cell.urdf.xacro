@@ -6,7 +6,8 @@
                        open_amr_isaac_hardware/IsaacJointSystem)
                mock  = mock_components/GenericSystem (tests without a simulator)
                none  = no ros2_control block (MoveIt only, e.g. the reach study)
-               real  = no ros2_control block here: ur_robot_driver brings its own. -->
+               ur    = the real arm / URSim through ur_robot_driver's hardware interface (headless: the driver sends
+                       its External Control script itself; robot_ip, reverse ports per cell) -->
 <robot xmlns:xacro="http://wiki.ros.org/xacro" name="arm_cell">
   <xacro:arg name="ur_type" default="ur30"/>
   <xacro:arg name="pedestal_height" default="1.1"/>
@@ -14,7 +15,16 @@
   <xacro:arg name="tool_length" default="0.20"/>
   <xacro:arg name="hardware" default="none"/>
   <xacro:arg name="arm_id" default="arm"/>
-  <xacro:arg name="force_abs_paths" default="false"/>   <!-- true: mesh file:// paths (Isaac's URDF importer) -->
+  <xacro:arg name="force_abs_paths" default="false"/>
+  <xacro:arg name="robot_ip" default="192.168.56.101"/>
+  <xacro:arg name="reverse_port" default="50001"/>
+  <xacro:arg name="script_sender_port" default="50002"/>
+  <xacro:arg name="trajectory_port" default="50003"/>
+  <xacro:arg name="script_command_port" default="50004"/>
+  <!-- the robot's External Control script stops if no command arrives within this (driver default 0.04 s): on a PC
+       without a real-time kernel the 500 Hz command stream stalled past 40 ms under load and the program dropped
+       (URSim test, 2026-10-02). Deployment: a PREEMPT_RT kernel, then the default. -->
+  <xacro:arg name="robot_receive_timeout" default="0.2"/>   <!-- true: mesh file:// paths (Isaac's URDF importer) -->
 
   <xacro:property name="ur_type" value="$(arg ur_type)"/>
   <xacro:property name="H" value="$(arg pedestal_height)"/>
@@ -82,6 +92,19 @@
     <child link="tcp"/>
     <origin xyz="0 0 ${L}"/>
   </joint>
+
+  <xacro:if value="${hw == 'ur'}">
+    <xacro:include filename="$(find ur_robot_driver)/urdf/ur.ros2_control.xacro"/>
+    <xacro:ur_ros2_control name="$(arg arm_id)_ur" tf_prefix=""
+        kinematics_parameters_file="$(find ur_description)/config/$(arg ur_type)/default_kinematics.yaml"
+        robot_ip="$(arg robot_ip)" headless_mode="true"
+        script_filename="$(find ur_client_library)/resources/external_control.urscript"
+        input_recipe_filename="$(find ur_robot_driver)/resources/rtde_input_recipe.txt"
+        output_recipe_filename="$(find ur_robot_driver)/resources/rtde_output_recipe.txt"
+        reverse_port="$(arg reverse_port)" script_sender_port="$(arg script_sender_port)"
+        trajectory_port="$(arg trajectory_port)" script_command_port="$(arg script_command_port)"
+        robot_receive_timeout="$(arg robot_receive_timeout)"/>
+  </xacro:if>
 
   <xacro:if value="${hw in ('topic', 'mock')}">
     <ros2_control name="$(arg arm_id)_hardware" type="system">

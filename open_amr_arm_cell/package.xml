@@ -26,6 +26,8 @@
   <exec_depend>open_amr_msgs</exec_depend>
   <exec_depend>ur_msgs</exec_depend>
   <exec_depend>ur_dashboard_msgs</exec_depend>
+  <exec_depend>ur_robot_driver</exec_depend>
+  <exec_depend>ur_client_library</exec_depend>
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>control_msgs</exec_depend>

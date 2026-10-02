@@ -98,8 +98,19 @@ class CellController(Node):
 
         cfg = moveit_configs(self.local.p, hardware='topic', execution=True).to_dict()
         cfg['use_sim_time'] = self.get_parameter('use_sim_time').value
+        # the arm's trajectory controller: sim joint_trajectory_controller; a real UR / URSim the driver's
+        # scaled_joint_trajectory_controller (follows the speed slider, pauses on a pause) — with it MoveIt must not
+        # abort a trajectory for taking longer than planned (UR's guidance)
+        jtc = dp('trajectory_controller', 'joint_trajectory_controller').value
+        msc = cfg['moveit_simple_controller_manager']
+        if jtc not in msc['controller_names']:
+            msc[jtc] = msc.pop(msc['controller_names'][0])
+            msc['controller_names'] = [jtc]
+        if not dp('execution_duration_monitoring', True).value:
+            cfg.setdefault('trajectory_execution', {})['execution_duration_monitoring'] = False
         self.moveit = moveit_py('cell_controller_moveit', cfg, name_space=self.arm_id)
-        self.io = VacuumIO(self, self.arm_id)
+        # URSim has no vacuum switch: part present = the vacuum output read back (test double, never on a real cell)
+        self.io = VacuumIO(self, self.arm_id, echo=dp('part_present_echo', False).value)
         topic = dp('detections_topic', '').value
         lim = {'pallet': (dp('locate_pallet_mm', 30.0).value / 1000, dp('locate_pallet_deg', 5.0).value),
                'deck': (dp('locate_deck_mm', 100.0).value / 1000, dp('locate_deck_deg', 10.0).value)}
@@ -316,6 +327,9 @@ class CellController(Node):
         res.duration_s = float(t1 - t0)
         res.wait_interlock_s = float(marks['dock'] - marks['wait']) if 'dock' in marks else 0.0
         res.deck_s = float(marks['clear'] - marks['dock']) if 'clear' in marks and 'dock' in marks else 0.0
+        if self.motion.step_log:
+            self.log('steps (plan / execute / planned / settle s): ' + ', '.join(
+                f'{n} {a}/{b}/{c}/{e}' for n, a, b, c, e in self.motion.step_log))
         if res.success:
             self.log(f'{kind} done in {res.duration_s:.1f} s' + (f', robot at the bay {res.deck_s:.1f} s after the '
                      f'interlock (waited {res.wait_interlock_s:.1f} s for it)' if 'dock' in marks else ''))

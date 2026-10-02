@@ -49,8 +49,10 @@ class VacuumIO:
     """The cell's tool I/O over ur_robot_driver's io_and_status_controller interface (sim: arm_bridge.py), and the
     payload (set_payload: a real UR's dynamics and force limits must know a carton hangs on the tool)."""
 
-    def __init__(self, node, arm_id):
+    def __init__(self, node, arm_id, echo=False):
+        """echo: part present = the vacuum output's state (URSim, which has no vacuum switch to simulate)."""
         from ur_msgs.msg import IOStates
+        self.echo = echo
         from ur_msgs.srv import SetIO, SetPayload
         self.SetIO, self.SetPayload = SetIO, SetPayload
         self.cli = node.create_client(SetIO, f'/{arm_id}/io_and_status_controller/set_io')
@@ -59,8 +61,8 @@ class VacuumIO:
         node.create_subscription(IOStates, f'/{arm_id}/io_and_status_controller/io_states', self.on_io, 10)
 
     def on_io(self, m):
-        for d in m.digital_in_states:
-            if d.pin == PART_PRESENT_IN:
+        for d in (m.digital_out_states if self.echo else m.digital_in_states):
+            if d.pin == (VACUUM_OUT if self.echo else PART_PRESENT_IN):
                 with self.lock:
                     self.part_present, self.stamp = bool(d.state), time.monotonic()
 
@@ -125,6 +127,7 @@ class CellMotion:
         self.gripper_mass, self.carton_mass = gripper_mass, carton_mass
         self.guard = lambda in_zone: None        # -> reason to stop now, or None (set by the cell controller)
         self.times = {}                          # step -> last duration (s)
+        self.step_log = []                       # (step, plan s, execute s, planned s, settle s) of the last run()
         self.carrying = None                     # where the carton on the tool came from, or None
         self.carton = C_NONE                     # where the carton of the current cycle is
         self.stock, self.docked, self.deck_box = [0, 0], False, False
@@ -198,6 +201,7 @@ class CellMotion:
             self.arm.set_goal_state(pose_stamped_msg=ps, pose_link='tcp')
         t0 = time.monotonic()
         res = self.arm.plan(single_plan_parameters=self.lin_place if place else self.lin if lin else self.ptp)
+        t_plan = time.monotonic()
         if not res:
             raise CellFault(f'plan rejected: {name}')
         # every trajectory is checked densely before it runs (MoveIt checks only its waypoints), PTP transfers with
@@ -240,10 +244,15 @@ class CellMotion:
                     raise CellFault(f'stopped during {name}: {why}')
                 time.sleep(0.02)
             raise CellFault(f'execution failed: {name} ({getattr(status, "status", status)})')
+        t_exec = time.monotonic()
         jt = res.trajectory.get_robot_trajectory_msg().joint_trajectory
         end = dict(zip(jt.joint_names, jt.points[-1].positions))
         self._settle([end[j] for j in JOINTS], name)
-        self.times[name] = time.monotonic() - t0
+        t_end = time.monotonic()
+        self.times[name] = t_end - t0
+        d = jt.points[-1].time_from_start
+        self.step_log.append((name, round(t_plan - t0, 2), round(t_exec - t_plan, 2), round(d.sec + d.nanosec * 1e-9, 2),
+                              round(t_end - t_exec, 2)))
         if self.carrying and not self.io.holding():
             self._dropped(name)
 
@@ -350,6 +359,7 @@ class CellMotion:
         on_dock() blocks until the interlock is made; on_undock() is told the arm is clear of the deck zone;
         on_step(name) before every step."""
         depal, pallet, slot, _ = self.cycle
+        self.step_log = []
         while self.pc < len(self.steps):
             st = self.steps[self.pc]
             if until is not None and st.kind == until:

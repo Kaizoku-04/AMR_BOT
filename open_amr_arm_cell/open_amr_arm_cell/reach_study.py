@@ -169,6 +169,7 @@ class Study:
         self.lin_place = PlanRequestParameters(self.moveit, 'lin_place')
         self.objects = set()
         self.carrying = False
+        self.record = None
 
     def self_check(self):
         """The study is only as good as its collision checking: (1) a move only the carried box collides on must
@@ -294,6 +295,8 @@ class Study:
         if hit is not None:
             return None
         msg = res.trajectory.get_robot_trajectory_msg().joint_trajectory
+        if self.record is not None:                   # payload study: keep the trajectory and whether it carries
+            self.record.append((self.carrying, msg))
         last = msg.points[-1]
         idx = [msg.joint_names.index(j) for j in JOINTS]
         d = last.time_from_start
