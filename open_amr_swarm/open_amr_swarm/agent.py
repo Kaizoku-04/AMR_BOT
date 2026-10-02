@@ -37,7 +37,7 @@ import tf2_ros
 
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Pose2D, PoseStamped
-from nav2_msgs.action import ComputeRoute, DockRobot, FollowPath
+from nav2_msgs.action import ComputeRoute, DockRobot, FollowPath, UndockRobot
 from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap, DynamicEdges
 from nav_msgs.msg import Path
@@ -155,6 +155,15 @@ class SwarmAgent(Node):
             self.recenter_cli = self.create_client(Trigger, 'deck/recenter')
         self.dock_bays = dp('dock_bays', False).value
         self.dock_client = ActionClient(self, DockRobot, 'dock_robot')
+        self.undock_client = ActionClient(self, UndockRobot, 'undock_robot')
+        # Nav2's docking ends on position alone: the agent checks the result against the refined dock pose and docks
+        # again from staging if it is off (a 0.27 m staging offset once ended 4 deg off: the cell's dock sensor then
+        # refused the arm, fleet run 2026-10-02)
+        self.dock_tol = dp('dock_tol_m', 0.012).value
+        self.dock_tol_yaw = math.radians(dp('dock_tol_deg', 1.5).value)
+        self.staging_tol = dp('staging_tol_m', 0.12).value
+        self.dock_pose_msg = None
+        self.create_subscription(PoseStamped, 'dock_pose', lambda m: setattr(self, 'dock_pose_msg', m), 10)
         self.dock_state, self.dock_fails, self.docked, self.docking = None, 0, False, False
         self.route_client = ActionClient(self, ComputeRoute, 'compute_route')
         self.follow_client = ActionClient(self, FollowPath, 'follow_path')
@@ -601,7 +610,10 @@ class SwarmAgent(Node):
         yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
         x, y = t.transform.translation.x, t.transform.translation.y
         if self.pose is not None:
-            self.speed_est = 0.7 * self.speed_est + 0.3 * math.hypot(x - self.pose[0], y - self.pose[1]) / 0.2
+            step = math.hypot(x - self.pose[0], y - self.pose[1])
+            # not a millimetre since the last tick = stopped, now (the filtered estimate took ~0.6 s to fall below the
+            # cells' 0.02 m/s interlock threshold after every dock, fleet run 2026-10-02)
+            self.speed_est = 0.0 if step < 0.001 else 0.7 * self.speed_est + 0.3 * step / 0.2
         self.pose = (x, y, yaw)
         return True
 
@@ -926,8 +938,10 @@ class SwarmAgent(Node):
         d = math.hypot(self.graph.pos[n][0] - x, self.graph.pos[n][1] - y)
         if self.docking and k == len(self.route) - 2:
             # docking starts from a standstill at the staging node (a precise stop, or the stop given up on close by)
+            # (after 3 failed tries anyway: docking copes with an offset, the accuracy check re-docks if it shows, and
+            # an undock backs the robot out to a staging pose aligned with the bay)
             return self.follow_end == n and (self.follow_state == GoalStatus.STATUS_SUCCEEDED or (
-                self.follow_state == GoalStatus.STATUS_ABORTED and d < self.arrive_tol))
+                self.follow_state == GoalStatus.STATUS_ABORTED and (d < self.staging_tol or self.leg_fail >= 3)))
         if k in self.stop_at and k < len(self.route) - 1:
             # a turn stop counts only once the robot has actually stopped there — passing within 0.25 m while still
             # braking used to drop the stop, so the robot turned on the move (0.3 m off into aisle_0_bay_0)
@@ -943,6 +957,8 @@ class SwarmAgent(Node):
         the goal (MPPI aborts on no progress, forever: seen 2026-09-25 at 13 and 26 cm); or at a charger the BMS
         reports the contacts closed."""
         if self.docking:
+            if self.dock_state == 'settling' and self.settled():
+                self.check_dock(self.dock_name)
             return self.dock_state == GoalStatus.STATUS_SUCCEEDED
         if self.follow_state == GoalStatus.STATUS_SUCCEEDED:
             return True
@@ -1061,11 +1077,60 @@ class SwarmAgent(Node):
     def on_dock_done(self, r, name):
         res, status = r.result().result, r.result().status
         if status == GoalStatus.STATUS_SUCCEEDED and res.success:
-            self.docked, self.dock_state = True, GoalStatus.STATUS_SUCCEEDED
-            self.get_logger().info(f'{self.rid}: docked at {name} in {self.now() - self.dock_t0:.1f} s'
-                                   + (f' ({res.num_retries} retries)' if res.num_retries else ''))
+            # docked only at a confirmed standstill: the docking server's 'success' comes while the 60 kg robot still
+            # creeps a few mm (~5 mm/s, ~1 s) — the cell's dock sensor and its interlock then disagreed under a
+            # descending arm (fleet run 2026-10-02). final_reached() finishes it (settled() then check_dock()).
+            self.dock_state, self.settle_since, self.dock_name, self.dock_retries = 'settling', None, name, res.num_retries
         else:
             self.dock_failed(name, f'error {res.error_code} {res.error_msg}'.strip())
+
+    def settled(self):
+        """Docking: the robot has stood still (no mm of motion per 0.2 s tick) for 0.5 s."""
+        if self.speed_est > 0.0:
+            self.settle_since = None
+            return False
+        self.settle_since = self.settle_since or self.now()
+        return self.now() - self.settle_since >= 0.5
+
+    def check_dock(self, name):
+        """Settled: accurate enough -> docked; else back out to staging and dock again."""
+        err = self.dock_error()
+        if err is not None and (math.hypot(err[0], err[1]) > self.dock_tol or abs(err[2]) > self.dock_tol_yaw):
+            self.get_logger().warn(f'{self.rid}: docked at {name} but {1000 * err[0]:+.0f} / {1000 * err[1]:+.0f} mm, '
+                                   f'{math.degrees(err[2]):+.1f} deg off: backing out to dock again')
+            self.dock_state = 'undocking'
+            self.undock_client.send_goal_async(UndockRobot.Goal(dock_type='bay_dock')).add_done_callback(
+                lambda f, name=name: self.on_undock_handle(f, name))
+            return
+        self.docked, self.dock_state = True, GoalStatus.STATUS_SUCCEEDED
+        self.get_logger().info(f'{self.rid}: docked at {name} in {self.now() - self.dock_t0:.1f} s'
+                               + (f' ({self.dock_retries} retries)' if self.dock_retries else '')
+                               + (f', {1000 * math.hypot(err[0], err[1]):.0f} mm / {math.degrees(err[2]):+.1f} deg'
+                                  if err is not None else ''))
+
+    def dock_error(self):
+        """(along, across, yaw) of base_footprint relative to the refined dock pose, or None if unknown."""
+        m = self.dock_pose_msg
+        if m is None:
+            return None
+        try:
+            t = self.tf.lookup_transform(m.header.frame_id, 'base_footprint', Time())
+        except Exception:
+            return None
+        q = m.pose.orientation
+        dyaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+        r = t.transform.rotation
+        ryaw = math.atan2(2 * (r.w * r.z + r.x * r.y), 1 - 2 * (r.y * r.y + r.z * r.z))
+        dx, dy = t.transform.translation.x - m.pose.position.x, t.transform.translation.y - m.pose.position.y
+        c, s = math.cos(dyaw), math.sin(dyaw)
+        return c * dx + s * dy, -s * dx + c * dy, math.remainder(ryaw - dyaw, math.tau)
+
+    def on_undock_handle(self, f, name):
+        h = f.result()
+        if not h.accepted:
+            self.dock_failed(name, 'undock rejected')
+            return
+        h.get_result_async().add_done_callback(lambda r, name=name: self.dock_failed(name, 'inaccurate dock, re-docking'))
 
     def dock_failed(self, name, why):
         """The docking server gave up (after its own retries): try again from where the robot stands; after 3

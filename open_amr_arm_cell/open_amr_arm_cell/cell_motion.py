@@ -14,6 +14,7 @@ Faults raise CellFault (plan rejected, collision between waypoints, execution fa
 on, part lost while carrying, part still held after release, carton not where expected); `carton` tells where the
 carton of the cycle is then.
 """
+import math
 import os
 import threading
 import time
@@ -127,6 +128,8 @@ class CellMotion:
         self.carrying = None                     # where the carton on the tool came from, or None
         self.carton = C_NONE                     # where the carton of the current cycle is
         self.stock, self.docked, self.deck_box = [0, 0], False, False
+        self.seen = {}                           # (pallet, slot) -> detected carton centre (x, y, z, yaw): the scene
+                                                 # uses these instead of the pattern (cleared with every new stock)
         self.cycle = None                        # (depal, pallet, slot, taught entry) of the program being run
         self.steps, self.pc = [], 0              # its steps and the next one to run
         self.before_release = None               # diagnostics hook: called with the place name just before vacuum off
@@ -137,9 +140,11 @@ class CellMotion:
             for co in objs:
                 scene.apply_collision_object(co)
 
-    def set_scene(self, stock=None, docked=None, deck_box=None):
+    def set_scene(self, stock=None, docked=None, deck_box=None, fresh=False):
         """Pallet stock (cartons per pallet), robot docked (its outline, a carton on its deck if deck_box) or not (the
-        keep-out volume over the bay)."""
+        keep-out volume over the bay). fresh: a new transfer — forget the detected carton poses of the last one."""
+        if fresh:
+            self.seen = {}
         self.stock = list(stock) if stock is not None else self.stock
         self.docked = self.docked if docked is None else docked
         self.deck_box = self.deck_box if deck_box is None else deck_box
@@ -150,7 +155,8 @@ class CellMotion:
             objs.append(box_object(f'pallet_{i}', ps, (cx, cy, ps[2] / 2), yaw))
             for k in range(self.p.capacity):
                 (x, y, z), byaw = self.cell.slot_cell(i, k)
-                objs.append(box_object(f'box_{i}_{k}', self.p.box, (x, y, z - self.p.box[2] / 2), byaw)
+                cx, cy, cz, cyaw = self.seen.get((i, k), (x, y, z - self.p.box[2] / 2, byaw))
+                objs.append(box_object(f'box_{i}_{k}', self.p.box, (cx, cy, cz), cyaw)
                             if k < self.stock[i] else box_object(f'box_{i}_{k}', (), (), op=CollisionObject.REMOVE))
         self._apply(objs + zone_objects(self.cell, self.docked, self.deck_box))
 
@@ -313,10 +319,31 @@ class CellMotion:
             off = self.locator.locate(step.locate, (x, y, z - self.p.box[2] / 2, yaw))
         except LocateFault as e:
             raise CellFault(f'{e} at {where}')
+        if step.locate[0] == 'pallet':
+            self._scene_from_detections(pallet)
         if any(abs(v) > 1e-4 for v in off):
             self.log(f'carton at {where} located {off[0] * 1000:+.0f} / {off[1] * 1000:+.0f} mm, {off[2]:+.1f} deg '
                      'off the pattern: grip corrected')
         self.steps = prog.program(self.cell, depal, pallet, slot, t, offset=off)
+
+    def _scene_from_detections(self, pallet):
+        """Plan against what the camera sees: the cartons on `pallet` go into the scene at their detected poses (a
+        stack nudged a few mm — by a stop, a dropped carton — made a lift 'collide' with neighbours drawn at their
+        pattern slots, fleet run 2026-10-02)."""
+        dets = self.locator.detected()
+        if not dets:
+            return
+        changed = False
+        for k in range(self.stock[pallet]):
+            (x, y, z), yaw = self.cell.slot_cell(pallet, k)
+            nz = z - self.p.box[2] / 2
+            near = min(dets, key=lambda d: (d[0] - x) ** 2 + (d[1] - y) ** 2 + (d[2] - nz) ** 2)
+            if math.dist(near[:3], (x, y, nz)) < 0.06:
+                dyaw = (near[3] - yaw + 45.0) % 90.0 - 45.0
+                self.seen[(pallet, k)] = (near[0], near[1], near[2], yaw + dyaw)
+                changed = True
+        if changed:
+            self.set_scene()
 
     def run(self, until=None, on_dock=None, on_undock=None, on_step=None):
         """Run the loaded program from where it stands; stop before a step of kind `until` (e.g. prog.DOCK: pre-pick).

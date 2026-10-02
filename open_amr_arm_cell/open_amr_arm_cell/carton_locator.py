@@ -24,6 +24,9 @@ class NominalLocator:
     def locate(self, target, nominal, timeout=1.0):
         return (0.0, 0.0, 0.0)
 
+    def detected(self):
+        return []
+
 
 def match(detections, nominal, max_dist, max_dyaw, search=0.15, height_tol=0.08):
     """Offset (dx, dy, dyaw) of the detection nearest to `nominal` (x, y, z, yaw_deg; carton centre, same frame).
@@ -64,6 +67,11 @@ class DetectionLocator:
             out.append((c * dx + s * dy, -s * dx + c * dy, p.position.z, yaw - ayaw))
         with self.lock:
             self.cartons, self.stamp = out, time.monotonic()
+
+    def detected(self):
+        """The latest carton detections (x, y, z, yaw_deg), cell frame."""
+        with self.lock:
+            return list(self.cartons)
 
     def locate(self, target, nominal, timeout=1.0):
         """target = ('pallet', i, k) | ('deck',); nominal = carton centre (x, y, z, yaw_deg), cell frame."""

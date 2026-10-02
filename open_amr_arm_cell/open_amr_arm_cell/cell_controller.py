@@ -282,7 +282,7 @@ class CellController(Node):
                 if m.carrying is not None or self.io.holding():
                     raise CellFault(f'asked to {kind} pallet {g.pallet} slot {g.slot} while holding a carton from '
                                     f'{m.carrying or "?"}')
-                m.set_scene(stock=list(g.stock), docked=False, deck_box=False)
+                m.set_scene(stock=list(g.stock), docked=False, deck_box=False, fresh=True)
                 m.start(g.kind != ArmTransfer.Goal.PALLETIZE, g.pallet, g.slot)
             m.run(until=prog.DOCK if g.kind == ArmTransfer.Goal.PREPARE else None, on_dock=on_dock,
                   on_undock=on_undock, on_step=lambda s: s in steps and self.feedback(gh, steps[s]))
