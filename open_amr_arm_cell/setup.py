@@ -25,5 +25,7 @@ setup(
         'reach_study = open_amr_arm_cell.reach_study:main',
         'tracking_test = open_amr_arm_cell.tracking_test:main',
         'gripper_test = open_amr_arm_cell.gripper_test:main',
+        'cell_controller = open_amr_arm_cell.cell_controller:main',
+        'cell_test = open_amr_arm_cell.cell_test:main',
     ]},
 )

@@ -13,6 +13,8 @@ mode:=mission also starts a station_agent per arm (arm_receiving at receiving_ba
 receiving_pallets / outbound_pallets = boxes on each staged pallet at start (default a dock mid-shift: receiving 8 and 24
 boxes, outbound 16 and 0, so a pallet runs empty / fills up early in a run), pallet_swap_s = truck restock / pickup
 time, arm_cycle_s = one transfer; fault:=arm_receiving:300:120 takes that arm out of service at 300 s for 120 s.
+cells:=true runs the stations against real arm cells (open_amr_arm_cell cell_controller per arm, Phase 4b) instead of
+a fixed arm_cycle_s.
 """
 import os
 
@@ -58,7 +60,8 @@ def spawn(context):
                                              'pallets': [int(v) for v in pallets.split(',')],
                                              'cycle_s': float(lc('arm_cycle_s')), 'swap_s': float(lc('pallet_swap_s')),
                                              'fault_at_s': float(fault[1]) if f else 0.0,
-                                             'fault_for_s': float(fault[2]) if f else 0.0, 'use_sim_time': True}]))
+                                             'fault_for_s': float(fault[2]) if f else 0.0,
+                                             'cell': lc('cells') == 'true', 'use_sim_time': True}]))
     if lc('mode') != 'none':
         actions.append(Node(package='open_amr_swarm', executable='mission_generator', name='mission_generator',
                             output='screen',
@@ -84,6 +87,7 @@ def generate_launch_description():
         DeclareLaunchArgument('outbound_pallets', default_value='16,0'),
         DeclareLaunchArgument('pallet_swap_s', default_value='180'),
         DeclareLaunchArgument('arm_cycle_s', default_value='8.0'),
+        DeclareLaunchArgument('cells', default_value='false', description='stations drive real arm cells (cell_controller)'),
         DeclareLaunchArgument('fault', default_value='', description='station:start_s:duration_s, e.g. arm_receiving:300:120'),
         DeclareLaunchArgument('graph', default_value=''),
         DeclareLaunchArgument('graph_nodes', default_value=''),

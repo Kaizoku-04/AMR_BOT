@@ -13,6 +13,7 @@ find_package(geometry_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/TimedRotation.action"
+  "action/ArmTransfer.action"
   "srv/SetCleaningState.srv"
   "msg/RobotState.msg"
   "msg/Task.msg"
@@ -22,6 +23,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Transfer.msg"
   "msg/Inventory.msg"
   "msg/OperatorCommand.msg"
+  "msg/ArmCellState.msg"
   DEPENDENCIES builtin_interfaces geometry_msgs
 )
 

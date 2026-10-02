@@ -68,3 +68,15 @@ def test_params_from_layout():
     p = CellParams.from_layout({'arm_cell': {'pedestal_height': 1.2, 'pattern': [3, 2, 3]},
                                 'box': {'size': [0.35, 0.35, 0.3]}})
     assert p.pedestal_height == 1.2 and p.capacity == 18 and p.box == (0.35, 0.35, 0.3)
+
+
+def test_deck_zone_covers_the_docked_robot_and_a_carton_on_it():
+    c = Cell((0.0, 0.0, 0.0))
+    p = c.p
+    x, y, sx, sy, top = c.deck_zone()
+    assert (x, y) == (p.deck_distance, 0.0)
+    assert sx >= p.amr_footprint[0] + 0.1 and sy >= p.amr_footprint[1] + 0.1
+    assert top >= p.deck_top + p.box[2] + 0.1                  # a carton on the deck is inside, with room to spare
+    assert c.deck_hold_height() - p.box[2] > top               # a held carton's bottom is above the zone
+    assert c.deck_clear_height() > top
+    assert c.deck_hold_height() < c.transit_height()           # holding never needs the pallet transit height

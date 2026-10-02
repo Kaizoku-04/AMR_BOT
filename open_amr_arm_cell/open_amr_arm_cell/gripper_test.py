@@ -85,7 +85,7 @@ def main(argv=None):
 
     motion = CellMotion(moveit, io, cell, load_pattern(), vel_scale=a.speed or None, acc_scale=a.speed or None)
     n = p.capacity
-    motion.set_scene(stock=[n, 0], amr=True, deck_box=False)
+    motion.set_scene(stock=[n, 0], docked=False, deck_box=False)   # a stand-in AMR is always docked: no interlock
     held = {}
 
     def snap_before(where):
@@ -101,11 +101,11 @@ def main(argv=None):
         k, slot = n - 1 - c, c                    # top box of pallet 0 -> next free slot of pallet 1
         try:
             t0 = time.monotonic()
-            motion.pick(0, k)
-            motion.place_on_deck()
+            motion.start(True, 0, k)                 # one depalletizing and one palletizing program, run through
+            motion.run()
             t1 = time.monotonic()
-            motion.pick_from_deck(1, slot)
-            motion.place(1, slot)
+            motion.start(False, 1, slot)
+            motion.run()
             t2 = time.monotonic()
         except CellFault as e:
             fault = f'cycle {c} (pallet 0 slot {k} -> pallet 1 slot {slot}): {e}'
@@ -116,7 +116,6 @@ def main(argv=None):
                     t_end = rec.hw[-1][0] if rec.hw else 0.0
                     pickle.dump(dict(cmds=[x for x in rec.cmds if x[0] > t_end - 6], hw=[x for x in rec.hw if x[0] > t_end - 6],
                                      fault=fault), open(a.out + '.fault.pkl', 'wb'))
-            motion.recover()
             break
         time.sleep(0.6)                           # a fresh /test_boxes (2 Hz)
         with watch.lock:

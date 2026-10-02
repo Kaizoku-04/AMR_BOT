@@ -2,14 +2,12 @@
 Pilz (the planner the cell runs), with collision checking against the pedestal, both pallets and their boxes, the
 docked AMR and the floor, carrying the box attached to the gripper.
 
-For each pallet slot, both directions:
-  depalletize  home -PTP-> above slot -LIN-> slot (vacuum on, box attached) -LIN-> lift clear of the layer
-               -PTP-> above deck -LIN-> deck (vacuum off) -LIN-> above deck -PTP-> home
-  palletize    home -PTP-> above deck -LIN-> deck (vacuum on) -LIN-> above deck -PTP-> lift height over the slot
-               -LIN-> slot (vacuum off) -LIN-> above slot -PTP-> home
-Scene per slot = the worst case of the pattern: the slot's pallet holds the boxes below it (and the picked one), the
-other pallet is full. The four gripper orientations (box square footprint) are tried; the fastest feasible one is
-kept. A slot passes only if every segment plans (Pilz validates each solution for collisions).
+For each pallet slot, both directions, the cell's own motion program (cell_program.py: depalletize / palletize, with
+the deck zone interlock — the keep-out volume over the bay is in the scene until DOCK, the docked robot from DOCK to
+UNDOCK, the keep-out volume again after UNDOCK). Scene per slot = the worst case of the pattern: the slot's pallet
+holds the boxes below it (and the picked one), the other pallet is full. The four gripper orientations (box square
+footprint) are tried, then the same with a via point at the transit height; the fastest feasible one is kept. A slot
+passes only if every step plans and passes the dense collision check.
 
 Writes a taught pattern (joint configurations above each slot / the deck, gripper yaw, segment times) that the cell
 controller uses as PTP goals, as a UR palletizer's taught waypoints.
@@ -31,15 +29,14 @@ from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
 from shape_msgs.msg import SolidPrimitive
 
 from .cell_geometry import Cell, CellParams
+from . import cell_program as prog
+from .cell_program import CONTACT, HOME  # noqa: F401 (re-exported)
 from . import ur_ik
 
 JOINTS = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint', 'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
-HOME = [0.0, -1.5708, 1.5708, -1.5708, -1.5708, 0.0]
 LIMITS = [(-2 * math.pi, 2 * math.pi)] * 2 + [(-math.pi, math.pi)] + [(-2 * math.pi, 2 * math.pi)] * 3   # ur_description
 AMR = (0.806, 0.64, 0.334)          # AMR body up to the deck surface (collision outline, Robot Parameters)
 VACUUM_S = 0.3                      # vacuum build-up / release (typical area gripper with a vacuum switch)
-CONTACT = 0.005                     # planned contact stops this short: the foam pad compresses 10-20 mm to seal, and a
-                                    # released box drops this far (exact contact would read as a collision)
 
 
 def moveit_configs(p: CellParams, hardware='none', execution=False):
@@ -142,6 +139,18 @@ def box_object(name, size, xyz, yaw_deg=0.0, op=CollisionObject.ADD):
     return co
 
 
+def zone_objects(cell, docked, deck_box=False):
+    """Planning-scene objects of the bay: the docked robot (+ the carton on its deck) or the keep-out volume."""
+    p = cell.p
+    rm = lambda n: box_object(n, (), (), op=CollisionObject.REMOVE)
+    if not docked:
+        x, y, sx, sy, top = cell.deck_zone()
+        return [rm('amr'), rm('deck_box'), box_object('deck_zone', (sx, sy, top), (x, y, top / 2))]
+    (dx, dy, dz), dyaw = cell.deck_cell()
+    return [rm('deck_zone'), box_object('amr', AMR, (p.deck_distance, 0.0, AMR[2] / 2)),
+            box_object('deck_box', p.box, (dx, dy, dz - p.box[2] / 2), dyaw) if deck_box else rm('deck_box')]
+
+
 class Study:
     def __init__(self, cell: Cell):
         from moveit.planning import MoveItPy, PlanRequestParameters
@@ -225,10 +234,10 @@ class Study:
             if not attach:
                 scene.apply_collision_object(box_object('carried', (), (), op=CollisionObject.REMOVE))
 
-    def set_scene(self, pallet, filled, deck_box):
-        """pallet `pallet` holds slots 0..filled-1, the other one is full; a box on the deck if deck_box."""
+    def set_scene(self, pallet, filled):
+        """pallet `pallet` holds slots 0..filled-1, the other one is full; no robot docked (keep-out volume over the
+        bay)."""
         self.clear()
-        (px, py), pyaw = self.cell.pallet_cell(pallet)
         objs = [box_object('floor', (6.0, 6.0, 0.02), (0.0, 0.0, -0.011))]
         for i in (0, 1):
             (cx, cy), yaw = self.cell.pallet_cell(i)
@@ -237,11 +246,12 @@ class Study:
             for k in range(filled if i == pallet else self.p.capacity):
                 (x, y, z), byaw = self.cell.slot_cell(i, k)
                 objs.append(box_object(f'box_{i}_{k}', self.p.box, (x, y, z - self.p.box[2] / 2), byaw))
-        objs.append(box_object('amr', AMR, (self.p.deck_distance, 0.0, AMR[2] / 2)))
-        if deck_box:
-            x, y, z = self.cell.deck_cell()[0]
-            objs.append(box_object('deck_box', self.p.box, (x, y, z - self.p.box[2] / 2), 180.0))
         self.apply(objs)
+        self.dock(False)
+
+    def dock(self, docked, deck_box=False):
+        """Robot docked (its outline, a carton on its deck if deck_box) or not (the deck zone's keep-out volume)."""
+        self.apply(zone_objects(self.cell, docked, deck_box))
 
     # ------------------------------------------------------------ planning
     def state(self, q):
@@ -287,77 +297,69 @@ class Study:
         d = last.time_from_start
         return [last.positions[i] for i in idx], d.sec + d.nanosec * 1e-9
 
-    def sequence(self, pallet, slot, yaw_grip, yaw_deck, depal, via=False):
-        """Plan one full cycle. Returns dict(times, taught) or the name of the failing segment. via: carry the box
-        across at the transit height (clear of a full pallet) instead of swinging straight from the lift point."""
-        (sx, sy, sz), _ = self.cell.slot_cell(pallet, slot)
+    def sequence(self, pallet, slot, yaw_grip, yaw_deck, depal, via=False, hold_high=False):
+        """Plan one full cycle of the cell's program. Returns dict(times, deck_s, taught) or the name of the failing
+        step. via: carry the box across at the transit height (clear of a full pallet) instead of swinging straight
+        from the lift point."""
+        (sx, sy, _), _ = self.cell.slot_cell(pallet, slot)
         (dx, dy, dz), _ = self.cell.deck_cell()
-        a = self.p.approach
+        p_slot, p_deck = prog.taught_poses(self.cell, depal, pallet, slot, yaw_grip, yaw_deck, via, hold_high)
         seed = list(HOME)
         seed[0] = math.atan2(sy, sx)
-        zt = self.cell.transit_height()
-        z_slot_carry = zt if via else self.cell.lift_height(sz)       # where the box is carried to / from the slot
-        q_slot_above = self.ik(tool_down(sx, sy, sz + a if depal else z_slot_carry, yaw_grip), seed)
-        if q_slot_above is None:
+        q_slot = self.ik(tool_down(*p_slot), seed)
+        if q_slot is None:
             return 'ik above slot'
         seed_d = list(HOME)
         seed_d[0] = math.atan2(dy, dx)
-        z_deck_carry = zt if via else dz + a
-        q_deck_above = self.ik(tool_down(dx, dy, z_deck_carry if depal else dz + a, yaw_deck), seed_d)
-        q_deck_carry = self.ik(tool_down(dx, dy, z_deck_carry, yaw_deck), seed_d) if not depal else q_deck_above
-        if q_deck_above is None:
-            return 'ik above deck'
-        slot_pose = tool_down(sx, sy, sz + CONTACT, yaw_grip)
-        lift_pose = tool_down(sx, sy, z_slot_carry if depal else sz + a, yaw_grip)
-        deck_pose = tool_down(dx, dy, dz + CONTACT, yaw_deck)
-        deck_above = tool_down(dx, dy, dz + a, yaw_deck)
-        deck_carry = tool_down(dx, dy, z_deck_carry, yaw_deck)
-        if q_deck_carry is None:
-            return 'ik deck transit'
-        times, q = {}, list(HOME)
-        steps = ([('to slot', dict(goal_q=q_slot_above)), ('down to slot', dict(goal_pose=slot_pose, lin=True)),
-                  ('attach', None), ('lift', dict(goal_pose=lift_pose, lin=True)),
-                  ('to deck', dict(goal_q=q_deck_above)),
-                  ('down to deck', dict(goal_pose=deck_pose, lin=True, place=True)), ('detach deck', None), ('retreat', dict(goal_pose=deck_above, lin=True)), ('home', dict(goal_q=HOME))]
-                 if depal else
-                 [('to deck', dict(goal_q=q_deck_above)), ('down to deck', dict(goal_pose=deck_pose, lin=True)),
-                  ('attach deck', None), ('up from deck', dict(goal_pose=deck_carry, lin=True)),
-                  ('to slot', dict(goal_q=q_slot_above)),
-                  ('down to slot', dict(goal_pose=slot_pose, lin=True, place=True)), ('detach', None), ('retreat', dict(goal_pose=lift_pose, lin=True)), ('home', dict(goal_q=HOME))])
+        q_deck = self.ik(tool_down(*p_deck), seed_d)
+        if q_deck is None:
+            return 'ik deck hold'
+        t = dict(slot_above=q_slot, deck_hold=q_deck, grip_yaw=yaw_grip, deck_yaw=yaw_deck, via=via, hold_high=hold_high)
+        times, q, docked_at, deck_s = {}, list(HOME), None, 0.0
         try:
-            for name, kw in steps:
-                if kw is None:                           # vacuum on / off: scene bookkeeping
-                    if name.startswith('attach'):
-                        self.apply([box_object('deck_box' if 'deck' in name else f'box_{pallet}_{slot}', (), (),
-                                               op=CollisionObject.REMOVE)])
-                        self.attach(True)
-                    else:                                # the released box lands where it was put down
-                        self.attach(False)
-                        if 'deck' in name:
-                            self.apply([box_object('deck_box', self.p.box, (dx, dy, dz - self.p.box[2] / 2), yaw_deck)])
-                        else:
-                            self.apply([box_object(f'box_{pallet}_{slot}', self.p.box, (sx, sy, sz - self.p.box[2] / 2),
-                                                   yaw_grip)])
-                    times[name] = VACUUM_S
-                    continue
-                r = self.plan(q, **kw)
-                if r is None:
-                    return name
-                q, times[name] = r
+            for st in prog.program(self.cell, depal, pallet, slot, t):
+                if st.kind == prog.DOCK:
+                    self.dock(True, deck_box=not depal)
+                    docked_at = sum(times.values())
+                elif st.kind == prog.UNDOCK:
+                    deck_s = sum(times.values()) - docked_at
+                    self.dock(False)
+                elif st.kind == prog.GRIP:
+                    self.apply([box_object('deck_box' if st.where == 'deck' else f'box_{pallet}_{slot}', (), (),
+                                           op=CollisionObject.REMOVE)])
+                    self.attach(True)
+                    times[st.name] = VACUUM_S
+                elif st.kind == prog.RELEASE:           # the released box lands where it was put down
+                    self.attach(False)
+                    if st.where == 'deck':
+                        self.apply([box_object('deck_box', self.p.box, (dx, dy, dz - self.p.box[2] / 2), yaw_deck)])
+                    else:
+                        (bx, by, bz), _ = self.cell.slot_cell(pallet, slot)
+                        self.apply([box_object(f'box_{pallet}_{slot}', self.p.box, (bx, by, bz - self.p.box[2] / 2),
+                                               yaw_grip)])
+                    times[st.name] = VACUUM_S
+                else:
+                    r = self.plan(q, goal_q=st.q) if st.kind == prog.PTP else \
+                        self.plan(q, goal_pose=tool_down(*st.pose), lin=True, place=st.place)
+                    if r is None:
+                        return st.name
+                    q, times[st.name] = r
         finally:
             self.attach(False)
-        return dict(times=times, via=via, taught=dict(slot_above=[round(v, 5) for v in q_slot_above],
-                                                      deck_above=[round(v, 5) for v in q_deck_above],
-                                                      grip_yaw=yaw_grip, deck_yaw=yaw_deck,
-                                                      carry_height=round(zt if via else -1.0, 4)))
+        return dict(times=times, via=via, deck_s=round(deck_s, 2),
+                    taught=dict(slot_above=[round(v, 5) for v in q_slot], deck_hold=[round(v, 5) for v in q_deck],
+                                grip_yaw=yaw_grip, deck_yaw=yaw_deck, hold_high=hold_high))
 
     def slot(self, pallet, slot, depal):
         """Best (fastest) feasible gripper orientation for a slot, or the failures per orientation."""
         _, box_yaw = self.cell.slot_cell(pallet, slot)
         best, fails = None, []
-        for via, m in [(v, m) for v in (False, True) for m in range(4)]:
-            if via and best is not None:
-                break                                    # a direct swing works: no via point needed
+        # preference: direct swing; else a via point at the transit height with the carton still held low over the
+        # deck (shortest robot wait); else held at the transit height. Within a group the fastest cycle wins.
+        groups = [(False, False), (True, False), (True, True)]
+        for (via, high), m in [(g, m) for g in groups for m in range(4)]:
+            if best is not None and (via, high) != (best['via'], best['taught']['hold_high']):
+                break                                    # an earlier (preferred) group already works
             yaw_grip = box_yaw + 90.0 * m
             # the box turns with the gripper: on the deck it must end square to the AMR (the deck conveyor pushes it
             # into a bin), i.e. at a multiple of 90 deg from the AMR's heading (180 in the cell frame); take the one
@@ -365,10 +367,10 @@ class Study:
             # deck at the pallet's angle and on the other pallet 30 deg off its pattern: gripper test, 2026-09-26.)
             yaw_deck = 180.0 + 90.0 * round((yaw_grip - 180.0) / 90.0)
             filled = slot + 1 if depal else slot
-            self.set_scene(pallet, filled, deck_box=not depal)
-            r = self.sequence(pallet, slot, yaw_grip, yaw_deck, depal, via)
+            self.set_scene(pallet, filled)
+            r = self.sequence(pallet, slot, yaw_grip, yaw_deck, depal, via, high)
             if isinstance(r, str):
-                fails.append(f'{int(yaw_grip) % 360}deg{" via" if via else ""}: {r}')
+                fails.append(f'{int(yaw_grip) % 360}deg{" via" if via else ""}{" high" if high else ""}: {r}')
                 continue
             r['cycle_s'] = round(sum(r['times'].values()), 2)
             if best is None or r['cycle_s'] < best['cycle_s']:
@@ -410,18 +412,24 @@ def main(argv=None):
                 else:
                     n_ok += 1
                     out['pattern'][key] = best
-                    print(f'ok   {key}: cycle {best["cycle_s"]:.2f} s (grip {int(best["taught"]["grip_yaw"]) % 360} deg'
-                          f'{", via transit height" if best["via"] else ""})',
+                    print(f'ok   {key}: cycle {best["cycle_s"]:.2f} s, robot waits {best["deck_s"]:.2f} s (grip {int(best["taught"]["grip_yaw"]) % 360} deg'
+                          f'{", via transit height" if best["via"] else ""}{", held high" if best["taught"]["hold_high"] else ""})',
                           flush=True)
     cycles = [v['cycle_s'] for v in out['pattern'].values()]
+    decks = [v['deck_s'] for v in out['pattern'].values()]
     out['summary'] = dict(passed=n_ok, total=n, cycle_mean_s=round(sum(cycles) / max(len(cycles), 1), 2),
-                          cycle_max_s=max(cycles, default=0.0), wall_s=round(time.time() - t0, 1))
-    for k in ('pallet_size', 'box', 'pattern'):
+                          cycle_max_s=max(cycles, default=0.0), deck_mean_s=round(sum(decks) / max(len(decks), 1), 2),
+                          deck_max_s=max(decks, default=0.0), wall_s=round(time.time() - t0, 1))
+    for k in ('pallet_size', 'box', 'pattern', 'amr_footprint'):
         out['cell'][k] = list(out['cell'][k])
     with open(a.out, 'w') as f:
+        f.write(f'# Taught pallet pattern of the {p.ur_type.upper()} cell, generated by: ros2 run open_amr_arm_cell reach_study '
+                '--out config/taught_pattern.yaml\n# (cell frame; both cells identical; steps = cell_program.py). Do not '
+                'edit by hand: change warehouse_layout.yaml arm_cell and re-run the study.\n')
         yaml.safe_dump(out, f, sort_keys=False)
     print(f'reach study: {n_ok}/{n} slot cycles feasible, cycle mean {out["summary"]["cycle_mean_s"]} s, '
-          f'max {out["summary"]["cycle_max_s"]} s -> {a.out}', flush=True)
+          f'max {out["summary"]["cycle_max_s"]} s; robot at the bay {out["summary"]["deck_mean_s"]} s mean, '
+          f'{out["summary"]["deck_max_s"]} s max -> {a.out}', flush=True)
     return _exit(0 if n_ok == n else 1)
 
 

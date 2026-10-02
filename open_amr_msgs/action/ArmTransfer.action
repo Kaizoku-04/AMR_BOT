@@ -1,0 +1,32 @@
+# One transfer of a palletizing cell (open_amr_arm_cell cell_controller, one per arm at /<arm_id>/cell/transfer),
+# requested by the cell's station_agent, which owns the stock bookkeeping (which pallet, which slot, how many cartons).
+# The controller enforces the bay interlock itself: it enters the deck zone (the keep-out volume over the bay) only
+# while robot `robot_id` reports, in its own heartbeat (/swarm/state), AT_STATION on the bay node, stopped, at the bay
+# pose; if that robot moves while the arm is in the zone, the arm stops and the transfer ends in a fault.
+# One goal at a time: a goal sent while another runs, or while the cell is faulted, is rejected.
+uint8 PREPARE=0        # depalletizing: pick the top carton (`slot`) of `pallet` and hold it above the deck zone
+uint8 DEPALLETIZE=1    # put the held (or a freshly picked) carton from pallet/slot onto the docked robot's deck
+uint8 PALLETIZE=2      # take the carton off the docked robot's deck and stack it into `slot` of `pallet`
+
+uint8 kind
+uint8 pallet
+uint8 slot
+int32[] stock          # cartons on each pallet pose before this transfer (the planning scene mirrors the cell)
+string robot_id        # the robot at the bay (DEPALLETIZE / PALLETIZE)
+string task_id
+---
+uint8 CARTON_NONE=0    # nothing was picked
+uint8 CARTON_PALLET=1  # in a pallet slot (palletized, or put back)
+uint8 CARTON_TOOL=2    # on the gripper (PREPARE done, or a fault while holding: the operator takes it off)
+uint8 CARTON_DECK=3    # on the robot's deck (depalletized, or a palletize that faulted before the pick)
+uint8 CARTON_LOST=4    # dropped / not where expected: the operator must find and clear it
+
+bool success
+string fault           # CellFault text when not successful (the station goes to FAULT until the cell is reset)
+uint8 carton           # where the carton of this transfer is now
+float32 duration_s     # goal accepted -> result
+float32 deck_s         # interlock made -> arm clear of the deck zone (what the robot waits for once docked)
+float32 wait_interlock_s
+---
+string phase           # 'picking' | 'holding' | 'waiting_interlock' | 'in_deck_zone' | 'deck_clear' (the robot may
+                       # leave) | 'placing' | 'home'

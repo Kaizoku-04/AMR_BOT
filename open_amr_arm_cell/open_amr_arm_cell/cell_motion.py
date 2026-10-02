@@ -1,19 +1,18 @@
-"""Motion executor of a palletizing cell: runs the taught pattern (config/taught_pattern.yaml, from the reach study)
-through MoveIt 2 + Pilz on the cell's trajectory controller, with the vacuum over UR digital I/O
-(io_and_status_controller: set_io tool output 16, io_states tool input 16 = part present). The same code drives the
-simulated cell (open_amr_sim.py --arms) and a real UR30 (ur_robot_driver).
+"""Motion executor of a palletizing cell: runs the cell's motion program (cell_program.py, the steps the reach study
+validated, with the taught points of config/taught_pattern.yaml) through MoveIt 2 + Pilz on the cell's trajectory
+controller, with the vacuum over UR digital I/O (io_and_status_controller: set_io tool output 16, io_states tool input
+16 = part present). The same code drives the simulated cell (open_amr_sim.py --arms) and a real UR30 (ur_robot_driver).
 
-Phases (so the cell controller can pre-pick and never keeps a robot waiting for more than the handover):
-  depalletizing  pick(pallet, slot)       home -> above the slot -> down -> vacuum -> part present -> lift -> above deck
-                 place_on_deck()          down -> vacuum off -> part released -> up (clear of the deck) -> home
-  palletizing    pick_from_deck()         home -> above the deck -> down -> vacuum -> part present -> up (clear)
-                 place(pallet, slot)      above the slot -> down -> vacuum off -> released -> up -> home
-  Every cycle starts and ends at home: exactly the moves the reach study planned and validated.
-  home()
-Every move is planned with Pilz against the planning scene the executor keeps (pallets with their current stock,
-the docked AMR, the carried box attached to the tool), and validated for collisions before it runs.
-Faults raise CellFault: plan rejected, execution failed (controller abort, protective stop), no part after vacuum on,
-part lost while carrying, part still held after release.
+A cycle runs as one program with two markers (cell_program.py): at DOCK the executor calls `on_dock` (the cell
+controller waits there for the bay interlock), at UNDOCK `on_undock` (the robot may leave). `start()` + `run(until=DOCK)`
+pre-picks a carton and holds it over the deck zone; a later `run()` finishes the cycle.
+Every move is planned with Pilz against the planning scene the executor keeps (pallets with their current stock, the
+keep-out volume over the bay or the docked robot, the carried carton attached to the tool), checked densely for
+collisions before it runs, and watched while it runs by `guard(in_zone)`: a non-empty answer (protective stop, robot
+moved under the arm) stops the trajectory at once.
+Faults raise CellFault (plan rejected, collision between waypoints, execution failed or stopped, no part after vacuum
+on, part lost while carrying, part still held after release, carton not where expected); `carton` tells where the
+carton of the cycle is then.
 """
 import os
 import threading
@@ -23,14 +22,19 @@ import yaml
 from geometry_msgs.msg import PoseStamped
 from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
 
+from . import cell_program as prog
+from .carton_locator import LocateFault, NominalLocator
 from .cell_geometry import Cell, CellParams
-from .reach_study import AMR, CONTACT, HOME, JOINTS, TRANSFER_MARGIN, box_object, dense_collision, tool_down
+from .reach_study import JOINTS, TRANSFER_MARGIN, box_object, dense_collision, tool_down, zone_objects
 
 VACUUM_OUT, PART_PRESENT_IN = 16, 16
+# where the carton of the current cycle is
+C_NONE, C_PALLET, C_TOOL, C_DECK, C_LOST = 'none', 'pallet', 'tool', 'deck', 'lost'
+VACUUM_LOST = 'vacuum switch lost the part'
 
 
 class CellFault(Exception):
-    """A cell fault the station must report (FAULT) and a person / the controller must clear."""
+    """A cell fault the station must report (FAULT) and a person must clear (cell reset)."""
 
 
 def load_pattern(path=None):
@@ -41,13 +45,15 @@ def load_pattern(path=None):
 
 
 class VacuumIO:
-    """The cell's tool I/O over ur_robot_driver's io_and_status_controller interface (sim: arm_bridge.py)."""
+    """The cell's tool I/O over ur_robot_driver's io_and_status_controller interface (sim: arm_bridge.py), and the
+    payload (set_payload: a real UR's dynamics and force limits must know a carton hangs on the tool)."""
 
     def __init__(self, node, arm_id):
         from ur_msgs.msg import IOStates
-        from ur_msgs.srv import SetIO
-        self.SetIO = SetIO
+        from ur_msgs.srv import SetIO, SetPayload
+        self.SetIO, self.SetPayload = SetIO, SetPayload
         self.cli = node.create_client(SetIO, f'/{arm_id}/io_and_status_controller/set_io')
+        self.payload_cli = node.create_client(SetPayload, f'/{arm_id}/io_and_status_controller/set_payload')
         self.lock, self.part_present, self.stamp = threading.Lock(), None, 0.0
         node.create_subscription(IOStates, f'/{arm_id}/io_and_status_controller/io_states', self.on_io, 10)
 
@@ -60,15 +66,25 @@ class VacuumIO:
     def ready(self, timeout=30.0):
         return self.cli.wait_for_service(timeout_sec=timeout)
 
-    def vacuum(self, on):
-        req = self.SetIO.Request(fun=self.SetIO.Request.FUN_SET_DIGITAL_OUT, pin=VACUUM_OUT,
-                                 state=float(self.SetIO.Request.STATE_ON if on else self.SetIO.Request.STATE_OFF))
-        fut = self.cli.call_async(req)
+    def _call(self, cli, req, what):
+        fut = cli.call_async(req)
         t0 = time.monotonic()
         while not fut.done() and time.monotonic() - t0 < 5.0:
             time.sleep(0.005)
         if not fut.done() or not fut.result().success:
-            raise CellFault(f'set_io vacuum {"on" if on else "off"} failed')
+            raise CellFault(f'{what} failed')
+
+    def vacuum(self, on):
+        self._call(self.cli, self.SetIO.Request(fun=self.SetIO.Request.FUN_SET_DIGITAL_OUT, pin=VACUUM_OUT, state=float(
+            self.SetIO.Request.STATE_ON if on else self.SetIO.Request.STATE_OFF)), f'set_io vacuum {"on" if on else "off"}')
+
+    def payload(self, mass, cog_z):
+        """Tool payload (kg, centre of gravity along the tool axis from the flange, m); skipped without set_payload."""
+        if not self.payload_cli.service_is_ready():
+            return
+        req = self.SetPayload.Request(mass=float(mass))
+        req.center_of_gravity.z = float(cog_z)
+        self._call(self.payload_cli, req, 'set_payload')
 
     def wait_part(self, present, timeout):
         """Wait for the vacuum switch to read `present` (a fresh reading); False on timeout."""
@@ -86,14 +102,17 @@ class VacuumIO:
 
 
 class CellMotion:
-    def __init__(self, moveit, io, cell: Cell, pattern, vel_scale=None, acc_scale=None, logger=print):
-        """vel_scale / acc_scale override the configured scaling (moveit_cpp.yaml ptp 0.8/0.5, lin 0.5/0.5) for
-        every move; 1.0 = the arm's full speed (UR's joint velocity limits, UR MoveIt's acceleration limits)."""
+    def __init__(self, moveit, io, cell: Cell, pattern, locator=None, vel_scale=None, acc_scale=None, logger=print,
+                 gripper_mass=2.0, carton_mass=8.0):
+        """vel_scale / acc_scale override the configured scaling (moveit_cpp.yaml: the production speeds) for every
+        move; 1.0 = the arm's full speed (UR's joint velocity limits, UR MoveIt's acceleration limits)."""
         from moveit.planning import PlanRequestParameters
         self.moveit, self.io, self.cell, self.p = moveit, io, cell, cell.p
         self.pattern = pattern['pattern']
+        self.locator = locator or NominalLocator()
         self.arm = moveit.get_planning_component('arm')
         self.psm = moveit.get_planning_scene_monitor()
+        self.tem = moveit.get_trajectory_execution_manager()
         self.ptp, self.lin = PlanRequestParameters(moveit, 'ptp'), PlanRequestParameters(moveit, 'lin')
         self.lin_place = PlanRequestParameters(moveit, 'lin_place')
         for prm in (self.ptp, self.lin):
@@ -102,12 +121,15 @@ class CellMotion:
             if acc_scale is not None:
                 prm.max_acceleration_scaling_factor = float(acc_scale)
         self.log = logger
-        self.times = {}                    # segment -> last duration (s)
-        self.carrying = None               # 'pallet' / 'deck' source of the box on the tool, or None
-        self.stock = [0, 0]
-        self.amr = False
-        self.deck_box = False
-        self.before_release = None         # diagnostics hook: called with the place name just before vacuum off
+        self.gripper_mass, self.carton_mass = gripper_mass, carton_mass
+        self.guard = lambda in_zone: None        # -> reason to stop now, or None (set by the cell controller)
+        self.times = {}                          # step -> last duration (s)
+        self.carrying = None                     # where the carton on the tool came from, or None
+        self.carton = C_NONE                     # where the carton of the current cycle is
+        self.stock, self.docked, self.deck_box = [0, 0], False, False
+        self.cycle = None                        # (depal, pallet, slot, taught entry) of the program being run
+        self.steps, self.pc = [], 0              # its steps and the next one to run
+        self.before_release = None               # diagnostics hook: called with the place name just before vacuum off
 
     # ------------------------------------------------------------------ planning scene (mirrors the real cell)
     def _apply(self, objs):
@@ -115,10 +137,11 @@ class CellMotion:
             for co in objs:
                 scene.apply_collision_object(co)
 
-    def set_scene(self, stock=None, amr=None, deck_box=None):
-        """Pallet stock (boxes per pallet), AMR docked or not, a box on its deck or not."""
+    def set_scene(self, stock=None, docked=None, deck_box=None):
+        """Pallet stock (cartons per pallet), robot docked (its outline, a carton on its deck if deck_box) or not (the
+        keep-out volume over the bay)."""
         self.stock = list(stock) if stock is not None else self.stock
-        self.amr = self.amr if amr is None else amr
+        self.docked = self.docked if docked is None else docked
         self.deck_box = self.deck_box if deck_box is None else deck_box
         objs = [box_object('floor', (6.0, 6.0, 0.02), (0.0, 0.0, -0.011))]
         for i in (0, 1):
@@ -129,12 +152,11 @@ class CellMotion:
                 (x, y, z), byaw = self.cell.slot_cell(i, k)
                 objs.append(box_object(f'box_{i}_{k}', self.p.box, (x, y, z - self.p.box[2] / 2), byaw)
                             if k < self.stock[i] else box_object(f'box_{i}_{k}', (), (), op=CollisionObject.REMOVE))
-        objs.append(box_object('amr', AMR, (self.p.deck_distance, 0.0, AMR[2] / 2)) if self.amr else
-                    box_object('amr', (), (), op=CollisionObject.REMOVE))
-        (dx, dy, dz), _ = self.cell.deck_cell()
-        objs.append(box_object('deck_box', self.p.box, (dx, dy, dz - self.p.box[2] / 2), 180.0) if self.deck_box else
-                    box_object('deck_box', (), (), op=CollisionObject.REMOVE))
-        self._apply(objs)
+        self._apply(objs + zone_objects(self.cell, self.docked, self.deck_box))
+
+    def clear_bay(self):
+        """Neither robot nor keep-out volume (fault recovery, after a person has checked the bay)."""
+        self._apply([box_object(n, (), (), op=CollisionObject.REMOVE) for n in ('amr', 'deck_box', 'deck_zone')])
 
     def _attach(self, on, pad=0.0):
         aco = AttachedCollisionObject()
@@ -151,8 +173,11 @@ class CellMotion:
                 scene.apply_collision_object(box_object('carried', (), (), op=CollisionObject.REMOVE))
 
     # ------------------------------------------------------------------ motion
-    def _move(self, name, goal_q=None, goal_pose=None, lin=False, place=False):
+    def _move(self, name, goal_q=None, goal_pose=None, lin=False, place=False, in_zone=False):
         from moveit.core.robot_state import RobotState
+        why = self.guard(in_zone)
+        if why:
+            raise CellFault(f'{why} (before {name})')
         self.arm.set_start_state_to_current_state()
         if goal_q is not None:
             s = RobotState(self.moveit.get_robot_model())
@@ -177,7 +202,27 @@ class CellMotion:
             self._attach(True)
         if hit is not None:
             raise CellFault(f'plan rejected: {name} collides between waypoints')
-        status = self.moveit.execute(res.trajectory, controllers=[])
+        stopped, done = [], threading.Event()
+
+        def watch():                             # stops the arm the moment the guard (or the vacuum switch) says so
+            while not done.is_set():
+                r = self.guard(in_zone) or (self.carrying and not self.io.holding() and VACUUM_LOST)
+                if r:
+                    stopped.append(r)
+                    self.tem.stop_execution()
+                    return
+                done.wait(0.02)
+        w = threading.Thread(target=watch, daemon=True)
+        w.start()
+        try:
+            status = self.moveit.execute(res.trajectory, controllers=[])
+        finally:
+            done.set()
+            w.join()
+        if stopped and stopped[0] == VACUUM_LOST:
+            self._dropped(name)
+        if stopped:
+            raise CellFault(f'stopped during {name}: {stopped[0]}')
         if not status:
             raise CellFault(f'execution failed: {name} ({getattr(status, "status", status)})')
         jt = res.trajectory.get_robot_trajectory_msg().joint_trajectory
@@ -185,7 +230,12 @@ class CellMotion:
         self._settle([end[j] for j in JOINTS], name)
         self.times[name] = time.monotonic() - t0
         if self.carrying and not self.io.holding():
-            raise CellFault(f'vacuum lost: part dropped during {name}')
+            self._dropped(name)
+
+    def _dropped(self, name):
+        self.carton, self.carrying = C_LOST, None
+        self._attach(False)
+        raise CellFault(f'vacuum lost: carton dropped during {name}')
 
     def _settle(self, target, name, tol=0.001, timeout=2.0):
         """Wait until the measured joints have reached the move's end (within `tol` rad): the next plan must start
@@ -203,99 +253,138 @@ class CellMotion:
         self.io.vacuum(True)
         if not self.io.wait_part(True, 1.5):
             self.io.vacuum(False)
-            raise CellFault(f'no part at {where}: vacuum switch stayed off')
+            raise CellFault(f'no carton at {where}: vacuum switch stayed off')
         self._attach(True)
-        self.carrying = where
+        self.carrying, self.carton = where, C_TOOL
+        m, g = self.carton_mass, self.gripper_mass       # carton centre half a carton below the pad face
+        self.io.payload(m + g, (g * 0.5 * self.p.tool_length + m * (self.p.tool_length + self.p.box[2] / 2)) / (m + g))
 
     def _release(self, where):
         if self.before_release:
             self.before_release(where)
         self.io.vacuum(False)
         if not self.io.wait_part(False, 1.5):
-            raise CellFault(f'part still held after release at {where}')
+            raise CellFault(f'carton still held after release at {where}')
         self._attach(False)
         self.carrying = None
+        self.io.payload(self.gripper_mass, 0.5 * self.p.tool_length)
 
-    def _taught(self, mode, pallet, slot):
-        key = f'{mode}/{pallet}/{slot}'
+    # ------------------------------------------------------------------ program
+    def taught(self, depal, pallet, slot):
+        key = f'{"depalletize" if depal else "palletize"}/{pallet}/{slot}'
         if key not in self.pattern:
             raise CellFault(f'no taught motion for {key}')
-        return self.pattern[key]
+        e = self.pattern[key]
+        return dict(e['taught'], via=e['via'])
 
-    def _geometry(self, pallet, slot, t):
-        (sx, sy, sz), _ = self.cell.slot_cell(pallet, slot)
-        (dx, dy, dz), _ = self.cell.deck_cell()
-        tt = t['taught']
-        via = t['via']
-        zt = self.cell.transit_height()
-        return sx, sy, sz, dx, dy, dz, tt, via, zt
+    def start(self, depal, pallet, slot):
+        """Load one cycle's program (the next run() starts it)."""
+        self.cycle = (depal, pallet, slot, self.taught(depal, pallet, slot))
+        self.steps, self.pc = prog.program(self.cell, depal, pallet, slot, self.cycle[3]), 0
+        self.carton = C_PALLET if depal else C_DECK
 
-    def pick(self, pallet, slot):
-        """Depalletizing, part 1: take the top box of `pallet` (slot = its count - 1) and hold it above the deck."""
-        t = self._taught('depalletize', pallet, slot)
-        sx, sy, sz, dx, dy, dz, tt, via, zt = self._geometry(pallet, slot, t)
-        a = self.p.approach
-        self._move('to slot', goal_q=tt['slot_above'])
-        self._move('down to slot', goal_pose=tool_down(sx, sy, sz + CONTACT, tt['grip_yaw']), lin=True)
-        self.set_scene(stock=[n - 1 if i == pallet else n for i, n in enumerate(self.stock)])   # the box is ours now
-        self._grip(f'pallet {pallet} slot {slot}')
-        self._move('lift', goal_pose=tool_down(sx, sy, zt if via else self.cell.lift_height(sz), tt['grip_yaw']),
-                   lin=True)
-        self._move('to deck', goal_q=tt['deck_above'])
-        self._deck_yaw, self._deck_carry = tt['deck_yaw'], zt if via else dz + a
+    @property
+    def at_dock(self):
+        """A program is loaded and waits at its DOCK marker (a depalletizing pre-pick holds its carton there)."""
+        return bool(self.steps) and self.pc < len(self.steps) and self.steps[self.pc].kind == prog.DOCK
 
-    def place_on_deck(self):
-        """Depalletizing, part 2 (the AMR is docked and stopped): put the held box on the deck and clear it."""
-        (dx, dy, dz), _ = self.cell.deck_cell()
-        a = self.p.approach
-        self._move('down to deck', goal_pose=tool_down(dx, dy, dz + CONTACT, self._deck_yaw), lin=True, place=True)
-        self._release('deck')
-        self.set_scene(deck_box=True)
-        self._move('retreat', goal_pose=tool_down(dx, dy, dz + a, self._deck_yaw), lin=True)
-        self.home()                    # every taught cycle starts and ends at home (the moves the reach study validated)
+    def holding_for(self, pallet, slot):
+        return self.at_dock and self.cycle[0] and tuple(self.cycle[1:3]) == (pallet, slot) and self.carrying is not None
 
-    def pick_from_deck(self, pallet, slot):
-        """Palletizing, part 1 (the AMR is docked and stopped): take the box off the deck, up clear of it."""
-        t = self._taught('palletize', pallet, slot)
-        sx, sy, sz, dx, dy, dz, tt, via, zt = self._geometry(pallet, slot, t)
-        a = self.p.approach
-        self._move('to deck', goal_q=tt['deck_above'])
-        self._move('down to deck', goal_pose=tool_down(dx, dy, dz + CONTACT, tt['deck_yaw']), lin=True)
-        self.set_scene(deck_box=False)
-        self._grip('deck')
-        self._move('up from deck', goal_pose=tool_down(dx, dy, zt if via else dz + a, tt['deck_yaw']), lin=True)
-        self._pal = (pallet, slot)
+    def _locate(self, step):
+        """Correct the program by where the carton really is (the steps from here on are rebuilt with the offset)."""
+        depal, pallet, slot, t = self.cycle
+        if step.locate[0] == 'pallet':
+            (x, y, z), yaw = self.cell.slot_cell(pallet, slot)
+            where = f'pallet {pallet} slot {slot}'
+        else:
+            (x, y, z), _ = self.cell.deck_cell()
+            yaw, where = t['deck_yaw'], 'the deck'
+        try:
+            off = self.locator.locate(step.locate, (x, y, z - self.p.box[2] / 2, yaw))
+        except LocateFault as e:
+            raise CellFault(f'{e} at {where}')
+        if any(abs(v) > 1e-4 for v in off):
+            self.log(f'carton at {where} located {off[0] * 1000:+.0f} / {off[1] * 1000:+.0f} mm, {off[2]:+.1f} deg '
+                     'off the pattern: grip corrected')
+        self.steps = prog.program(self.cell, depal, pallet, slot, t, offset=off)
 
-    def place(self, pallet, slot):
-        """Palletizing, part 2: put the held box into `slot` of `pallet` (slot = its count)."""
-        t = self._taught('palletize', pallet, slot)
-        sx, sy, sz, dx, dy, dz, tt, via, zt = self._geometry(pallet, slot, t)
-        a = self.p.approach
-        self._move('to slot', goal_q=tt['slot_above'])
-        self._move('down to slot', goal_pose=tool_down(sx, sy, sz + CONTACT, tt['grip_yaw']), lin=True, place=True)
-        self._release(f'pallet {pallet} slot {slot}')
-        self.set_scene(stock=[n + 1 if i == pallet else n for i, n in enumerate(self.stock)])
-        self._move('retreat', goal_pose=tool_down(sx, sy, zt if via else sz + a, tt['grip_yaw']), lin=True)
-        self.home()
+    def run(self, until=None, on_dock=None, on_undock=None, on_step=None):
+        """Run the loaded program from where it stands; stop before a step of kind `until` (e.g. prog.DOCK: pre-pick).
+        on_dock() blocks until the interlock is made; on_undock() is told the arm is clear of the deck zone;
+        on_step(name) before every step."""
+        depal, pallet, slot, _ = self.cycle
+        while self.pc < len(self.steps):
+            st = self.steps[self.pc]
+            if until is not None and st.kind == until:
+                return
+            if on_step:
+                on_step(st.name)
+            if st.locate:
+                self._locate(st)
+                st = self.steps[self.pc]
+            if st.kind == prog.DOCK:
+                if on_dock:
+                    on_dock()
+                self.set_scene(docked=True, deck_box=not depal)
+            elif st.kind == prog.UNDOCK:
+                self.set_scene(docked=False, deck_box=False)       # the robot leaves (with the carton, depalletizing)
+                if on_undock:
+                    on_undock()
+            elif st.kind == prog.GRIP:
+                if st.where == 'deck':
+                    self.set_scene(deck_box=False)
+                else:
+                    self.set_scene(stock=[n - 1 if i == pallet else n for i, n in enumerate(self.stock)])
+                self._grip(st.where)
+            elif st.kind == prog.RELEASE:
+                self._release(st.where)
+                if st.where == 'deck':
+                    self.carton = C_DECK
+                    self.set_scene(deck_box=True)
+                else:
+                    self.carton = C_PALLET
+                    self.set_scene(stock=[n + 1 if i == pallet else n for i, n in enumerate(self.stock)])
+            elif st.kind == prog.PTP:
+                self._move(st.name, goal_q=st.q, in_zone=self.docked)
+            else:
+                self._move(st.name, goal_pose=tool_down(*st.pose), lin=True, place=st.place, in_zone=self.docked)
+            self.pc += 1
+        self.abandon()
 
     def home(self):
-        self._move('home', goal_q=HOME)
+        self._move('home', goal_q=prog.HOME, in_zone=self.docked)
 
-    def recover(self):
-        """After a fault: vacuum off, detach, back to the scene the controller will set again."""
-        try:
-            self.io.vacuum(False)
-        except CellFault:
-            pass
+    def abandon(self):
+        """Forget the loaded program."""
+        self.steps, self.pc, self.cycle = [], 0, None
+
+    def recover(self, bay_clear=True):
+        """After a fault, once a person has cleared the cell (no carton on the tool): vacuum off, nothing attached,
+        program dropped, home. bay_clear: no robot at the bay — plan without the keep-out volume (the arm may have
+        stopped inside it), which is back in the scene once the arm is home."""
+        if self.io.holding():
+            raise CellFault('a carton is still on the gripper: take it off (release) before the reset')
+        self.io.vacuum(False)
         self._attach(False)
-        self.carrying = None
+        self.carrying, self.carton = None, C_NONE
+        self.abandon()
+        if bay_clear:
+            self.docked = False
+            self.clear_bay()
+        self.home()
+        self.set_scene(docked=self.docked)
 
 
-def make_cell(layout_path=None):
+def make_cell(layout_path=None, arm_id=None):
+    """The cell in its own frame (arm_id None) or placed in the warehouse (the arm's pose from the layout)."""
     if layout_path is None:
         layout_path = os.path.join(os.environ.get('OPENAMR_ROOT', os.path.expanduser('~/Robotics/OpenAMR')), 'sim',
                                    'configs', 'warehouse_layout.yaml')
-    return Cell((0.0, 0.0, 0.0), CellParams.from_layout(yaml.safe_load(open(layout_path))))
+    layout = yaml.safe_load(open(layout_path))
+    pose = (0.0, 0.0, 0.0) if arm_id is None else \
+        tuple(next(layout[d]['arm']['pose'] for d in ('receiving', 'outbound') if layout[d]['arm']['id'] == arm_id))
+    return Cell(pose, CellParams.from_layout(layout))
 
 
 __all__ = ['CellFault', 'CellMotion', 'VacuumIO', 'load_pattern', 'make_cell']
