@@ -16,6 +16,10 @@ reset, removing a carton) and the fault injector (simulator hooks), and checks e
               the stop is cleared
   station     the real station_agent (cell mode, receiving) serves 3 robot visits through the cell: pre-picks, serves
               at 'deck_clear', the robot waits only for the hand-over
+  safety      the cell's safety layer (simulated safety hardware, sim/scripts/cell_safety.py) catches what software
+              lets through: (a) the software believes a robot is docked (its heartbeat says so) but the bay's dock
+              sensor is off -> the arm is stopped at the bay volume's boundary (safeguard stop); (b) a person walks
+              into the cell while the arm moves -> safeguard stop; reset refused until the person has left
 Throughout: the arm (TCP, and the carried carton) never enters the deck zone unless the robot is docked and stopped
 (checked independently from the joint states, 100 Hz), and every stacked carton ends within 15 mm / 3 deg of its slot.
 
@@ -24,6 +28,7 @@ Needs open_amr_sim.py --arms --arm-test, the cell's control stack and its cell_c
 --cell runs everything).
 """
 import argparse
+import json
 import math
 import os
 import subprocess
@@ -72,6 +77,9 @@ class Bench(Node):
         self.intrusions, self.zone_samples, self.tcp = [], 0, None
         self.excused = False                           # the arm stopped in the zone by a fault, until the reset
         self.station, self.station_rx = None, 0.0
+        self.safety = None
+        self.create_subscription(String, f'/{arm_id}/safety/state', lambda m: setattr(self, 'safety', json.loads(m.data)), 10)
+        self.pub_person = self.create_publisher(String, '/sim/persons', 10)
         self.create_subscription(PoseArray, f'/{arm_id}/test_boxes', self.on_boxes, 1)
         self.create_subscription(ArmCellState, f'/{arm_id}/cell/state', lambda m: setattr(self, 'cell_state', m), 10)
         self.create_subscription(JointState, f'/{arm_id}/joint_states', self.on_joints, 50)
@@ -125,7 +133,7 @@ class Bench(Node):
         for rid, r in list(self.robots.items()):
             self.seq += 1
             x, y, th = r['pose']
-            self.pub_state.publish(RobotState(robot_id=rid, seq=self.seq, status=r['status'],
+            self.pub_state.publish(RobotState(robot_id=rid, seq=self.seq, status=r['status'], docked=r['docked'],
                                               pose=Pose2D(x=x, y=y, theta=th), speed=float(r['speed']),
                                               task_id=r.get('task', ''), last_node=r.get('node', 0),
                                               stamp=self.get_clock().now().to_msg()))
@@ -141,7 +149,7 @@ class Bench(Node):
              'in_bay': dict(status=RobotState.YIELDING, pose=(bx + 0.1, by, th), speed=0.0),
              'moved': dict(status=RobotState.AT_STATION, pose=(bx - 0.12 * math.cos(th), by - 0.12 * math.sin(th), th),
                            speed=0.3)}[where]
-        r.update(task=task, node=node)
+        r.update(task=task, node=node, docked=where in ('docked', 'moved'))
         self.robots[rid] = r
         (self.docked.add if where == 'docked' else self.docked.discard)(rid)
         if where == 'moved':
@@ -215,6 +223,12 @@ class Bench(Node):
                 return True
             time.sleep(0.05)
         return False
+
+    def wait_safety(self, cond, timeout=3.0):
+        """The safety state is published at 5 Hz: wait for the update that shows the event."""
+        t0 = time.time()
+        while time.time() - t0 < timeout and not (self.safety and cond(self.safety)):
+            time.sleep(0.05)
 
     def placement(self, k, slot):
         """(pos error m, yaw error deg) of carton k (index = its slot on pallet 0) in `slot` of pallet 1."""
@@ -467,6 +481,72 @@ class Run:
         done['reset'] = self.reset(what='reset after the stop is cleared')
         self.check(b.wait_cell([ArmCellState.READY], 30), 'cell READY')
 
+    def safety_layer(self):
+        print('== safety: simulated safety hardware under the software', flush=True)
+        b = self.b
+        if b.safety is None:
+            self.check(False, 'no /<arm>/safety/state from the simulator')
+            return
+        # (a) software says docked, the dock sensor says no AMR
+        ok, k, r = self.prepare()
+        if not self.check(ok, f'pre-pick pallet 0 slot {k}'):
+            return
+        b.robot('amr_t', 'docked', 'sf_in')
+        acc, r, ph = self.depalletize(k, task='sf_in')
+        if not self.check(r is not None and r.success, f'carton {k} onto the deck (dock sensor on)'):
+            return
+        trips0 = b.safety['trips']
+        b.inject('dock_sensor off')                    # the robot isn't physically there; its heartbeat still says docked
+        b.sleep(0.5)
+        b.robot('amr_t', 'docked', 'sf_out')
+        b.excused = True                               # the software lets the arm in: the safety layer must stop it
+        slot = self.stock[1]
+        acc, r, st, ph = b.transfer(G.PALLETIZE, 1, slot, self.stock, 'amr_t', 'sf_out')
+        b.wait_safety(lambda s: s['trips'] > trips0)
+        sf = dict(b.safety)
+        self.check(r is not None and not r.success and 'safeguard' in r.fault,
+                   f'software interlock passed, safety layer stopped the arm: "{r.fault if r else "?"}"')
+        self.check(sf['trips'] > trips0 and 'safety plane' in sf.get('last', ''),
+                   f'safety layer tripped: "{sf.get("last")}", deepest point {sf["max_depth_mm"]} mm into the bay '
+                   f'volume (stopping distance)')
+        self.check(sf['max_depth_mm'] <= 30.0, f'arm stopped within 30 mm of the bay volume boundary '
+                                                f'({sf["max_depth_mm"]} mm)')
+        self.check(b.wait_cell([ArmCellState.STOPPED], 5), 'cell STOPPED while the dock sensor is off')
+        self.reset(expect=False, what='reset during the safeguard stop')
+        b.inject('dock_sensor on')                     # the robot docks for real
+        b.sleep(1.0)
+        ok = self.reset(what='reset with the AMR docked')
+        b.excused = False
+        if ok:
+            acc, r, ph = self.palletize(k, task='sf_out2')
+            self.check(r is not None and r.success, 'the carton palletized after the reset')
+        # (b) a person walks into the cell while the arm moves
+        trips1 = b.safety['trips']
+        k = self.top()
+        done = {}
+
+        def walk_in():
+            b.sleep(0.4)
+            px, py, _ = b.cell.to_world(0.6, 1.1)      # beside the bay, 1.25 m from the arm: in the protective field
+            b.pub_person.publish(String(data=f'add visitor {px:.2f} {py:.2f}'))
+            done['t'] = b.now()
+        threading.Thread(target=walk_in, daemon=True).start()
+        acc, r, st, ph = b.transfer(G.PREPARE, 0, k, self.stock)
+        self.check(r is not None and not r.success and 'safeguard' in r.fault,
+                   f'person in the cell: arm stopped ("{r.fault if r else "?"}")')
+        b.wait_safety(lambda s: s['trips'] > trips1)
+        self.check(b.safety['trips'] > trips1 and 'person' in b.safety.get('last', ''),
+                   f'area scanner tripped on the person: "{b.safety.get("last")}"')
+        carton = r.carton if r else None
+        self.reset(expect=False, what='reset with the person still in the cell')
+        b.pub_person.publish(String(data='remove visitor'))
+        b.sleep(1.0)
+        if b.cell_state and b.cell_state.carton_on_tool:
+            b.call(b.release_cli)                      # (stopped mid-pick holding it: put back by hand)
+        ok = self.reset(what='reset after the person left')
+        if ok and carton in (R.CARTON_PALLET, R.CARTON_NONE):
+            self.check(b.wait_cell([ArmCellState.READY], 30), 'cell READY, work continues')
+
     def station(self, visits, graph):
         print(f'== station: station_agent (cell mode) serves {visits} robot visits', flush=True)
         b = self.b
@@ -519,7 +599,7 @@ def main(argv=None):
     ap.add_argument('--arm-id', default='arm_receiving')
     ap.add_argument('--normal', type=int, default=4)
     ap.add_argument('--visits', type=int, default=3)
-    ap.add_argument('--scenarios', default='locate,normal,interlock,moved,drop,estop,station')
+    ap.add_argument('--scenarios', default='locate,normal,interlock,moved,drop,estop,safety,station')
     root = os.environ.get('OPENAMR_ROOT', os.path.expanduser('~/Robotics/OpenAMR'))
     ap.add_argument('--layout', default=os.path.join(root, 'sim', 'configs', 'warehouse_layout.yaml'))
     ap.add_argument('--graph', default=os.path.join(root, 'sim', 'worlds', 'warehouse_mission_graph.geojson'))
@@ -545,6 +625,8 @@ def main(argv=None):
             run.normal(a.normal)
         elif s == 'station':
             run.station(a.visits, a.graph)
+        elif s == 'safety':
+            run.safety_layer()
         else:
             getattr(run, s)()
     # every stacked carton still in its slot at the end

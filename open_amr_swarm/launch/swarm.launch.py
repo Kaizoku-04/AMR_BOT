@@ -38,6 +38,7 @@ def spawn(context):
     actions = [Node(package='open_amr_swarm', executable='swarm_agent', namespace=f'amr_{i}', name='swarm_agent',
                     output='screen',
                     parameters=[{'robot_id': f'amr_{i}', 'graph': graph, 'drain_prior_per_h': 0.15 * scale,
+                                 'dock_bays': lc('dock_bays') == 'true', 'deck_sensor': lc('deck_sensor') == 'true',
                                  'chargers': chargers, 'fleet': [f'amr_{k}' for k in range(n)],
                                  'use_sim_time': True}],
                     remappings=tf)
@@ -87,6 +88,10 @@ def generate_launch_description():
         DeclareLaunchArgument('outbound_pallets', default_value='16,0'),
         DeclareLaunchArgument('pallet_swap_s', default_value='180'),
         DeclareLaunchArgument('arm_cycle_s', default_value='8.0'),
+        DeclareLaunchArgument('dock_bays', default_value='false',
+                              description='dock at arm bays on the lidar marker (Nav2 docking server)'),
+        DeclareLaunchArgument('deck_sensor', default_value='false',
+                              description='robots check their deck load sensors (physical cartons)'),
         DeclareLaunchArgument('cells', default_value='false', description='stations drive real arm cells (cell_controller)'),
         DeclareLaunchArgument('fault', default_value='', description='station:start_s:duration_s, e.g. arm_receiving:300:120'),
         DeclareLaunchArgument('graph', default_value=''),

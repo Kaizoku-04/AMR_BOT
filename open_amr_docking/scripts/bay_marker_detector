@@ -1,0 +1,4 @@
+#!/usr/bin/env python3
+from open_amr_docking.bay_marker_detector import main
+
+main()

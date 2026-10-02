@@ -80,3 +80,18 @@ def test_deck_zone_covers_the_docked_robot_and_a_carton_on_it():
     assert c.deck_hold_height() - p.box[2] > top               # a held carton's bottom is above the zone
     assert c.deck_clear_height() > top
     assert c.deck_hold_height() < c.transit_height()           # holding never needs the pallet transit height
+
+
+def test_marker_leaves_room_for_a_robot_turning_in_the_bay():
+    c = Cell((-14.85, 7.0, 0.0))
+    apex, left, right = c.marker_cell()
+    p = c.p
+    swept = max(math.hypot(x, y) for x in (0.416, -0.39) for y in (0.319, -0.319))   # AMR collision outline
+    for x, y in (left, right, apex):
+        assert math.hypot(p.deck_distance - x, y) > swept + 0.02
+    mx, my, myaw = c.marker_world()
+    bx, by, byaw = c.bay_pose()
+    assert myaw == pytest.approx(byaw)                                   # marker x = docked heading
+    d = c.marker_to_bay()
+    assert (mx - d * math.cos(math.radians(myaw)), my - d * math.sin(math.radians(myaw))) == \
+        (pytest.approx(bx), pytest.approx(by))

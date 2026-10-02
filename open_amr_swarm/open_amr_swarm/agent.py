@@ -37,11 +37,13 @@ import tf2_ros
 
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Pose2D, PoseStamped
-from nav2_msgs.action import ComputeRoute, FollowPath
+from nav2_msgs.action import ComputeRoute, DockRobot, FollowPath
 from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap, DynamicEdges
 from nav_msgs.msg import Path
 from sensor_msgs.msg import BatteryState
+from std_msgs.msg import UInt8
+from std_srvs.srv import Trigger
 from open_amr_msgs.msg import Bid, Claim, OperatorCommand, RobotState, StationState, Task, Transfer
 
 from .energy import (ChargeParams, ChargerPeer, DrainEstimator, bid_penalty_s, can_take, evictions, pick_charger,
@@ -112,6 +114,11 @@ class SwarmAgent(Node):
         self.zones = {'street': dp('zone_street_pct', 100.0).value, 'aisle': dp('zone_aisle_pct', 50.0).value,
                       'dock': dock_pct, 'charging': dock_pct, 'charger': dock_pct, 'parking': dock_pct, 'park': dock_pct}
         self.zone_lookahead = dp('zone_lookahead_m', 1.5).value
+        # loaded motion profile (as payload-carrying AMRs limit speed and turning with a load on the top module): with a
+        # carton on the deck at most loaded_pct of full speed, and turn_pct approaching a turn of > 30 deg (the lanes'
+        # 0.4 m corner radius at 60 % = 0.6 m/s -> 0.9 m/s^2 lateral). Only with deck_sensor (physical cartons).
+        self.loaded_pct = dp('loaded_speed_pct', 80.0).value
+        self.turn_pct = dp('loaded_turn_pct', 60.0).value
         self.arrive_tol = dp('arrive_tol_m', 0.3).value
         self.arrive_tol_parking = dp('arrive_tol_parking_m', 0.5).value   # a parked robot needs no precision
         self.deadlock_s = dp('deadlock_after_s', 15.0).value
@@ -137,6 +144,18 @@ class SwarmAgent(Node):
         self.create_subscription(Claim, '/swarm/claims', self.on_claim, EVENT_QOS)
         self.create_subscription(StationState, '/swarm/stations', self.on_station, STATE_QOS)
         self.create_subscription(OperatorCommand, '/swarm/operator', self.on_operator, OPERATOR_QOS)
+        # arm bays: stop at the staging node one edge short, then dock on the bay's lidar marker (Nav2 docking server)
+        # deck load sensors (conveyor top: 0 empty, 1 carton centred, 2 shifted / dangling): never leave a pickup without a
+        # centred carton or a drop with one still on, stop at once if the load is lost or shifts on the way
+        self.deck_sensor = dp('deck_sensor', False).value
+        self.deck_load, self.load_wait_since, self.load_fault = None, None, ''
+        self.recenter_since = None
+        if self.deck_sensor:
+            self.create_subscription(UInt8, 'deck/load', lambda m: setattr(self, 'deck_load', m.data), 10)
+            self.recenter_cli = self.create_client(Trigger, 'deck/recenter')
+        self.dock_bays = dp('dock_bays', False).value
+        self.dock_client = ActionClient(self, DockRobot, 'dock_robot')
+        self.dock_state, self.dock_fails, self.docked, self.docking = None, 0, False, False
         self.route_client = ActionClient(self, ComputeRoute, 'compute_route')
         self.follow_client = ActionClient(self, FollowPath, 'follow_path')
         self.clear_local = self.create_client(ClearEntireCostmap, 'local_costmap/clear_entirely_local_costmap')
@@ -424,6 +443,7 @@ class SwarmAgent(Node):
             self.update_ghost_edges()
             self.check_stuck()
             self.check_noroute()
+        self.watch_load()
         if self.phase == 'driving':
             self.drive()
         elif self.phase == 'dwelling':
@@ -713,6 +733,7 @@ class SwarmAgent(Node):
             return
         self.leg = self.legs.pop(0)
         self.status = self.leg.drive_status
+        self.dock_state, self.dock_fails, self.docked = None, 0, False
         start = self.start_node()
         if start == self.leg.target:
             self.arrived(); return
@@ -825,6 +846,8 @@ class SwarmAgent(Node):
         lo = self.node_idx[self.next_idx - 1] if self.next_idx > 0 else 0   # node 0 may lie ahead (lead-in)
         hi = min(len(pts), self.node_idx[min(self.next_idx + 1, len(self.route) - 1)] + 1)
         ridx = min(range(lo, max(hi, lo + 1)), key=lambda j: math.hypot(pts[j].pose.position.x - x, pts[j].pose.position.y - y))
+        self.docking = self.dock_bays and self.leg is not None and self.leg.station and len(self.route) >= 2 and \
+            self.graph.kind.get(self.route[-1]) == 'bay'
         while self.next_idx < len(self.route) and self.node_reached(self.next_idx, ridx, x, y):
             if self.next_idx == len(self.route) - 1 and not self.final_reached(x, y):
                 break   # the final node counts only when the controller reports arrival (or see final_reached)
@@ -867,6 +890,17 @@ class SwarmAgent(Node):
         turn_stops = [k for k in self.stop_at if self.next_idx <= k < end_k]
         if turn_stops:                                   # stop and turn in place first
             end_k = min(turn_stops); end_node = self.route[end_k]
+        staging = False
+        if self.docking and end_k == len(self.route) - 1:
+            if self.next_idx < len(self.route) - 1:          # first stop at the staging node (precise) ...
+                end_k = len(self.route) - 2; end_node = self.route[end_k]
+                staging = True
+            else:                                            # ... then the last edge is the docking controller's
+                self.status_wait(False)
+                self.start_dock()
+                return
+        elif self.docking and end_k == len(self.route) - 2:
+            staging = True
         final = end_k == len(self.route) - 1
         self.status_wait(self.blocked and self.speed_est < 0.05)
         self.maybe_break_deadlock()
@@ -882,7 +916,7 @@ class SwarmAgent(Node):
             # 0.25 m past the turn node (loose checker, arriving at street speed) carried a 0.3 m sideways offset
             # straight into the first bay of an aisle (2026-09-25)
             pre_final = end_k == len(self.route) - 2 and end_k in self.stop_at
-            self.send_path(ridx, self.node_idx[end_k], (final or pre_final) and self.leg.precise)
+            self.send_path(ridx, self.node_idx[end_k], (final or pre_final or staging) and self.leg.precise)
             self.follow_end = end_node
 
     def node_reached(self, k, ridx, x, y):
@@ -890,6 +924,10 @@ class SwarmAgent(Node):
         if self.follow_state == GoalStatus.STATUS_SUCCEEDED and self.follow_end == n:
             return True     # the controller finished a segment ending here (hold point / turn stop)
         d = math.hypot(self.graph.pos[n][0] - x, self.graph.pos[n][1] - y)
+        if self.docking and k == len(self.route) - 2:
+            # docking starts from a standstill at the staging node (a precise stop, or the stop given up on close by)
+            return self.follow_end == n and (self.follow_state == GoalStatus.STATUS_SUCCEEDED or (
+                self.follow_state == GoalStatus.STATUS_ABORTED and d < self.arrive_tol))
         if k in self.stop_at and k < len(self.route) - 1:
             # a turn stop counts only once the robot has actually stopped there — passing within 0.25 m while still
             # braking used to drop the stop, so the robot turned on the move (0.3 m off into aisle_0_bay_0)
@@ -904,6 +942,8 @@ class SwarmAgent(Node):
         robot stands within `arrive_tol_m` — a forward-only robot can't remove a sideways offset once it is on top of
         the goal (MPPI aborts on no progress, forever: seen 2026-09-25 at 13 and 26 cm); or at a charger the BMS
         reports the contacts closed."""
+        if self.docking:
+            return self.dock_state == GoalStatus.STATUS_SUCCEEDED
         if self.follow_state == GoalStatus.STATUS_SUCCEEDED:
             return True
         n = self.route[-1]
@@ -924,6 +964,15 @@ class SwarmAgent(Node):
         if k + 1 < len(self.route) and math.hypot(nx - x, ny - y) < self.zone_lookahead:
             kinds.append(self.graph.edge_kind.get((self.route[k], self.route[k + 1]), 'street'))
         pct = min((self.zones.get(kd, 100.0) for kd in kinds), default=100.0)
+        if self.deck_sensor and self.loaded:
+            pct = min(pct, self.loaded_pct)
+            # a turn ahead (within the lookahead): slow before entering it
+            for j in range(max(k, 1), min(k + 2, len(self.route) - 1)):
+                a, b, c = self.route[j - 1], self.route[j], self.route[j + 1]
+                bx, by = self.graph.pos[b]
+                turn = abs(math.remainder(self.graph.heading(b, c) - self.graph.heading(a, b), math.tau))
+                if turn > math.radians(30) and math.hypot(bx - x, by - y) < self.zone_lookahead:
+                    pct = min(pct, self.turn_pct)
         if pct != self.speed_pct or self.now() - self.speed_sent_at > 2.0:
             m = SpeedLimit(percentage=True, speed_limit=float(pct if pct < 100.0 else 0.0))   # 0 = no limit
             m.header.stamp = self.get_clock().now().to_msg()
@@ -985,6 +1034,48 @@ class SwarmAgent(Node):
             if self.leg is not None and self.status == RobotState.YIELDING:
                 self.status = self.leg.drive_status
 
+    def start_dock(self):
+        """Dock on the bay's marker (the robot stands at the staging node, the bay is reserved and acknowledged)."""
+        if self.dock_state == 'retry' and self.now() >= self.dock_retry_at:
+            self.dock_state = None
+        if self.dock_state is not None:
+            return                                       # running / done / waiting for the retry
+        if self.follow_handle is not None or self.follow_end is not None:
+            self.stop_following()
+        name = self.graph.name[self.route[-1]]
+        if not self.dock_client.server_is_ready():
+            self.get_logger().warn(f'{self.rid}: no docking server for {name}', throttle_duration_sec=10.0)
+            return
+        g = DockRobot.Goal(use_dock_id=True, dock_id=name, navigate_to_staging_pose=False)
+        self.dock_state, self.dock_t0 = 'sending', self.now()
+        self.get_logger().info(f'{self.rid}: docking at {name}')
+        self.dock_client.send_goal_async(g).add_done_callback(lambda f, name=name: self.on_dock_handle(f, name))
+
+    def on_dock_handle(self, f, name):
+        h = f.result()
+        if not h.accepted:
+            self.dock_failed(name, 'goal rejected')
+            return
+        h.get_result_async().add_done_callback(lambda r, name=name: self.on_dock_done(r, name))
+
+    def on_dock_done(self, r, name):
+        res, status = r.result().result, r.result().status
+        if status == GoalStatus.STATUS_SUCCEEDED and res.success:
+            self.docked, self.dock_state = True, GoalStatus.STATUS_SUCCEEDED
+            self.get_logger().info(f'{self.rid}: docked at {name} in {self.now() - self.dock_t0:.1f} s'
+                                   + (f' ({res.num_retries} retries)' if res.num_retries else ''))
+        else:
+            self.dock_failed(name, f'error {res.error_code} {res.error_msg}'.strip())
+
+    def dock_failed(self, name, why):
+        """The docking server gave up (after its own retries): try again from where the robot stands; after 3
+        attempts report STUCK and keep trying (an operator has to look: no transfer happens undocked)."""
+        self.dock_fails += 1
+        self.get_logger().warn(f'{self.rid}: docking at {name} failed ({why}), attempt {self.dock_fails}')
+        if self.dock_fails >= 3:
+            self.status = RobotState.STUCK
+        self.dock_state, self.dock_retry_at = 'retry', self.now() + 3.0
+
     def send_path(self, i0, i1, precise):
         p = Path(); p.header = self.path.header; p.header.stamp = self.get_clock().now().to_msg()
         p.poses = self.path.poses[max(0, i0 - 1): i1 + 1]
@@ -1034,18 +1125,71 @@ class SwarmAgent(Node):
         else:
             self.next_leg()
 
+    def load_check(self):
+        """Deck load before leaving a transfer: None = fine, else why not to leave (yet)."""
+        if not self.deck_sensor or self.task is None or self.task.type == Task.GOTO:
+            return None
+        want = 1 if self.leg.drive_status == RobotState.TO_PICK else 0
+        if self.deck_load == want:
+            return None
+        return {0: 'no carton on the deck after the pickup', 1: 'carton still on the deck after the drop',
+                2: 'carton shifted on the deck'}.get(self.deck_load, 'no deck load reading')
+
+    def leave_transfer(self):
+        """The transfer is done: leave once the deck load sensors agree (a few seconds' grace for the reading)."""
+        why = self.load_check()
+        if why is None:
+            self.load_wait_since = None
+            self.next_leg()
+            return
+        now = self.now()
+        self.load_wait_since = self.load_wait_since or now
+        if now - self.load_wait_since > 3.0 and self.status != RobotState.STUCK:
+            self.status, self.load_fault = RobotState.STUCK, why
+            self.get_logger().error(f'{self.rid}: {why}: staying here until a person clears it')
+
+    def watch_load(self):
+        """While carrying: the carton must stay on the deck, centred. Shifted (sideways, towards the conveyor's end) ->
+        stop, the conveyor jogs it back to the centre (as conveyor tops position a load with their end sensors), carry
+        on. Lost, or not re-centred within 4 s -> stop where it is (STUCK: a person has to look)."""
+        if not self.deck_sensor:
+            return
+        if self.phase == 'recentring':
+            if self.deck_load == 1:
+                self.get_logger().info(f'{self.rid}: carton re-centred on the deck, carrying on')
+                self.phase, self.recenter_since = 'driving', None
+                self.status = self.leg.drive_status if self.leg else self.status
+            elif self.now() - self.recenter_since > 4.0 or self.deck_load == 0:
+                self.load_fault = 'carton lost from the deck' if self.deck_load == 0 else 'carton would not re-centre'
+                self.get_logger().error(f'{self.rid}: {self.load_fault}: stopped')
+                self.status, self.phase = RobotState.STUCK, 'load_fault'
+            return
+        if not (self.loaded and self.phase == 'driving') or self.deck_load in (None, 1):
+            return
+        self.stop_following()
+        if self.deck_load == 2 and self.recenter_cli.service_is_ready():
+            self.get_logger().warn(f'{self.rid}: carton shifted on the deck: stopping to re-centre it')
+            self.recenter_cli.call_async(Trigger.Request())
+            self.phase, self.recenter_since = 'recentring', self.now()
+            return
+        why = 'carton lost from the deck' if self.deck_load == 0 else 'carton shifted on the deck'
+        if self.status != RobotState.STUCK:
+            self.get_logger().error(f'{self.rid}: {why} while driving: stopped')
+        self.status, self.load_fault = RobotState.STUCK, why
+        self.phase = 'load_fault'
+
     def dwell(self):
         """At a bin: the deck's fixed transfer time. At an arm bay: until the station reports this task served."""
         if not (self.leg.station and self.handshake):
             if self.now() >= self.dwell_until:
-                self.next_leg()
+                self.leave_transfer()
             return
         st = self.station_state(self.leg.target)
         if st is not None and self.task is not None and st.task_id == self.task.task_id and \
                 st.state == StationState.BUSY and self.leg.drive_status == RobotState.TO_PICK:
             self.loaded = True                   # the arm is putting the box on the deck
         if st is not None and self.task is not None and st.served_task == self.task.task_id:
-            self.next_leg()
+            self.leave_transfer()
 
     def check_station(self):
         """An empty robot whose arm stays out of service (fault, or no heartbeat) gives its task back instead of
@@ -1253,6 +1397,7 @@ class SwarmAgent(Node):
         m.reserved_nodes = [int(n) for n in self.reserved]
         m.wait_s = float(self.wait_s)
         m.goal_node = int(self.goal_node())
+        m.docked = bool(self.docked and self.phase == 'dwelling')
         self.send(self.pub_state, m)
 
 

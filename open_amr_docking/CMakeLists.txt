@@ -28,6 +28,14 @@ install(TARGETS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# lidar V-marker docking (bay docks of the arm cells): Python package + node
+ament_python_install_package(${PROJECT_NAME})
+# the launcher is copied into the build tree with explicit permissions: Syncthing (two-laptop setup) does not carry
+# the executable bit, and --symlink-install would otherwise link to a non-executable source file
+file(COPY scripts/bay_marker_detector DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/scripts
+  FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+install(PROGRAMS ${CMAKE_CURRENT_BINARY_DIR}/scripts/bay_marker_detector DESTINATION lib/${PROJECT_NAME})
+
 # Copy necessary files to designated locations in the project
 install (
   DIRECTORY config launch

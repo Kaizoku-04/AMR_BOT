@@ -27,5 +27,7 @@ uint32 last_node                   # lane-graph node most recently reached
 uint32[] route                     # remaining route (lane-graph node ids)
 uint32[] reserved_nodes            # nodes this robot holds (traffic control): peers must not enter them
 float32 wait_s                     # seconds spent waiting for the current reservation (ageing priority)
+bool docked                        # docked to the bay's marker by the docking server (precise, stopped): the arm
+                                   # cell's interlock trusts this, not the localization estimate in `pose`
 uint32 goal_node                   # node the current leg ends at (or where it stands when idle): chargers are
                                    # claimed through it, so two robots never head for the same one

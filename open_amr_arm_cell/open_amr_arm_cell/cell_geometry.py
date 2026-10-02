@@ -37,11 +37,18 @@ class CellParams:
     approach: float = 0.10               # TCP above a box top before descending / after releasing
     lift_clearance: float = 0.05         # a lifted box's bottom clears neighbouring box tops by this
     amr_footprint: tuple = (0.806, 0.64) # docked AMR's outline (Robot Parameters), centred on the deck
+    deck_size: tuple = (0.5, 0.4)        # AMR conveyor deck (Mission Design §2): along the AMR, across (the conveyor runs
+                                         # across the AMR, into the bins); top at deck_top
+    rail_height: float = 0.04            # side rails along the conveyor at the deck's front and back edges (as ROEQ /
+    rail_clearance: float = 0.015        # MiR conveyor tops): they hold a carton when the AMR accelerates or brakes
     zone_margin: float = 0.10            # deck zone = AMR outline + this on every side (docking tolerance)
     zone_clearance: float = 0.15         # ... up to this above a carton standing on the deck (the tallest thing the
                                          # robot brings in); the arm stays above it unless the interlock is made
     hold_clearance: float = 0.05         # a carton held over the zone (pre-pick) / a gripper retreating from it
                                          # clears the zone top by this
+    marker_width: float = 0.30           # docking marker (lidar V, MiR VL-marker style) on the pedestal's bay face:
+    marker_depth: float = 0.06           # mouth width and depth of the V, apex on the face; the plates span
+    marker_z: tuple = (0.05, 0.25)       # this height band (the AMR's lidar scans at 0.12 m)
 
     @classmethod
     def from_layout(cls, layout):
@@ -49,7 +56,7 @@ class CellParams:
         c = dict(layout.get('arm_cell', {}))
         if 'box' in layout and 'size' in layout['box']:
             c['box'] = tuple(layout['box']['size'])
-        for k in ('pallet_size', 'box', 'pattern', 'amr_footprint'):
+        for k in ('pallet_size', 'box', 'pattern', 'amr_footprint', 'marker_z', 'deck_size'):
             if k in c:
                 c[k] = tuple(c[k])
         return cls(**c)
@@ -119,6 +126,14 @@ class Cell:
         sx, sy = (d + 2 * self.p.zone_margin for d in self.p.amr_footprint)
         return self.p.deck_distance, 0.0, sx, sy, self.zone_top()
 
+    def rails_cell(self):
+        """The deck's side rails, cell frame: [(centre x, centre y, centre z, size x, size y, size z)]. The docked AMR
+        faces the arm, so its along-axis is the cell x axis."""
+        p = self.p
+        off = p.box[0] / 2 + p.rail_clearance + 0.005             # rails 10 mm thick, inner face at the clearance
+        return [(p.deck_distance + s * off, 0.0, p.deck_top + p.rail_height / 2, 0.01, p.deck_size[1], p.rail_height)
+                for s in (-1, 1)]
+
     def zone_top(self):
         return self.p.deck_top + self.p.box[2] + self.p.zone_clearance
 
@@ -130,6 +145,21 @@ class Cell:
         """TCP height of an empty gripper that has left the zone (the robot may drive off)."""
         return self.zone_top() + self.p.hold_clearance
 
+    def marker_cell(self):
+        """Docking marker, cell frame: (apex, left mouth corner, right mouth corner) as (x, y). The V opens towards the
+        bay; the apex sits on the pedestal face."""
+        h, w, d = self.p.pedestal_size / 2, self.p.marker_width / 2, self.p.marker_depth
+        return (h, 0.0), (h + d, w), (h + d, -w)
+
+    def marker_frame_cell(self):
+        """Marker frame (cell frame): origin at the apex, x pointing into the marker = the heading of a robot docked
+        at the bay. The bay pose is at (-marker_to_bay(), 0) in it."""
+        (ax, ay), _, _ = self.marker_cell()
+        return (ax, ay), 180.0
+
+    def marker_to_bay(self):
+        return self.p.deck_distance - self.marker_cell()[0][0]
+
     # ---------------------------------------------------------------- world frame
     def pallet_world(self, i):
         (x, y), yaw = self.pallet_cell(i)
@@ -139,6 +169,12 @@ class Cell:
     def slot_world(self, i, k):
         (x, y, z), yaw = self.slot_cell(i, k)
         return self.to_world(x, y, z), self.yaw_world(yaw)
+
+    def marker_world(self):
+        """Marker frame in the world: (x, y, yaw_deg)."""
+        (x, y), yaw = self.marker_frame_cell()
+        wx, wy, _ = self.to_world(x, y)
+        return wx, wy, self.yaw_world(yaw)
 
     def bay_pose(self):
         """Where the AMR's base_footprint stops (deck centred on it): (x, y, yaw_deg), facing the arm."""

@@ -27,9 +27,19 @@ cell:
   amr_footprint:
   - 0.806
   - 0.64
+  deck_size:
+  - 0.5
+  - 0.4
+  rail_height: 0.04
+  rail_clearance: 0.015
   zone_margin: 0.1
   zone_clearance: 0.15
   hold_clearance: 0.05
+  marker_width: 0.3
+  marker_depth: 0.06
+  marker_z:
+  - 0.05
+  - 0.25
 pattern:
   depalletize/0/0:
     times:
@@ -3207,4 +3217,4 @@ summary:
   cycle_max_s: 11.28
   deck_mean_s: 2.86
   deck_max_s: 3.87
-  wall_s: 14.6
+  wall_s: 15.3

@@ -6,8 +6,8 @@ the reach study validated).
 
 Interlocks (software; a real cell adds safety-rated hardware, see below):
   - deck zone: the arm enters the keep-out volume over the bay only while the transfer's robot reports, in its own
-    heartbeat (/swarm/state), AT_STATION, stopped, within bay_tol of the bay pose — and no other robot reports a pose
-    in the zone. Until then the volume is a collision object, so no planned motion can enter it.
+    heartbeat (/swarm/state), AT_STATION, docked to the bay's marker (its docking server: millimetres), stopped, and
+    at this bay (pose within bay_tol: the localization estimate) — and no other robot reports a pose in the zone. Until then the volume is a collision object, so no planned motion can enter it.
   - while the arm is in the zone, that robot moving (speed, or pose drifting from where it docked, or leaving
     AT_STATION) or another robot entering stops the arm at once (trajectory execution stopped) and faults the cell.
     A heartbeat that goes stale does not stop the arm: a silent robot is a stopped robot (Phase 4a), and the real
@@ -73,7 +73,10 @@ class CellController(Node):
         dp = self.declare_parameter
         self.arm_id = dp('arm_id', 'arm_receiving').value
         layout = dp('layout', '').value or None
-        self.bay_tol = dp('bay_tol_m', 0.20).value               # reported pose vs bay pose: docked here
+        # the robot's own docking (lidar marker, Nav2 docking server) is what positions it to millimetres; its reported
+        # pose is a localization estimate (~0.15 m) and only tells which bay it is at
+        self.require_docked = dp('require_docked', True).value
+        self.bay_tol = dp('bay_tol_m', 0.30).value               # reported pose vs bay pose: at this bay
         self.bay_tol_yaw = dp('bay_tol_deg', 10.0).value
         self.stop_speed = dp('stop_speed', 0.02).value           # m/s: counts as stopped (interlock made)
         self.move_speed = dp('move_speed', 0.05).value           # m/s: counts as moving (interlock broken)
@@ -136,14 +139,21 @@ class CellController(Node):
             self.set_fault('no set_io service (arm driver / io_and_status_controller down)')
             return
         time.sleep(1.0)
-        try:
-            self.motion.set_scene(stock=[0, 0], docked=False)
-            if self.io.holding():
-                raise CellFault('a carton is on the gripper at start-up: take it off and reset')
-            self.motion.home()
-        except CellFault as e:
-            self.set_fault(f'start-up: {e}')
-            return
+        for attempt in range(5):
+            try:
+                self.motion.set_scene(stock=[0, 0], docked=False)
+                if self.io.holding():
+                    raise CellFault('a carton is on the gripper at start-up: take it off and reset')
+                self.motion.home()
+                break
+            except CellFault as e:
+                # right after start-up the measured joints can still be settling (MoveIt then refuses a trajectory
+                # whose start deviates > 0.01 rad from them, seen 2026-10-02): try again before calling it a fault
+                if 'carton' in str(e) or attempt == 4:
+                    self.set_fault(f'start-up: {e}')
+                    return
+                self.log(f'start-up home: {e}; again in 2 s')
+                time.sleep(2.0)
         self.state = ArmCellState.READY
         self.log('ready (home, deck zone guarded)')
 
@@ -177,6 +187,8 @@ class CellController(Node):
         m = robots[rid][0]
         if m.status != RobotState.AT_STATION:
             return f'{rid} not at a station (status {m.status})'
+        if self.require_docked and not m.docked:
+            return f'{rid} not docked to the bay marker'
         if m.speed > self.stop_speed:
             return f'{rid} moving ({m.speed:.2f} m/s)'
         d = math.hypot(m.pose.x - self.bay[0], m.pose.y - self.bay[1])
@@ -202,8 +214,8 @@ class CellController(Node):
             robots = dict(self.robots)
         m, rx = robots.get(rid, (None, 0.0))
         if m is not None and t - rx <= self.hb_timeout:      # stale: a silent robot is a stopped robot
-            if m.status != RobotState.AT_STATION:
-                return f'interlock: {rid} left the station under the arm (status {m.status})'
+            if m.status != RobotState.AT_STATION or (self.require_docked and not m.docked):
+                return f'interlock: {rid} left the station / undocked under the arm (status {m.status})'
             if m.speed > self.move_speed or math.hypot(m.pose.x - x0, m.pose.y - y0) > self.move_dist:
                 return f'interlock: {rid} moved under the arm ({m.speed:.2f} m/s, ' \
                        f'{math.hypot(m.pose.x - x0, m.pose.y - y0) * 1000:.0f} mm)'

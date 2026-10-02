@@ -156,7 +156,8 @@ class CellMotion:
 
     def clear_bay(self):
         """Neither robot nor keep-out volume (fault recovery, after a person has checked the bay)."""
-        self._apply([box_object(n, (), (), op=CollisionObject.REMOVE) for n in ('amr', 'deck_box', 'deck_zone')])
+        self._apply([box_object(n, (), (), op=CollisionObject.REMOVE) for n in ('amr', 'deck_box', 'deck_zone',
+                                                                                  'deck_rail_0', 'deck_rail_1')])
 
     def _attach(self, on, pad=0.0):
         aco = AttachedCollisionObject()
@@ -224,6 +225,14 @@ class CellMotion:
         if stopped:
             raise CellFault(f'stopped during {name}: {stopped[0]}')
         if not status:
+            # the trajectory controller can abort a few ms before the driver's safety-mode message arrives: a safety
+            # stop must be reported as one, not as a failed execution
+            t1 = time.monotonic()
+            while time.monotonic() - t1 < 0.5:
+                why = self.guard(in_zone)
+                if why:
+                    raise CellFault(f'stopped during {name}: {why}')
+                time.sleep(0.02)
             raise CellFault(f'execution failed: {name} ({getattr(status, "status", status)})')
         jt = res.trajectory.get_robot_trajectory_msg().joint_trajectory
         end = dict(zip(jt.joint_names, jt.points[-1].positions))
