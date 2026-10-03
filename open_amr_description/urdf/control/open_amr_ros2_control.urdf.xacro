@@ -1,11 +1,18 @@
 <?xml version="1.0" ?>
 <robot xmlns:xacro="http://wiki.ros.org/xacro">
 
-    <xacro:macro name="open_amr_ros2_control" params="prefix use_gazebo">
+    <!-- hardware: Gazebo (use_gazebo), Isaac Sim (isaac_ns = the robot's namespace: open_amr_isaac_hardware bridged to
+         the simulated wheels, sim/scripts/base_bridge.py), or none here (a real robot's driver brings its own) -->
+    <xacro:macro name="open_amr_ros2_control" params="prefix use_gazebo isaac_ns:=''">
         <ros2_control name="RobotSystem" type="system">
             <hardware>
                 <xacro:if value="${use_gazebo}">
                     <plugin>gz_ros2_control/GazeboSimSystem</plugin>
+                </xacro:if>
+                <xacro:if value="${isaac_ns != ''}">
+                    <plugin>open_amr_isaac_hardware/IsaacJointSystem</plugin>
+                    <param name="joint_commands_topic">/${isaac_ns}/isaac_joint_commands</param>
+                    <param name="joint_states_topic">/${isaac_ns}/isaac_joint_states</param>
                 </xacro:if>
             </hardware>
 

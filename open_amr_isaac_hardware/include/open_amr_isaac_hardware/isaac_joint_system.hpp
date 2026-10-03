@@ -34,6 +34,7 @@ private:
   sensor_msgs::msg::JointState latest_state_;   // guarded by state_mutex_
   bool have_state_{ false };                    // guarded by state_mutex_
   std::vector<std::string> joints_;
+  std::vector<bool> has_position_command_;
   std::vector<bool> has_velocity_command_;
   std::vector<bool> has_acceleration_command_;
   std::size_t skipped_non_finite_{ 0 };

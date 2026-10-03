@@ -5,7 +5,9 @@ ekf_filter_node:
 # The frequency, in Hz, at which the filter will output a position estimate. Note that the filter will not begin
 # computation until it receives at least one message from one of the inputs. It will then run continuously at the
 # frequency specified here, regardless of whether it receives more measurements. Defaults to 30 if unspecified.
-        frequency: 15.0
+        # 50 Hz = the wheel odometry and IMU rates: Nav2's docking controller runs at 50 Hz on this TF, and the costmaps
+        # look up scans in it (15 Hz left ~67 ms gaps to extrapolate across)
+        frequency: 50.0
 
 # ekf_localization_node and ukf_localization_node both use a 3D omnidirectional motion model. If this parameter is
 # set to true, no 3D information will be used in your state estimate. Use this if you are operating in a planar
@@ -68,9 +70,13 @@ ekf_filter_node:
 
 
         imu0: imu/data
+        # Yaw rate only. Forward acceleration (ax) was fused until 2026-10-03: standing still the accelerometer reads
+        # gravity through any chassis pitch / mounting tilt / floor slope (-0.04 m/s^2 = 0.2 deg in the Isaac sim), which
+        # two_d_mode cannot remove, and the filter integrated it into a creeping velocity (0.11 m in a minute at rest,
+        # dock-marker prediction lost). The wheels measure vx directly; the gyro catches what they miss in turns.
         imu0_config: [false, false, false,
                       false, false, false,
                       false, false, false,
                       false, false, true,
-                      true, false, false]
+                      false, false, false]
 

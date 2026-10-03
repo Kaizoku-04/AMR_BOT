@@ -1,8 +1,7 @@
 """Payload study of the cell (deployment check): the force the vacuum pad must hold on the carton through every carrying
 move of the taught pattern, against the gripper's datasheet. Each cycle is planned exactly as the cell runs it (the
-reach study's planner and program, production speeds); every carrying trajectory is sampled at 1 ms along the
-controller's own interpolation (quintic per segment from positions / velocities / accelerations) and the carton's
-centre of mass is pushed through forward kinematics:
+reach study's planner and program, production speeds); along every carrying trajectory the carton's centre-of-mass
+acceleration comes from the planned joint velocities / accelerations (a = J qdd + dJ/dt qd):
     F = m (a - g)          force the pad applies to the carton (world frame)
     pull  = F . n          along the pad normal n (out of the pad, into the carton): what the vacuum must hold
     shear = |F - (F.n) n|  in the pad's plane: what friction under the foam must hold
@@ -28,52 +27,49 @@ from .reach_study import JOINTS, Study, _exit
 G = np.array([0.0, 0.0, -9.81])
 
 
-def quintic(p0, v0, a0, p1, v1, a1, T, t):
-    """Position at t of the quintic through (p0, v0, a0) at 0 and (p1, v1, a1) at T (per joint, vectorised)."""
-    T2, T3, T4, T5 = T * T, T ** 3, T ** 4, T ** 5
-    c0, c1, c2 = p0, v0, a0 / 2
-    c3 = (20 * (p1 - p0) - (8 * v1 + 12 * v0) * T - (3 * a0 - a1) * T2) / (2 * T3)
-    c4 = (30 * (p0 - p1) + (14 * v1 + 16 * v0) * T + (3 * a0 - 2 * a1) * T2) / (2 * T4)
-    c5 = (12 * (p1 - p0) - (6 * v1 + 6 * v0) * T - (a0 - a1) * T2) / (2 * T5)
-    return c0 + c1 * t + c2 * t ** 2 + c3 * t ** 3 + c4 * t ** 4 + c5 * t ** 5
+def carton_point(q, p: CellParams, ur):
+    """Carton centre of mass (cell frame) and the pad normal for joint configuration q."""
+    M = ur_ik.fk(q, ur)
+    n = M[:3, 2]                                            # tool z = out of the pad, into the carton
+    tcp = M[:3, 3] + n * p.tool_length + np.array([0.0, 0.0, p.pedestal_height])
+    return tcp + n * p.box[2] / 2, n
 
 
-def carton_states(jt, p: CellParams, dt=0.001):
-    """(times, carton CoG positions [N,3], pad normals [N,3]) along a joint trajectory."""
-    idx = [jt.joint_names.index(j) for j in JOINTS]
-    pts = jt.points
-    tt = [pt.time_from_start.sec + pt.time_from_start.nanosec * 1e-9 for pt in pts]
-    arr = lambda pt, f: np.array([getattr(pt, f)[i] if len(getattr(pt, f)) else 0.0 for i in idx])
-    ur = ur_ik.params(p.ur_type)
-    ts, cog, nrm = [], [], []
-    for a, b, ta, tb in zip(pts, pts[1:], tt, tt[1:]):
-        T = tb - ta
-        if T <= 0:
-            continue
-        for t in np.arange(0.0, T, dt):
-            q = quintic(arr(a, 'positions'), arr(a, 'velocities'), arr(a, 'accelerations'),
-                        arr(b, 'positions'), arr(b, 'velocities'), arr(b, 'accelerations'), T, t)
-            M = ur_ik.fk(q, ur)
-            n = M[:3, 2]                                    # tool z = out of the pad, into the carton
-            tcp = M[:3, 3] + n * p.tool_length + np.array([0.0, 0.0, p.pedestal_height])
-            ts.append(ta + t)
-            cog.append(tcp + n * p.box[2] / 2)
-            nrm.append(n)
-    return np.array(ts), np.array(cog), np.array(nrm)
+def carton_accel(q, qd, qdd, p, ur, eps=1e-6, h=1e-4):
+    """Carton CoG acceleration from the joint state: a = J qdd + (dJ/dt) qd, Jacobians by finite differences (no
+    second differences of positions: sampled trajectories made those blow up)."""
+    def J(qq):
+        x0, _ = carton_point(qq, p, ur)
+        cols = []
+        for i in range(6):
+            dq = np.array(qq, float)
+            dq[i] += eps
+            cols.append((carton_point(dq, p, ur)[0] - x0) / eps)
+        return np.column_stack(cols)
+    J0 = J(q)
+    Jh = J(np.asarray(q) + np.asarray(qd) * h)
+    return J0 @ qdd + ((Jh - J0) / h) @ qd
 
 
 def loads(jt, p, mass):
-    t, x, n = carton_states(jt, p)
-    if len(t) < 5:
-        return 0.0, 0.0, 0.0
-    dt = np.diff(t).mean()
-    a = np.zeros_like(x)
-    a[1:-1] = (x[2:] - 2 * x[1:-1] + x[:-2]) / dt ** 2
-    F = mass * (a - G)                                      # force the pad applies to the carton
-    pull = np.einsum('ij,ij->i', F, n)                      # positive = pad pulling the carton towards itself...
-    shear = np.linalg.norm(F - pull[:, None] * n, axis=1)
-    acc = np.linalg.norm(a, axis=1)
-    return float(np.max(np.abs(pull[1:-1]))), float(np.max(shear[1:-1])), float(np.max(acc[1:-1]))
+    """Worst pad pull / shear (N) and carton acceleration (m/s^2) over the trajectory's points (Pilz trapezoidal
+    profiles: the joint accelerations are piecewise constant between points, so the points carry the extremes)."""
+    ur = ur_ik.params(p.ur_type)
+    idx = [jt.joint_names.index(j) for j in JOINTS]
+    worst = [0.0, 0.0, 0.0]
+    for pt in jt.points:
+        if not (len(pt.velocities) and len(pt.accelerations)):
+            continue
+        q = np.array([pt.positions[i] for i in idx])
+        qd = np.array([pt.velocities[i] for i in idx])
+        qdd = np.array([pt.accelerations[i] for i in idx])
+        a = carton_accel(q, qd, qdd, p, ur)
+        _, n = carton_point(q, p, ur)
+        F = mass * (a - G)                                  # force the pad applies to the carton
+        pull = float(F @ n)
+        shear = float(np.linalg.norm(F - pull * n))
+        worst = [max(worst[0], abs(pull)), max(worst[1], shear), max(worst[2], float(np.linalg.norm(a)))]
+    return tuple(worst)
 
 
 def main(argv=None):

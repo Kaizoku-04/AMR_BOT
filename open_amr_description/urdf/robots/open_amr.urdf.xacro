@@ -15,6 +15,7 @@
     <xacro:arg name="robot_name" default="open_amr"/>
     <xacro:arg name="prefix" default=""/>
     <xacro:arg name="use_gazebo" default="false"/>
+    <xacro:arg name="isaac_ns" default=""/>   <!-- Isaac Sim with ros2_control (sim real-inputs mode): the namespace of the robot -->
     <!-- Rendered by robot_state_publisher.launch.py per robot instance; default = checked-in un-prefixed config -->
     <xacro:arg name="controllers_file" default="$(find open_amr_description)/config/open_amr/ros2_controllers.yaml"/>
     <!-- Kinematic body-twist plugin. OFF by default: it double-actuates the robot together with ros2_control -->
@@ -90,7 +91,8 @@
     <xacro:include filename="$(find open_amr_description)/urdf/control/open_amr_ros2_control.urdf.xacro" />
     <xacro:open_amr_ros2_control
       prefix="$(arg prefix)"
-      use_gazebo="$(arg use_gazebo)"/>
+      use_gazebo="$(arg use_gazebo)"
+      isaac_ns="$(arg isaac_ns)"/>
 
 
 </robot>

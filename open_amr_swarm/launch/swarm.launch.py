@@ -48,7 +48,7 @@ def spawn(context):
                          output='screen',
                          parameters=[{'graph': graph, 'time_scale': scale, 'initial_soc': start[i % len(start)],
                                       'chargers': chargers, 'use_sim_time': True}],
-                         remappings=tf)
+                         remappings=tf + [('odom', lc('odom_topic'))])
                     for i in range(n)]
     if lc('mode') == 'mission':
         fault = lc('fault').split(':') if lc('fault') else ['', '0', '0']
@@ -92,6 +92,8 @@ def generate_launch_description():
                               description='dock at arm bays on the lidar marker (Nav2 docking server)'),
         DeclareLaunchArgument('deck_sensor', default_value='false',
                               description='robots check their deck load sensors (physical cartons)'),
+        DeclareLaunchArgument('odom_topic', default_value='odom',
+                              description='odometry the battery model reads: odom (Isaac truth) or odometry/filtered'),
         DeclareLaunchArgument('cells', default_value='false', description='stations drive real arm cells (cell_controller)'),
         DeclareLaunchArgument('fault', default_value='', description='station:start_s:duration_s, e.g. arm_receiving:300:120'),
         DeclareLaunchArgument('graph', default_value=''),

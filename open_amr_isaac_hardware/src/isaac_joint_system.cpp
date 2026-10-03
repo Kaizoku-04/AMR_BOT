@@ -22,12 +22,14 @@ CallbackReturn IsaacJointSystem::on_init(const hardware_interface::HardwareCompo
   for (const auto& joint : get_hardware_info().joints)
   {
     joints_.push_back(joint.name);
-    bool vel = false, acc = false;
+    bool pos = false, vel = false, acc = false;
     for (const auto& ci : joint.command_interfaces)
     {
+      pos = pos || ci.name == hardware_interface::HW_IF_POSITION;
       vel = vel || ci.name == hardware_interface::HW_IF_VELOCITY;
       acc = acc || ci.name == hardware_interface::HW_IF_ACCELERATION;
     }
+    has_position_command_.push_back(pos);
     has_velocity_command_.push_back(vel);
     has_acceleration_command_.push_back(acc);
   }
@@ -47,12 +49,16 @@ CallbackReturn IsaacJointSystem::on_init(const hardware_interface::HardwareCompo
 
 CallbackReturn IsaacJointSystem::on_activate(const rclcpp_lifecycle::State& /*previous_state*/)
 {
-  // start commanding where the arm is (ros2_control command interfaces are NaN until a controller writes them)
+  // start commanding where the arm is and wheels at rest (ros2_control command interfaces are NaN until a
+  // controller writes them)
   read(get_node()->now(), rclcpp::Duration(0, 0));
-  for (const auto& name : joints_)
+  for (size_t i = 0; i < joints_.size(); ++i)
   {
-    set_command(name + "/" + hardware_interface::HW_IF_POSITION,
-                get_state(name + "/" + hardware_interface::HW_IF_POSITION));
+    if (has_position_command_[i])
+      set_command(joints_[i] + "/" + hardware_interface::HW_IF_POSITION,
+                  get_state(joints_[i] + "/" + hardware_interface::HW_IF_POSITION));
+    else if (has_velocity_command_[i])
+      set_command(joints_[i] + "/" + hardware_interface::HW_IF_VELOCITY, 0.0);
   }
   return CallbackReturn::SUCCESS;
 }
@@ -98,7 +104,10 @@ hardware_interface::return_type IsaacJointSystem::write(const rclcpp::Time& time
   cmd.header.stamp = time;
   for (std::size_t i = 0; i < joints_.size(); ++i)
   {
-    const double p = get_command(joints_[i] + "/" + hardware_interface::HW_IF_POSITION);
+    // velocity-only joints (an AMR's wheels under diff_drive_controller): positions are left out of the message and
+    // the simulator drives the joint by velocity
+    const double p = has_position_command_[i] ? get_command(joints_[i] + "/" + hardware_interface::HW_IF_POSITION)
+                                              : 0.0;
     const double v =
         has_velocity_command_[i] ? get_command(joints_[i] + "/" + hardware_interface::HW_IF_VELOCITY) : 0.0;
     const double a =
@@ -112,7 +121,8 @@ hardware_interface::return_type IsaacJointSystem::write(const rclcpp::Time& time
       return hardware_interface::return_type::OK;
     }
     cmd.joint_names.push_back(joints_[i]);
-    pt.positions.push_back(p);
+    if (has_position_command_[i])
+      pt.positions.push_back(p);
     pt.velocities.push_back(std::isfinite(v) ? v : 0.0);
     pt.accelerations.push_back(std::isfinite(a) ? a : 0.0);
   }
