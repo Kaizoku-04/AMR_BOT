@@ -18,8 +18,10 @@ import rclpy
 import rclpy.time
 import yaml
 from geometry_msgs.msg import PoseStamped
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from tf2_ros import Buffer, TransformListener
@@ -46,10 +48,12 @@ class BayMarkerDetector(Node):
         # the pose at the scan's time comes from the odometry stream (60 Hz) interpolated here, plus the static
         # base -> lidar mount: rclpy's TF listener fell 0.2-0.7 s behind ~300 TF messages/s on the loaded fleet
         # machine (C++ listeners keep up), so lookups at the scan time failed or extrapolated
-        self.odom = deque(maxlen=120)
+        self.odom = deque(maxlen=300)          # 5 s at 60 Hz
         self.mount = None                       # (x, y, yaw) of the lidar in base_footprint
         self.base_frame = dp('base_frame', 'base_footprint').value
-        self.create_subscription(Odometry, 'odom', self.on_odom, 50)
+        # odometry on its own thread: behind a slow scan fit in one thread, it lagged the (newest-only) scans by more
+        # than the extrapolation allowance — "no odometry at the scan time" for up to a third of them (Isaac 2026-10-03)
+        self.create_subscription(Odometry, 'odom', self.on_odom, 50, callback_group=MutuallyExclusiveCallbackGroup())
         self.range = dp('activation_range', 2.5).value
         self.fov = math.radians(dp('fov_deg', 120.0).value) / 2
         self.line_tol = dp('line_tol', 0.008).value
@@ -57,7 +61,11 @@ class BayMarkerDetector(Node):
         self.tf = Buffer()
         TransformListener(self.tf, self, spin_thread=True)   # own thread: lookups below wait for TF
         self.pub = self.create_publisher(PoseStamped, 'detected_dock_pose', 10)
-        self.create_subscription(LaserScan, 'scan', self.on_scan, qos_profile_sensor_data)
+        # only the newest scan: a 33 Hz safety scanner's 1,350-point scans outpace this Python fit on a loaded PC, and a
+        # queue of old scans ran past the odometry window ("no odometry at the scan time" for 40 % of the scans,
+        # docking aborted, Isaac 2026-10-03). The docking server needs ~10 Hz of fresh detections, not every scan.
+        self.create_subscription(LaserScan, 'scan', self.on_scan, QoSProfile(
+            depth=1, history=HistoryPolicy.KEEP_LAST, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.found, self.missed, self.last_why = 0, 0, ''
         self.create_timer(10.0, self.report)
         self.get_logger().info(f'{len(self.markers)} markers: {", ".join(self.markers)}')
@@ -97,6 +105,10 @@ class BayMarkerDetector(Node):
                 self.mount = (m.transform.translation.x, m.transform.translation.y, yaw_of(m.transform.rotation))
             except Exception:
                 return
+        ts = scan.header.stamp.sec + scan.header.stamp.nanosec * 1e-9
+        best = self.track(ts)
+        if best is not None:
+            return self.fit(scan, ts, best)
         # the prediction only has to put the region of interest within ~0.3 m: the latest map -> lidar transform will
         # do (at the scan's own stamp the lookup mostly fails: AMCL publishes map -> odom slower than the lidar scans)
         try:
@@ -117,6 +129,35 @@ class BayMarkerDetector(Node):
                 best = (d, name, (lx, ly, myaw + tyaw), m)
         if best is None:
             return
+        return self.fit(scan, ts, best)
+
+    def lidar_in_odom(self, ts):
+        """(x, y, yaw) of the lidar in odom at time ts, or None."""
+        b = self.odom_at(ts)
+        if b is None:
+            return None
+        bx, by, byaw = b
+        mx, my, myaw = self.mount
+        return (bx + math.cos(byaw) * mx - math.sin(byaw) * my, by + math.sin(byaw) * mx + math.cos(byaw) * my,
+                byaw + myaw)
+
+    def track(self, ts):
+        """Once a marker is detected, predict it in the next scans from that detection and odometry (good to mm
+        over a second), not from the map pose: near the bay the marker is 0.15-0.3 m from a nose-mounted scanner and
+        AMCL's normal 0.1-0.2 m error swung the map-based prediction out of the sector — scans were dropped
+        silently and docking aborted on a lost detection (Isaac 2026-10-03)."""
+        last = getattr(self, 'last_det', None)
+        if last is None or not 0.0 <= ts - last[0] < 1.0:
+            return None
+        lp = self.lidar_in_odom(ts)
+        if lp is None:
+            return None
+        _, X, Y, Yaw, name = last
+        c, s = math.cos(-lp[2]), math.sin(-lp[2])
+        px, py = c * (X - lp[0]) - s * (Y - lp[1]), s * (X - lp[0]) + c * (Y - lp[1])
+        return (math.hypot(px, py), name, (px, py, Yaw - lp[2]), self.markers[name])
+
+    def fit(self, scan, ts, best):
         _, name, pred, m = best
         r = np.asarray(scan.ranges, float)
         a = scan.angle_min + scan.angle_increment * np.arange(len(r))
@@ -127,19 +168,16 @@ class BayMarkerDetector(Node):
             self.missed += 1
             self.last_why = f'{name}: {info}'
             return
-        ts = scan.header.stamp.sec + scan.header.stamp.nanosec * 1e-9
-        b = self.odom_at(ts)
-        if b is None:
+        lp = self.lidar_in_odom(ts)                        # base in odom, then the lidar mount, then the marker
+        if lp is None:
             self.missed += 1
             self.last_why = 'no odometry at the scan time'
             return
-        bx, by, byaw = b                                   # base in odom, then the lidar mount, then the marker
-        mx, my, myaw = self.mount
-        lx, ly, lyaw = bx + math.cos(byaw) * mx - math.sin(byaw) * my, by + math.sin(byaw) * mx + math.cos(byaw) * my, \
-            byaw + myaw
+        lx, ly, lyaw = lp
         co, so = math.cos(lyaw), math.sin(lyaw)
         x, y, yaw = lx + co * pose[0] - so * pose[1], ly + so * pose[0] + co * pose[1], pose[2] + lyaw
         self.found += 1
+        self.last_det = (ts, x, y, yaw, name)
         msg = PoseStamped()
         msg.header.stamp, msg.header.frame_id = scan.header.stamp, self.out_frame
         msg.pose.position.x, msg.pose.position.y = x, y
@@ -151,6 +189,8 @@ def main():
     rclpy.init()
     node = BayMarkerDetector()
     try:
-        rclpy.spin(node)
+        ex = MultiThreadedExecutor(num_threads=2)
+        ex.add_node(node)
+        ex.spin()
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
