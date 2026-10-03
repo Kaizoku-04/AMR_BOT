@@ -49,6 +49,15 @@ CallbackReturn IsaacJointSystem::on_init(const hardware_interface::HardwareCompo
 
 CallbackReturn IsaacJointSystem::on_activate(const rclcpp_lifecycle::State& /*previous_state*/)
 {
+  // velocities read 0 until the simulator's first joint state arrives, as a motor driver reports standstill from
+  // power-up: NaN made diff_drive_controller fail its first update ("wheel velocity is invalid") and ros2_control
+  // deactivated it for good when activation beat the first message (Isaac 2026-10-03). Positions stay unset until
+  // real feedback, so an arm is never commanded towards an invented position.
+  for (const auto& name : joints_)
+  {
+    if (has_state(name + "/" + hardware_interface::HW_IF_VELOCITY))
+      set_state(name + "/" + hardware_interface::HW_IF_VELOCITY, 0.0);
+  }
   // start commanding where the arm is and wheels at rest (ros2_control command interfaces are NaN until a
   // controller writes them)
   read(get_node()->now(), rclcpp::Duration(0, 0));
