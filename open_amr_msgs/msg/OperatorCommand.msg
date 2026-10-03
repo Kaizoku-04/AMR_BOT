@@ -3,6 +3,8 @@
 uint8 RELEASE_ROBOT=0    # target (a robot id) is gone: stop treating its last reservations and charger as held, and
                          # count it out of the fleet (quorum). Applies to silence that began before `stamp`; if the
                          # robot is heard again after `stamp` it is back in the fleet.
+uint8 ACK_FAULT=1        # target (a robot id) was looked at by a person: retry what it gave up on (docking: back to
+                         # the staging node, fresh attempts)
 
 builtin_interfaces/Time stamp    # sim time
 uint8 command

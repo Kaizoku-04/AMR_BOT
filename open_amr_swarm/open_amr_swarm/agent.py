@@ -311,6 +311,16 @@ class SwarmAgent(Node):
     def on_operator(self, m):
         if self.link_down:
             return
+        if m.command == OperatorCommand.ACK_FAULT and m.target == self.rid:
+            if self.dock_state == 'gave_up':
+                self.get_logger().warn(f'{self.rid}: operator {m.issued_by or "?"} acknowledged the docking fault: '
+                                       f'back to staging, fresh attempts')
+                self.dock_fails = 0
+                self.status = self.leg.drive_status if self.leg is not None else RobotState.IDLE
+                self.restage()
+            else:
+                self.get_logger().info(f'{self.rid}: operator acknowledged a fault; nothing to retry')
+            return
         if m.command == OperatorCommand.RELEASE_ROBOT and m.target != self.rid:
             self.released[m.target] = stamp_s(m.stamp)
             self.get_logger().warn(f'{self.rid}: operator {m.issued_by or "?"} released {m.target}'
@@ -1052,8 +1062,8 @@ class SwarmAgent(Node):
 
     def start_dock(self):
         """Dock on the bay's marker (the robot stands at the staging node, the bay is reserved and acknowledged)."""
-        if self.dock_state == 'retry' and self.now() >= self.dock_retry_at:
-            self.dock_state = None
+        if self.dock_state == 'retry' and self.now() >= self.dock_retry_at or self.dock_state == 'restaging':
+            self.dock_state = None                       # (restaging: called only once the staging node is reached)
         if self.dock_state is not None:
             return                                       # running / done / waiting for the retry
         if self.follow_handle is not None or self.follow_end is not None:
@@ -1133,13 +1143,29 @@ class SwarmAgent(Node):
         h.get_result_async().add_done_callback(lambda r, name=name: self.dock_failed(name, 'inaccurate dock, re-docking'))
 
     def dock_failed(self, name, why):
-        """The docking server gave up (after its own retries): try again from where the robot stands; after 3
-        attempts report STUCK and keep trying (an operator has to look: no transfer happens undocked)."""
+        """The docking server gave up (after its own retries). Its recovery can leave the robot anywhere near the bay
+        (fleet run 2026-10-03: 1.8 m off, facing away, the marker out of view) and docking from there fails at once —
+        it was retried 79 times. So: drive back to the staging node along the lanes and dock again from there (after
+        an accuracy re-dock the undock already put the robot there); after 3 attempts stop and report STUCK until an
+        operator acknowledges (OperatorCommand.ACK_FAULT) — as an AMR pauses its mission and calls for a person."""
         self.dock_fails += 1
         self.get_logger().warn(f'{self.rid}: docking at {name} failed ({why}), attempt {self.dock_fails}')
         if self.dock_fails >= 3:
-            self.status = RobotState.STUCK
-        self.dock_state, self.dock_retry_at = 'retry', self.now() + 3.0
+            self.status, self.dock_state = RobotState.STUCK, 'gave_up'
+            self.get_logger().error(f'{self.rid}: gave up docking at {name} after {self.dock_fails} attempts: STUCK '
+                                    f'until an operator acknowledges')
+            return
+        if why.startswith('inaccurate dock'):
+            self.dock_state, self.dock_retry_at = 'retry', self.now() + 3.0
+        else:
+            self.restage()
+
+    def restage(self):
+        """Drive back to the staging node (the docking leg's second-to-last node) and dock again once there."""
+        self.stop_following()
+        self.next_idx = len(self.route) - 2
+        self.dock_state = 'restaging'
+        self.get_logger().info(f'{self.rid}: back to {self.graph.name[self.route[-2]]} to dock again')
 
     def send_path(self, i0, i1, precise):
         p = Path(); p.header = self.path.header; p.header.stamp = self.get_clock().now().to_msg()

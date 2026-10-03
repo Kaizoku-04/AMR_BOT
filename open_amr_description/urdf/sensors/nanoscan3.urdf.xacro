@@ -1,0 +1,51 @@
+<?xml version="1.0"?>
+<!-- SICK nanoScan3 safety laser scanner (SIL 2 / PL d / Cat. 3), the scanner MiR's AMRs carry: two per robot at diagonal
+     corners for 360 deg. Link origin = the optical centre (scan plane, mirror axis); x = the middle of the scan sector.
+     Data (SICK operating instructions nanoScan3, table 43 "Measurement data details"): 275 deg, 0.17 deg (1,651 values),
+     33 Hz, distance measurement range <= 8.7 m at 10 % remission / <= 27.4 m at 100 %, systematic error +-10 mm, total
+     error +-13 mm at 1 sigma. Housing 106.6 x 80 x 117.5 mm (W x H x D), 0.67 kg (data sheet NANS3-AAAZ30AN1).
+     `fov` < 275 deg leaves a margin so the sector's edge beams pass outside the chassis panels they run along. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="nanoscan3" params="prefix:='' parent:='base_link' name xyz rpy topic fov:=${266*pi/180}">
+    <link name="${prefix}${name}">
+      <visual>
+        <!-- housing behind the window: the optical centre sits near the front face -->
+        <origin xyz="-0.045 0 0" rpy="0 0 0"/>
+        <geometry><box size="0.1175 0.1066 0.080"/></geometry>
+        <material name="sick_yellow"><color rgba="0.98 0.78 0.05 1"/></material>
+      </visual>
+      <inertial>
+        <mass value="0.67"/>
+        <origin xyz="-0.045 0 0"/>
+        <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+      </inertial>
+    </link>
+    <joint name="${prefix}${name}_joint" type="fixed">
+      <parent link="${prefix}${parent}"/>
+      <child link="${prefix}${name}"/>
+      <origin xyz="${xyz}" rpy="${rpy}"/>
+    </joint>
+    <gazebo reference="${prefix}${name}">
+      <sensor name="${prefix}${name}_sensor" type="gpu_lidar">
+        <topic>${topic}</topic>
+        <update_rate>33</update_rate>
+        <always_on>true</always_on>
+        <visualize>false</visualize>
+        <ray>
+          <scan>
+            <horizontal>
+              <samples>${int(fov / (0.17 * pi / 180)) + 1}</samples>
+              <resolution>1</resolution>
+              <min_angle>${-fov / 2}</min_angle>
+              <max_angle>${fov / 2}</max_angle>
+            </horizontal>
+            <vertical><samples>1</samples><resolution>1</resolution><min_angle>0</min_angle><max_angle>0</max_angle></vertical>
+          </scan>
+          <range><min>0.05</min><max>27.4</max><resolution>0.001</resolution></range>
+          <noise><type>gaussian</type><mean>0.0</mean><stddev>0.003</stddev></noise>
+        </ray>
+        <gz_frame_id>${prefix}${name}</gz_frame_id>
+      </sensor>
+    </gazebo>
+  </xacro:macro>
+</robot>

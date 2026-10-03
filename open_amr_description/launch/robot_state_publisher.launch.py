@@ -133,6 +133,11 @@ def generate_launch_description():
         default_value='true',
         description='Whether to start RVIZ')
 
+    declare_lidar_cmd = DeclareLaunchArgument(
+        name='lidar',
+        default_value='rplidar',
+        description='rplidar (the Gazebo stack, single scan topic) or nanoscan3 (two corner safety scanners)')
+
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         name='use_sim_time',
         default_value='false',
@@ -143,6 +148,7 @@ def generate_launch_description():
         'robot_name:=', LaunchConfiguration('robot_name'), ' ',
         'prefix:=', LaunchConfiguration('prefix'), ' ',
         'use_gazebo:=', LaunchConfiguration('use_gazebo'), ' ',
+        'lidar:=', LaunchConfiguration('lidar'), ' ',
         'controllers_file:=', LaunchConfiguration('controllers_file')
     ]), value_type=str)
 
@@ -194,6 +200,7 @@ def generate_launch_description():
     ld.add_action(declare_use_jsp_cmd) 
     ld.add_action(declare_use_rviz_cmd)
     ld.add_action(declare_use_sim_time_cmd)
+    ld.add_action(declare_lidar_cmd)
 
     # Add any actions
     ld.add_action(start_joint_state_publisher_cmd)

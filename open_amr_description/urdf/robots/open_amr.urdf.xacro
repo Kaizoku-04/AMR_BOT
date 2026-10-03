@@ -15,7 +15,10 @@
     <xacro:arg name="robot_name" default="open_amr"/>
     <xacro:arg name="prefix" default=""/>
     <xacro:arg name="use_gazebo" default="false"/>
-    <xacro:arg name="isaac_ns" default=""/>   <!-- Isaac Sim with ros2_control (sim real-inputs mode): the namespace of the robot -->
+    <xacro:arg name="isaac_ns" default=""/>
+    <!-- lidar: nanoscan3 = two SICK nanoScan3 safety scanners at diagonal corners (MiR250 layout; the robot's design since
+         2026-10-03: safety-rated, 360 deg); rplidar = the original single RPLIDAR A1M8 (Gazebo stack) -->
+    <xacro:arg name="lidar" default="nanoscan3"/>   <!-- Isaac Sim with ros2_control (sim real-inputs mode): the namespace of the robot -->
     <!-- Rendered by robot_state_publisher.launch.py per robot instance; default = checked-in un-prefixed config -->
     <xacro:arg name="controllers_file" default="$(find open_amr_description)/config/open_amr/ros2_controllers.yaml"/>
     <!-- Kinematic body-twist plugin. OFF by default: it double-actuates the robot together with ros2_control -->
@@ -27,6 +30,7 @@
     <xacro:include filename="$(find open_amr_description)/urdf/mech/diff_wheel.urdf.xacro"/>
     <xacro:include filename="$(find open_amr_description)/urdf/sensors/rgbd_camera.urdf.xacro"/>
     <xacro:include filename="$(find open_amr_description)/urdf/sensors/lidar.urdf.xacro"/>
+    <xacro:include filename="$(find open_amr_description)/urdf/sensors/nanoscan3.urdf.xacro"/>
     <xacro:include filename="$(find open_amr_description)/urdf/sensors/imu.urdf.xacro"/>
     <xacro:include filename="$(find open_amr_description)/urdf/mech/caster_wheel.urdf.xacro"/>
 
@@ -58,15 +62,32 @@
       xyz_offset="0.39 0.02 0.042"
       rpy_offset="0 0 0"/>
 
+    <xacro:if value="${'$(arg lidar)' == 'rplidar'}">
     <xacro:lidar_sensor
-      prefix="$(arg prefix)"
-      parent="base_link"
-      frame_id="laser_frame"
-      xyz_offset="0.320 0 0.12"
-      rpy_offset="0 0 0"
-      mesh_xyz_offset="-0.3 0 -0.22"
-      mesh_rpy_offset="${M_PI/2} 0 0"
-      topic_name="scan"/>
+        prefix="$(arg prefix)"
+        parent="base_link"
+        frame_id="laser_frame"
+        xyz_offset="0.320 0 0.12"
+        rpy_offset="0 0 0"
+        mesh_xyz_offset="-0.3 0 -0.22"
+        mesh_rpy_offset="${M_PI/2} 0 0"
+        topic_name="scan"/>
+    </xacro:if>
+    <xacro:if value="${'$(arg lidar)' == 'nanoscan3'}">
+      <!-- optical centres on the collision outline's corners (x -0.39..0.416, y +-0.319), scan plane 0.12 m above
+           base_link (0.22 m above the floor, as the old lidar), aimed diagonally outward -->
+      <xacro:nanoscan3 prefix="$(arg prefix)" name="front_laser_link" xyz="0.416 0.319 0.12" rpy="0 0 ${M_PI/4}"
+                       topic="scan_front"/>
+      <xacro:nanoscan3 prefix="$(arg prefix)" name="rear_laser_link" xyz="-0.39 -0.319 0.12" rpy="0 0 ${-3*M_PI/4}"
+                       topic="scan_rear"/>
+      <!-- the merged 360 deg scan (dual_laser_merger) for AMCL: a virtual scanner at the base centre, scan height -->
+      <link name="$(arg prefix)scan_merged_link"/>
+      <joint name="$(arg prefix)scan_merged_joint" type="fixed">
+        <parent link="$(arg prefix)base_link"/>
+        <child link="$(arg prefix)scan_merged_link"/>
+        <origin xyz="0 0 0.12" rpy="0 0 0"/>
+      </joint>
+    </xacro:if>
 
     <xacro:imu_sensor
       prefix="$(arg prefix)"
