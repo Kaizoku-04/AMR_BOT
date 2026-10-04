@@ -165,6 +165,10 @@ class SwarmAgent(Node):
         self.dock_pose_msg = None
         self.create_subscription(PoseStamped, 'dock_pose', lambda m: setattr(self, 'dock_pose_msg', m), 10)
         self.dock_state, self.dock_fails, self.docked, self.docking = None, 0, False, False
+        # backing out of a bay (to dock again): the docking server's undock reverses to the staging pose; when that is
+        # blocked (a person, a robot that isn't an agent) retry every 5 s for up to backout_patience_s, then STUCK
+        self.backout_patience = dp('backout_patience_s', 60.0).value
+        self.backout_t0, self.backout_why = None, ''
         self.route_client = ActionClient(self, ComputeRoute, 'compute_route')
         self.follow_client = ActionClient(self, FollowPath, 'follow_path')
         self.clear_local = self.create_client(ClearEntireCostmap, 'local_costmap/clear_entirely_local_costmap')
@@ -317,7 +321,10 @@ class SwarmAgent(Node):
                                        f'back to staging, fresh attempts')
                 self.dock_fails = 0
                 self.status = self.leg.drive_status if self.leg is not None else RobotState.IDLE
-                self.restage()
+                if self.in_bay():          # nose-in at the pedestal: a forward-only path can't leave (deadlock, 2026-10-03)
+                    self.back_out(self.graph.name[self.route[-1]], 'operator acknowledged')
+                else:
+                    self.restage()
             else:
                 self.get_logger().info(f'{self.rid}: operator acknowledged a fault; nothing to retry')
             return
@@ -884,6 +891,14 @@ class SwarmAgent(Node):
         held = self.reserved
         self.reserved, self.blocked = plan_reservations(self.graph, self.route, self.next_idx, me, self.live_peers(), held,
                                                         self.tp, extend=self.has_quorum)
+        if self.docking and not self.docked and self.next_idx >= len(self.route) - 1 and \
+                self.route[-2] not in self.reserved:
+            # the bay zone = bay + its staging node, held until the dock is accurate: a re-dock backs out to the
+            # staging pose, and with the next robot already waiting there (0.19 m behind the docked robot's tail) the
+            # undock aborted on a collision, three times in 20 s -> STUCK, and after the operator's ACK the bay and its
+            # queue deadlocked for the rest of the shift (fleet run 2026-10-03). Released once docked accurately, so
+            # the next robot still pre-stages while the arm works.
+            self.reserved.insert(0, self.route[-2])
         if not self.has_quorum:
             # isolated: stop at the next node I hold (peers, which can't hear me, keep seeing my last reservation)
             nxt = self.route[self.next_idx]
@@ -1030,6 +1045,10 @@ class SwarmAgent(Node):
             return
         w, states, ghosts = self.waits()
         chain, cycle = wait_chain(self.rid, w)
+        if not cycle and self.graph.kind.get(self.route[self.next_idx]) in ('queue', 'bay'):
+            # a dock queue is the only way into its bay: re-routing around a blocked queue edge finds no route (405)
+            # and retried every 2.5 min for a whole shift behind a STUCK robot at the bay (2026-10-03) — wait in line
+            return
         end = states.get(chain[-1])
         long_block = chain[-1] in ghosts or (self.wait_s > self.blocked_reroute_s and end is not None and (
             end.status == RobotState.STUCK or end.wait_s > self.blocked_reroute_s))
@@ -1062,6 +1081,8 @@ class SwarmAgent(Node):
 
     def start_dock(self):
         """Dock on the bay's marker (the robot stands at the staging node, the bay is reserved and acknowledged)."""
+        if self.dock_state == 'backout_wait' and self.now() >= self.dock_retry_at:
+            return self.back_out(self.graph.name[self.route[-1]], self.backout_why)
         if self.dock_state == 'retry' and self.now() >= self.dock_retry_at or self.dock_state == 'restaging':
             self.dock_state = None                       # (restaging: called only once the staging node is reached)
         if self.dock_state is not None:
@@ -1108,9 +1129,10 @@ class SwarmAgent(Node):
         if err is not None and (math.hypot(err[0], err[1]) > self.dock_tol or abs(err[2]) > self.dock_tol_yaw):
             self.get_logger().warn(f'{self.rid}: docked at {name} but {1000 * err[0]:+.0f} / {1000 * err[1]:+.0f} mm, '
                                    f'{math.degrees(err[2]):+.1f} deg off: backing out to dock again')
-            self.dock_state = 'undocking'
-            self.undock_client.send_goal_async(UndockRobot.Goal(dock_type='bay_dock')).add_done_callback(
-                lambda f, name=name: self.on_undock_handle(f, name))
+            self.dock_fails += 1
+            if self.dock_fails >= 3:
+                return self.give_up_dock(name)
+            self.back_out(name, 'inaccurate dock')
             return
         self.docked, self.dock_state = True, GoalStatus.STATUS_SUCCEEDED
         self.get_logger().info(f'{self.rid}: docked at {name} in {self.now() - self.dock_t0:.1f} s'
@@ -1135,28 +1157,62 @@ class SwarmAgent(Node):
         c, s = math.cos(dyaw), math.sin(dyaw)
         return c * dx + s * dy, -s * dx + c * dy, math.remainder(ryaw - dyaw, math.tau)
 
+    def back_out(self, name, why):
+        """Reverse out of the bay to its staging pose (the docking server's undock, ≤ 0.15 m/s inside the bay's marked
+        zone) and dock again from there. Docking again from inside the bay instead "succeeds" at once with the same
+        error. A blocked back-out is retried, not counted as a docking attempt."""
+        self.dock_state, self.backout_why = 'undocking', why
+        self.backout_t0 = self.backout_t0 or self.now()
+        self.undock_client.send_goal_async(UndockRobot.Goal(dock_type='bay_dock')).add_done_callback(
+            lambda f, name=name: self.on_undock_handle(f, name))
+
     def on_undock_handle(self, f, name):
         h = f.result()
         if not h.accepted:
-            self.dock_failed(name, 'undock rejected')
+            self.backout_blocked(name, 'undock rejected')
             return
-        h.get_result_async().add_done_callback(lambda r, name=name: self.dock_failed(name, 'inaccurate dock, re-docking'))
+        h.get_result_async().add_done_callback(lambda r, name=name: self.on_undock_done(r, name))
+
+    def on_undock_done(self, r, name):
+        res, status = r.result().result, r.result().status
+        if status == GoalStatus.STATUS_SUCCEEDED and res.success:
+            self.backout_t0 = None
+            self.get_logger().info(f'{self.rid}: backed out of {name} ({self.backout_why}): docking again')
+            self.dock_state, self.dock_retry_at = 'retry', self.now() + 1.0
+            return
+        self.backout_blocked(name, f'error {res.error_code}')
+
+    def backout_blocked(self, name, why):
+        if self.now() - self.backout_t0 > self.backout_patience:
+            self.backout_t0 = None
+            self.get_logger().error(f'{self.rid}: can\'t back out of {name} for {self.backout_patience:.0f} s ({why})')
+            return self.give_up_dock(name)
+        self.get_logger().warn(f'{self.rid}: backing out of {name} blocked ({why}): retrying in 5 s',
+                               throttle_duration_sec=20.0)
+        self.dock_state, self.dock_retry_at = 'backout_wait', self.now() + 5.0
+
+    def give_up_dock(self, name):
+        self.status, self.dock_state = RobotState.STUCK, 'gave_up'
+        self.get_logger().error(f'{self.rid}: gave up docking at {name} after {self.dock_fails} attempts: STUCK '
+                                f'until an operator acknowledges')
+
+    def in_bay(self):
+        """Standing in the bay (nose at the pedestal): leaving it means reversing, which only the undock does."""
+        b = self.graph.pos[self.route[-1]] if self.route else None
+        return b is not None and self.pose is not None and math.hypot(self.pose[0] - b[0], self.pose[1] - b[1]) < 0.5
 
     def dock_failed(self, name, why):
         """The docking server gave up (after its own retries). Its recovery can leave the robot anywhere near the bay
         (fleet run 2026-10-03: 1.8 m off, facing away, the marker out of view) and docking from there fails at once —
-        it was retried 79 times. So: drive back to the staging node along the lanes and dock again from there (after
-        an accuracy re-dock the undock already put the robot there); after 3 attempts stop and report STUCK until an
-        operator acknowledges (OperatorCommand.ACK_FAULT) — as an AMR pauses its mission and calls for a person."""
+        it was retried 79 times. So: drive back to the staging node along the lanes (or, from inside the bay, back out
+        to it) and dock again from there; after 3 attempts stop and report STUCK until an operator acknowledges
+        (OperatorCommand.ACK_FAULT) — as an AMR pauses its mission and calls for a person."""
         self.dock_fails += 1
         self.get_logger().warn(f'{self.rid}: docking at {name} failed ({why}), attempt {self.dock_fails}')
         if self.dock_fails >= 3:
-            self.status, self.dock_state = RobotState.STUCK, 'gave_up'
-            self.get_logger().error(f'{self.rid}: gave up docking at {name} after {self.dock_fails} attempts: STUCK '
-                                    f'until an operator acknowledges')
-            return
-        if why.startswith('inaccurate dock'):
-            self.dock_state, self.dock_retry_at = 'retry', self.now() + 3.0
+            return self.give_up_dock(name)
+        if self.in_bay():
+            self.back_out(name, why)
         else:
             self.restage()
 

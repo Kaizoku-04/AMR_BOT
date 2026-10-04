@@ -1,5 +1,6 @@
 """Docking failures: back to the staging node and dock again; after 3 attempts STUCK until an operator acknowledges
-(fleet run 2026-10-03: a robot retried 79 times from a pose 1.8 m off the bay, the marker out of view)."""
+(fleet run 2026-10-03: a robot retried 79 times from a pose 1.8 m off the bay, the marker out of view). An inaccurate
+dock backs out of the bay (undock) and docks again; a blocked back-out is retried, not counted."""
 import json
 
 import pytest
@@ -52,6 +53,61 @@ def test_three_failed_attempts_stop_and_wait_for_an_operator(agent):
     assert agent.dock_state == 'restaging' and agent.dock_fails == 0 and agent.status != RobotState.STUCK
 
 
-def test_inaccurate_dock_redocks_from_where_the_undock_left_it(agent):
-    agent.dock_failed('n4', 'inaccurate dock, re-docking')              # the undock already backed out to staging
-    assert agent.dock_state == 'retry' and agent.next_idx == 4
+class _Res:
+    def __init__(self, ok):
+        from action_msgs.msg import GoalStatus
+        self.status = GoalStatus.STATUS_SUCCEEDED if ok else GoalStatus.STATUS_ABORTED
+        self.result = type('R', (), {'success': ok, 'error_code': 0 if ok else 999})()
+
+
+def _undock(agent, ok):
+    """Finish the pending undock goal: succeeded, or aborted (back-out blocked)."""
+    agent.on_undock_done(type('F', (), {'result': lambda s: _Res(ok)})(), 'n4')
+
+
+@pytest.fixture
+def bay_agent(agent):
+    agent.undock_sent = []
+    agent.undock_client.send_goal_async = lambda g: agent.undock_sent.append(g) or \
+        type('F', (), {'add_done_callback': lambda s, cb: None})()
+    agent.dock_error = lambda: (0.001, 0.003, 0.05)                     # 3 mm, 2.9 deg: out of tolerance
+    agent.pose = (4.0, 0.0, 0.0)                                        # in the bay n4
+    return agent
+
+
+def test_inaccurate_dock_backs_out_then_docks_again(bay_agent):
+    a = bay_agent
+    a.check_dock('n4')
+    assert len(a.undock_sent) == 1 and a.dock_state == 'undocking' and a.dock_fails == 1
+    _undock(a, True)                                                    # backed out to the staging pose
+    assert a.dock_state == 'retry' and a.next_idx == 4 and a.status != RobotState.STUCK
+    a.dock_retry_at = 0.0
+    a.start_dock()
+    assert len(a.dock_sent) == 1 and a.dock_state == 'sending'
+
+
+def test_blocked_back_out_is_retried_not_counted(bay_agent):
+    """Fleet run 2026-10-03: the undock aborted on the robot queued behind; each abort counted as a docking attempt and
+    a 'dock' from inside the bay succeeded at once with the same error -> STUCK in 20 s."""
+    a = bay_agent
+    a.check_dock('n4')
+    for _ in range(5):
+        _undock(a, False)
+        assert a.dock_state == 'backout_wait' and a.dock_fails == 1 and a.status != RobotState.STUCK
+        a.dock_retry_at = 0.0
+        a.start_dock()                                                  # retries the undock, never a dock
+        assert a.dock_state == 'undocking' and a.dock_sent == []
+    assert len(a.undock_sent) == 6
+    a.backout_t0 = a.now() - a.backout_patience - 1.0                   # blocked for longer than the patience
+    _undock(a, False)
+    assert a.status == RobotState.STUCK and a.dock_state == 'gave_up'
+
+
+def test_operator_ack_in_the_bay_backs_out(bay_agent):
+    a = bay_agent
+    for _ in range(2):
+        a.check_dock('n4'); _undock(a, True)
+    a.check_dock('n4')
+    assert a.status == RobotState.STUCK and a.dock_state == 'gave_up' and len(a.undock_sent) == 2
+    a.on_operator(OperatorCommand(command=OperatorCommand.ACK_FAULT, target='amr_0', stamp=TimeMsg(sec=1)))
+    assert a.dock_state == 'undocking' and len(a.undock_sent) == 3 and a.dock_fails == 0   # not a forward path
