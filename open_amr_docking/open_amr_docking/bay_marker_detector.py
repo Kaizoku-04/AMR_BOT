@@ -67,14 +67,25 @@ class BayMarkerDetector(Node):
         self.create_subscription(LaserScan, 'scan', self.on_scan, QoSProfile(
             depth=1, history=HistoryPolicy.KEEP_LAST, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.found, self.missed, self.last_why = 0, 0, ''
+        # scans dropped before a fit (not counted in `missed`; a dock test lost the detection for > 1 s while this
+        # reported 0 misses, 2026-10-05): tracking without odometry at the scan time, marker outside the sector of
+        # the map-based prediction, no map -> lidar transform. Plus the longest gap between detections while
+        # tracking and the longest processing lag (receive - scan stamp).
+        self.skip = {'track_no_odom': 0, 'out_of_sector': 0, 'no_tf': 0}
+        self.max_gap, self.max_lag = 0.0, 0.0
         self.create_timer(10.0, self.report)
         self.get_logger().info(f'{len(self.markers)} markers: {", ".join(self.markers)}')
 
     def report(self):
         if self.found or self.missed:
+            skips = ', '.join(f'{k} {v}' for k, v in self.skip.items() if v)
             self.get_logger().info(f'markers: {self.found} detections, {self.missed} scans near one without'
-                                   + (f' (last: {self.last_why})' if self.missed else ''))
+                                   + (f' (last: {self.last_why})' if self.missed else '')
+                                   + f' | longest gap {self.max_gap:.2f} s, lag {self.max_lag * 1000:.0f} ms'
+                                   + (f' | skipped: {skips}' if skips else ''))
         self.found = self.missed = 0
+        self.skip = {k: 0 for k in self.skip}
+        self.max_gap = self.max_lag = 0.0
 
     def on_odom(self, m):
         p = m.pose.pose
@@ -106,15 +117,20 @@ class BayMarkerDetector(Node):
             except Exception:
                 return
         ts = scan.header.stamp.sec + scan.header.stamp.nanosec * 1e-9
+        self.max_lag = max(self.max_lag, self.get_clock().now().nanoseconds * 1e-9 - ts)
         best = self.track(ts)
         if best is not None:
             return self.fit(scan, ts, best)
+        last = getattr(self, 'last_det', None)
+        if last is not None and 0.0 <= ts - last[0] < 1.0:
+            self.skip['track_no_odom'] += 1                 # tracking, but no odometry at the scan time
         # the prediction only has to put the region of interest within ~0.3 m: the latest map -> lidar transform will
         # do (at the scan's own stamp the lookup mostly fails: AMCL publishes map -> odom slower than the lidar scans)
         try:
             t = self.tf.lookup_transform(scan.header.frame_id, self.map_frame, rclpy.time.Time())
         except Exception as e:
             self.tf_fail = getattr(self, 'tf_fail', 0) + 1
+            self.skip['no_tf'] += 1
             if self.tf_fail % 100 == 1:
                 self.get_logger().warn(f'no map -> {scan.header.frame_id} transform: {e}')
             return
@@ -128,6 +144,8 @@ class BayMarkerDetector(Node):
             if d < self.range and abs(math.atan2(ly, lx)) < self.fov and (best is None or d < best[0]):
                 best = (d, name, (lx, ly, myaw + tyaw), m)
         if best is None:
+            if last is not None and ts - last[0] < 5.0:     # was docking a moment ago: count it
+                self.skip['out_of_sector'] += 1
             return
         return self.fit(scan, ts, best)
 
@@ -177,6 +195,9 @@ class BayMarkerDetector(Node):
         co, so = math.cos(lyaw), math.sin(lyaw)
         x, y, yaw = lx + co * pose[0] - so * pose[1], ly + so * pose[0] + co * pose[1], pose[2] + lyaw
         self.found += 1
+        prev = getattr(self, 'last_det', None)
+        if prev is not None and ts - prev[0] < 5.0:
+            self.max_gap = max(self.max_gap, ts - prev[0])
         self.last_det = (ts, x, y, yaw, name)
         msg = PoseStamped()
         msg.header.stamp, msg.header.frame_id = scan.header.stamp, self.out_frame

@@ -38,23 +38,23 @@ def segments(pts, tol=0.008, min_pts=6, max_gap=0.04, iters=60, rng=None):
         for _ in range(iters):
             a, b = rng.choice(idx, 2, replace=False)
             d = pts[b] - pts[a]
-            n = np.linalg.norm(d)
+            n = math.hypot(d[0], d[1])
             if n < 0.02:
                 continue
             normal = np.array([-d[1], d[0]]) / n
             inl = idx[np.abs((pts[idx] - pts[a]) @ normal) < tol]
             if len(inl) < min_pts:
                 continue
-            # longest contiguous run (consecutive in scan order, neighbours closer than max_gap)
-            runs, cur = [], [inl[0]]
-            for i, j in zip(inl, inl[1:]):
-                if np.linalg.norm(pts[j] - pts[i]) <= max_gap:
-                    cur.append(j)
-                else:
-                    runs.append(cur)
-                    cur = [j]
-            runs.append(cur)
-            run = max(runs, key=len)
+            # longest contiguous run (consecutive in scan order, neighbours closer than max_gap; the first one on a
+            # tie). Vectorized: the per-point Python loop took ~190 ms per scan with the marker 0.25 m from a
+            # nanoScan3 (~470 points in the ROI) — the detector then published at ~5 Hz with gaps up to 0.93 s
+            # against the docking server's 1 s detection timeout (dock test 2026-10-05)
+            d = pts[inl[1:]] - pts[inl[:-1]]
+            cut = np.flatnonzero(np.sqrt((d * d).sum(axis=1)) > max_gap) + 1
+            starts = np.concatenate(([0], cut))
+            ends = np.concatenate((cut, [len(inl)]))
+            k = int(np.argmax(ends - starts))
+            run = inl[starts[k]:ends[k]]
             if len(run) >= min_pts and (best is None or len(run) > len(best)):
                 best = run
         if best is None:
