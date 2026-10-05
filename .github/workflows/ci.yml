@@ -37,7 +37,15 @@ jobs:
           xacro "$XACRO" > /tmp/open_amr.urdf && check_urdf /tmp/open_amr.urdf
           xacro "$XACRO" use_gazebo:=true prefix:=amr_1_ > /tmp/amr_1.urdf && check_urdf /tmp/amr_1.urdf
 
-      - name: Tests (lint is informational until the codebase is lint-clean)
+      - name: Unit tests (blocking — swarm agent / WMS, docking marker fit, arm cell geometry)
+        run: |
+          source ws/install/setup.bash
+          cd ws
+          colcon test --packages-select open_amr_swarm --event-handlers console_direct-
+          colcon test-result --verbose
+          python3 -m pytest -q src/open_amr/open_amr_docking/test src/open_amr/open_amr_arm_cell/test
+
+      - name: All package tests incl. lint (informational until the codebase is lint-clean)
         continue-on-error: true
         run: |
           source /opt/ros/jazzy/setup.bash

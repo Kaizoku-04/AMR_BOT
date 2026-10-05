@@ -1,0 +1,13 @@
+# Who reviews what (openamr-swarm notes/Team.md). Later lines win.
+
+# default: Mohannad (robot & physical layer)
+*                                               @Kaizoku-04
+
+# shared: the interface between the fleet and the WMS, the team rules — both review
+/open_amr_msgs/                                 @Kaizoku-04 @xlaithx
+/CLAUDE.md                                      @Kaizoku-04 @xlaithx
+/CONTRIBUTING.md                                @Kaizoku-04 @xlaithx
+/.github/                                       @Kaizoku-04 @xlaithx
+
+# Laith: warehouse management & operations (the WMS stand-in today; his own packages as they appear)
+/open_amr_swarm/open_amr_swarm/mission_generator.py   @xlaithx

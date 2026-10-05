@@ -15,6 +15,26 @@
 
 ---
 
+## OpenAMR Swarm — what this repository is now
+
+This repo holds the ROS 2 packages of **OpenAMR Swarm**: a **decentralized fleet** of these robots running a
+warehouse's box flow (inbound, storage, outbound, charging, faults) with UR robot-arm cells, simulated in **NVIDIA
+Isaac Sim 6.0.1** with ROS 2 Jazzy / Nav2. Documentation, roadmap and team rules live in the companion repo
+**`Kaizoku-04/openamr-swarm`** (start at its `notes/Onboarding.md`). Team: Mohannad ([@Kaizoku-04](https://github.com/Kaizoku-04))
+— robot & physical layer; Laith ([@xlaithx](https://github.com/xlaithx)) — warehouse management & operations.
+
+| Package | What it adds for the fleet |
+|---|---|
+| `open_amr_swarm` | `swarm_agent` (one per robot: heartbeat, task auction, lane-graph reservations, deadlocks, liveness, charging), `station_agent` (one per arm cell), `battery_sim`, `mission_generator` (WMS stand-in) |
+| `open_amr_msgs` | the fleet/WMS interface: `Task`, `Claim`, `Bid`, `RobotState`, `StationState`, `Transfer`, `Inventory`, `OperatorCommand`; arm cell `ArmCellState`, `ArmTransfer` |
+| `open_amr_arm_cell` | UR cell controller (MoveIt 2 + Pilz, vacuum gripper, carton locator, bay interlock, faults) |
+| `open_amr_docking` | `bay_marker_detector`: lidar V-marker detection for Nav2's docking server at the arm bays |
+| `open_amr_isaac_hardware` | ros2_control hardware interface to the Isaac Sim drive bridge |
+
+Clone to **`~/ros2_lab/open_amr_ws/src/open_amr`** (the companion repo's scripts depend on that path). Contributing:
+[`CONTRIBUTING.md`](CONTRIBUTING.md). The sections below describe the original single-robot platform (Gazebo), which
+still builds and is used for single-robot checks.
+
 ## Overview
 
 **Open AMR** is a modular, ROS 2-based autonomous mobile robot designed for indoor navigation, mapping, and docking. It features a differential-drive platform with LiDAR, IMU, and RGBD camera sensors, running the full Nav2 navigation stack with SLAM, EKF-fused localization, and AprilTag-based autonomous docking.
@@ -43,10 +63,12 @@ open_amr_ws/src/open_amr/
 ├── open_amr_bringup/            # Top-level launch files & shell scripts
 ├── open_amr_localization/       # EKF configuration & launch
 ├── open_amr_navigation/         # Nav2 params, maps, nav scripts, cmd_vel relay
-├── open_amr_docking/            # AprilTag dock detection & pose publisher
-├── open_amr_msgs/               # Custom action/service definitions
-├── open_amr_system_tests/       # Test nodes (square drive, parameter demo, etc.)
-└── diff_drive_controller/       # Custom diff drive controller (ros2_control)
+├── open_amr_docking/            # Bay V-marker detector (fleet) + AprilTag dock pose publisher (original)
+├── open_amr_msgs/               # Fleet/WMS interface messages + original action/service definitions
+├── open_amr_swarm/              # Fleet: swarm_agent, station_agent, battery_sim, mission_generator (WMS stand-in)
+├── open_amr_arm_cell/           # UR arm cell controller (MoveIt 2 + Pilz, vacuum, locator, interlocks)
+├── open_amr_isaac_hardware/     # ros2_control hardware interface to the Isaac Sim drive bridge
+└── open_amr_system_tests/       # Test nodes (square drive, parameter demo, etc.)
 ```
 
 ### System Diagram
@@ -352,27 +374,22 @@ open_amr/
 │   ├── launch/                        # Docking launch file
 │   └── src/                           # Dock pose publisher C++ node
 ├── open_amr_msgs/
-│   ├── action/                        # TimedRotation.action
+│   ├── msg/                           # Fleet/WMS interface (Task, Claim, RobotState, ...), ArmCellState
+│   ├── action/                        # ArmTransfer.action, TimedRotation.action
 │   └── srv/                           # SetCleaningState.srv
-├── open_amr_system_tests/
-│   ├── config/                        # Test parameter files
-│   ├── launch/                        # Test launch files
-│   └── src/                           # Test C++ nodes
-└── diff_drive_controller/             # Custom ros2_control plugin
-    ├── include/                        # Header files
-    ├── src/                            # Implementation
-    └── test/                           # Unit tests
+├── open_amr_swarm/                    # Fleet agents + WMS stand-in (Python), launch/, test/
+├── open_amr_arm_cell/                 # Arm cell controller (Python), config/, launch/, test/
+├── open_amr_isaac_hardware/           # ros2_control hardware plugin (C++)
+└── open_amr_system_tests/
+    ├── config/                        # Test parameter files
+    ├── launch/                        # Test launch files
+    └── src/                           # Test C++ nodes
 ```
 
 ## Contributing
 
-Contributions are welcome! Please follow these guidelines:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Commit your changes (`git commit -m 'Add my feature'`)
-4. Push to the branch (`git push origin feature/my-feature`)
-5. Open a Pull Request
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) — branch `<person>/<topic>`, pull request, review by the owner
+(`.github/CODEOWNERS`), squash-merge; the full workflow is in the companion repo `Kaizoku-04/openamr-swarm`.
 
 ### Development Setup
 

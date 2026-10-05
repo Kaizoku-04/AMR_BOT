@@ -4,3 +4,7 @@ open_amr_analysis.md
 .stversions/
 __pycache__/
 *.pyc
+
+# Personal Claude Code context (each developer's own machine)
+CLAUDE.local.md
+.claude/settings.local.json
