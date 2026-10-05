@@ -73,6 +73,10 @@ class BayMarkerDetector(Node):
         # tracking and the longest processing lag (receive - scan stamp).
         self.skip = {'track_no_odom': 0, 'out_of_sector': 0, 'no_tf': 0}
         self.max_gap, self.max_lag = 0.0, 0.0
+        # scan callbacks themselves: how many ran and the longest pause between two (sim time) — the docking server
+        # declared a detection lost (> 1 s) while every processed scan had produced a detection, i.e. no callback ran
+        # (2026-10-05): scans not arriving, or this node's executor starved
+        self.scans, self.max_cb_gap, self.last_cb = 0, 0.0, None
         self.create_timer(10.0, self.report)
         self.get_logger().info(f'{len(self.markers)} markers: {", ".join(self.markers)}')
 
@@ -82,10 +86,12 @@ class BayMarkerDetector(Node):
             self.get_logger().info(f'markers: {self.found} detections, {self.missed} scans near one without'
                                    + (f' (last: {self.last_why})' if self.missed else '')
                                    + f' | longest gap {self.max_gap:.2f} s, lag {self.max_lag * 1000:.0f} ms'
+                                   + f' | {self.scans} scans, longest pause between scans {self.max_cb_gap:.2f} s'
                                    + (f' | skipped: {skips}' if skips else ''))
         self.found = self.missed = 0
         self.skip = {k: 0 for k in self.skip}
         self.max_gap = self.max_lag = 0.0
+        self.scans, self.max_cb_gap = 0, 0.0
 
     def on_odom(self, m):
         p = m.pose.pose
@@ -117,7 +123,12 @@ class BayMarkerDetector(Node):
             except Exception:
                 return
         ts = scan.header.stamp.sec + scan.header.stamp.nanosec * 1e-9
-        self.max_lag = max(self.max_lag, self.get_clock().now().nanoseconds * 1e-9 - ts)
+        now = self.get_clock().now().nanoseconds * 1e-9
+        self.max_lag = max(self.max_lag, now - ts)
+        self.scans += 1
+        if self.last_cb is not None:
+            self.max_cb_gap = max(self.max_cb_gap, now - self.last_cb)
+        self.last_cb = now
         best = self.track(ts)
         if best is not None:
             return self.fit(scan, ts, best)
