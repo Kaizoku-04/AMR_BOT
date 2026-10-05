@@ -95,3 +95,16 @@ def test_marker_leaves_room_for_a_robot_turning_in_the_bay():
     d = c.marker_to_bay()
     assert (mx - d * math.cos(math.radians(myaw)), my - d * math.sin(math.radians(myaw))) == \
         (pytest.approx(bx), pytest.approx(by))
+
+
+def test_deck_shift_keeps_a_located_carton_between_the_rails():
+    c = Cell((0.0, 0.0, 0.0))
+    p = c.p
+    assert c.deck_shift(0.0) == 0.0 and c.deck_shift(0.010) == 0.0 and c.deck_shift(-0.010) == 0.0
+    for dx in (0.024, -0.024, 0.012, 0.05):     # 0.024: the outbound cell's carton in the 2026-10-03 fleet run
+        shift = c.deck_shift(dx)
+        (r0x, *_), (r1x, *_) = c.rails_cell(shift)
+        back, front = r0x + 0.005, r1x - 0.005  # rails' inner faces
+        lo, hi = p.deck_distance + dx - p.box[0] / 2, p.deck_distance + dx + p.box[0] / 2
+        assert back + 0.003 - 1e-9 <= lo and hi <= front - 0.003 + 1e-9
+        assert abs(shift) <= abs(dx)            # the robot is never drawn further off than its carton

@@ -126,13 +126,22 @@ class Cell:
         sx, sy = (d + 2 * self.p.zone_margin for d in self.p.amr_footprint)
         return self.p.deck_distance, 0.0, sx, sy, self.zone_top()
 
-    def rails_cell(self):
+    def rails_cell(self, shift=0.0):
         """The deck's side rails, cell frame: [(centre x, centre y, centre z, size x, size y, size z)]. The docked AMR
-        faces the arm, so its along-axis is the cell x axis."""
+        faces the arm, so its along-axis is the cell x axis; shift = the deck's along-axis offset (deck_shift)."""
         p = self.p
         off = p.box[0] / 2 + p.rail_clearance + 0.005             # rails 10 mm thick, inner face at the clearance
-        return [(p.deck_distance + s * off, 0.0, p.deck_top + p.rail_height / 2, 0.01, p.deck_size[1], p.rail_height)
-                for s in (-1, 1)]
+        return [(p.deck_distance + shift + s * off, 0.0, p.deck_top + p.rail_height / 2, 0.01, p.deck_size[1],
+                 p.rail_height) for s in (-1, 1)]
+
+    def deck_shift(self, carton_dx, gap=0.003):
+        """Along-axis offset of the docked AMR's deck implied by a carton located carton_dx off the deck centre: the
+        rails hold it within rail_clearance, so a carton further out (slid against a rail when the robot braked, on a
+        robot docked a few mm long or short) means the deck is shifted at least the rest. Smallest such shift that
+        leaves `gap` between carton and rail (fleet run 2026-10-03: carton +24 mm, robot ~9 mm long -> the lift
+        'collided' with a rail drawn at the nominal deck)."""
+        c = self.p.rail_clearance - gap
+        return carton_dx - max(-c, min(c, carton_dx))
 
     def zone_top(self):
         return self.p.deck_top + self.p.box[2] + self.p.zone_clearance

@@ -133,6 +133,9 @@ class CellMotion:
         self.stock, self.docked, self.deck_box = [0, 0], False, False
         self.seen = {}                           # (pallet, slot) -> detected carton centre (x, y, z, yaw): the scene
                                                  # uses these instead of the pattern (cleared with every new stock)
+        self.deck_seen = None                    # located offset (dx, dy, dyaw) of the carton on the docked robot's
+                                                 # deck: the scene draws it, the deck and its rails there (cleared when
+                                                 # the robot leaves)
         self.cycle = None                        # (depal, pallet, slot, taught entry) of the program being run
         self.steps, self.pc = [], 0              # its steps and the next one to run
         self.before_release = None               # diagnostics hook: called with the place name just before vacuum off
@@ -150,6 +153,8 @@ class CellMotion:
             self.seen = {}
         self.stock = list(stock) if stock is not None else self.stock
         self.docked = self.docked if docked is None else docked
+        if fresh or not self.docked:
+            self.deck_seen = None
         self.deck_box = self.deck_box if deck_box is None else deck_box
         objs = [box_object('floor', (6.0, 6.0, 0.02), (0.0, 0.0, -0.011))]
         for i in (0, 1):
@@ -161,7 +166,7 @@ class CellMotion:
                 cx, cy, cz, cyaw = self.seen.get((i, k), (x, y, z - self.p.box[2] / 2, byaw))
                 objs.append(box_object(f'box_{i}_{k}', self.p.box, (cx, cy, cz), cyaw)
                             if k < self.stock[i] else box_object(f'box_{i}_{k}', (), (), op=CollisionObject.REMOVE))
-        self._apply(objs + zone_objects(self.cell, self.docked, self.deck_box))
+        self._apply(objs + zone_objects(self.cell, self.docked, self.deck_box, self.deck_seen))
 
     def clear_bay(self):
         """Neither robot nor keep-out volume (fault recovery, after a person has checked the bay)."""
@@ -330,6 +335,9 @@ class CellMotion:
             raise CellFault(f'{e} at {where}')
         if step.locate[0] == 'pallet':
             self._scene_from_detections(pallet)
+        else:
+            self.deck_seen = off
+            self.set_scene()
         if any(abs(v) > 1e-4 for v in off):
             self.log(f'carton at {where} located {off[0] * 1000:+.0f} / {off[1] * 1000:+.0f} mm, {off[2]:+.1f} deg '
                      'off the pattern: grip corrected')

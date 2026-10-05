@@ -14,6 +14,9 @@ reset, removing a carton) and the fault injector (simulator hooks), and checks e
   drop        vacuum lost while carrying: arm stops, fault 'vacuum lost', carton lost; operator removes it, reset
   estop       protective stop during a move: arm stops, cell STOPPED, fault; a goal is rejected; reset refused until
               the stop is cleared
+  deckshift   a robot docked ~10 mm long with its carton slid against the deck's front rail (fleet run 2026-10-03:
+              carton +24 mm off the pattern, every lift off the deck 'collided' with the rail drawn at the nominal deck):
+              the carton pushed 24 mm along the robot is located, lifted between the rails and stacked
   station     the real station_agent (cell mode, receiving) serves 3 robot visits through the cell: pre-picks, serves
               at 'deck_clear', the robot waits only for the hand-over
   safety      the cell's safety layer (simulated safety hardware, sim/scripts/cell_safety.py) catches what software
@@ -352,6 +355,25 @@ class Run:
             self.check(b.wait_cell([ArmCellState.READY], 30), 'cell READY after the reset')
             self.cycle('locate60')
 
+    def deckshift(self):
+        print('== deckshift: carton on the deck 24 mm off the pattern along the robot (slid against its rail)', flush=True)
+        b = self.b
+        ok, k, r = self.prepare()
+        if not self.check(ok, f'deckshift: pre-pick pallet 0 slot {k}'):
+            return
+        b.robot('amr_t', 'docked', 'deckshift_in')
+        acc, r, ph = self.depalletize(k, task='deckshift_in')
+        if not self.check(r is not None and r.success and r.carton == R.CARTON_DECK, f'deckshift: carton {k} onto the deck'):
+            return
+        ax, ay, _ = b.cell.to_world(0.0, 0.0)
+        dx, dy, _ = b.cell.to_world(1.0, 0.0)          # the cell x axis = the docked robot's along-axis
+        b.carton_cmd(f'nudge {k} {0.024 * (dx - ax):.4f} {0.024 * (dy - ay):.4f} 0.0')
+        b.sleep(1.0)
+        acc, r, ph = self.palletize(k, task='deckshift_out')
+        self.check(r is not None and r.success and r.carton == R.CARTON_PALLET,
+                   f'deckshift: carton {k} lifted off the deck between the rails onto pallet 1' if r is None or r.success
+                   else f'deckshift: palletize failed: {r.fault}')
+
     def normal(self, n):
         print(f'== normal: {n} cycles', flush=True)
         for c in range(n):
@@ -599,7 +621,7 @@ def main(argv=None):
     ap.add_argument('--arm-id', default='arm_receiving')
     ap.add_argument('--normal', type=int, default=4)
     ap.add_argument('--visits', type=int, default=3)
-    ap.add_argument('--scenarios', default='locate,normal,interlock,moved,drop,estop,safety,station')
+    ap.add_argument('--scenarios', default='locate,deckshift,normal,interlock,moved,drop,estop,safety,station')
     root = os.environ.get('OPENAMR_ROOT', os.path.expanduser('~/Robotics/OpenAMR'))
     ap.add_argument('--layout', default=os.path.join(root, 'sim', 'configs', 'warehouse_layout.yaml'))
     ap.add_argument('--graph', default=os.path.join(root, 'sim', 'worlds', 'warehouse_mission_graph.geojson'))
