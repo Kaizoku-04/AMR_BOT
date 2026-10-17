@@ -5,6 +5,11 @@ simulated in Isaac Sim. The project's documentation, rules and roadmap live in t
 **`Kaizoku-04/openamr-swarm`** (usually `~/Robotics/OpenAMR`; `$OPENAMR_ROOT` after `source
 $OPENAMR_ROOT/tools/setup/openamr_env.sh`). Read its `CLAUDE.md` first — the rules there apply here too — then
 `notes/Team.md` (ownership) and, for anything touching tasks or the WMS, `notes/WMS Interface.md`.
+**Read the companion repo's knowledge vault before reading code here**: `vault/README.md` and
+`vault/00-Overview/Status.md`, then the subsystem note (`vault/02-Architecture/`) and this repo's generated code map
+(`vault/03-Code-Map/open_amr_*.md`: every file, function with line number, ROS parameter and launch argument). After
+changing code here, regenerate it in the companion repo (`python3 tools/sync_vault.py`) and update the vault notes
+the change touches (`vault/Principles.md` "Records").
 Machine-specific context of the developer you are working for, if any: `CLAUDE.local.md` here (git-ignored).
 
 ## Where this repo lives
