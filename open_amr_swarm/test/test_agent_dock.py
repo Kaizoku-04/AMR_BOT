@@ -1,6 +1,7 @@
 """Docking failures: back to the staging node and dock again; after 3 attempts STUCK until an operator acknowledges
 (fleet run 2026-10-03: a robot retried 79 times from a pose 1.8 m off the bay, the marker out of view). An inaccurate
-dock backs out of the bay (undock) and docks again; a blocked back-out is retried, not counted."""
+dock backs out of the bay (undock) and docks again; a blocked back-out is retried, not counted. A back-out always aims at
+the bay's staging node: from partway out it backs up the rest instead of undocking (fleet run 2026-10-19, chain 33)."""
 import json
 
 import pytest
@@ -8,7 +9,7 @@ import rclpy
 from builtin_interfaces.msg import Time as TimeMsg
 
 from open_amr_msgs.msg import OperatorCommand, RobotState
-from open_amr_swarm.agent import SwarmAgent
+from open_amr_swarm.agent import SwarmAgent, backout_plan
 
 
 @pytest.fixture
@@ -70,6 +71,9 @@ def bay_agent(agent):
     agent.undock_sent = []
     agent.undock_client.send_goal_async = lambda g: agent.undock_sent.append(g) or \
         type('F', (), {'add_done_callback': lambda s, cb: None})()
+    agent.backup_sent = []
+    agent.backup_client.send_goal_async = lambda g: agent.backup_sent.append(g) or \
+        type('F', (), {'add_done_callback': lambda s, cb: None})()
     agent.dock_error = lambda: (0.001, 0.003, 0.05)                     # 3 mm, 2.9 deg: out of tolerance
     agent.pose = (4.0, 0.0, 0.0)                                        # in the bay n4
     return agent
@@ -111,3 +115,51 @@ def test_operator_ack_in_the_bay_backs_out(bay_agent):
     assert a.status == RobotState.STUCK and a.dock_state == 'gave_up' and len(a.undock_sent) == 2
     a.on_operator(OperatorCommand(command=OperatorCommand.ACK_FAULT, target='amr_0', stamp=TimeMsg(sec=1)))
     assert a.dock_state == 'undocking' and len(a.undock_sent) == 3 and a.dock_fails == 0   # not a forward path
+
+
+def test_backout_plan_aims_at_the_staging_node():
+    bay, staging = (4.0, 0.0), (3.0, 0.0)
+    assert backout_plan((4.0, 0.0, 0.0), bay, staging, 0.12, 0.05) == ('undock', 1.0)       # in the bay
+    how, d = backout_plan((3.7, 0.02, 0.0), bay, staging, 0.12, 0.05)                      # 0.3 m out
+    assert how == 'backup' and d == pytest.approx(0.7)
+    assert backout_plan((3.08, 0.0, 0.0), bay, staging, 0.12, 0.05) == ('done', 0.0)       # at staging
+    how, d = backout_plan((-13.8, 7.29, 3.14), (-14.0, 7.0), (-13.0, 7.0), 0.12, 0.05)       # chain 33, amr_1
+    assert how == 'backup' and d == pytest.approx(0.8)
+
+
+def test_dock_aborted_short_of_the_bay_backs_up_the_rest(bay_agent):
+    """Chain 33, amr_1: the dock aborted 0.2 m short of receiving_bay (a late TF sample); the undock from there aimed
+    1.2 m out, into amr_0's nose at queue_1 (13 attempts, 905 'Collision detected', STUCK)."""
+    a = bay_agent
+    a.pose = (3.8, 0.0, 0.0)
+    a.dock_failed('n4', 'error 905')
+    assert a.undock_sent == [] and len(a.backup_sent) == 1 and a.dock_state == 'undocking'
+    g = a.backup_sent[0]
+    assert g.target.x == pytest.approx(0.8) and g.speed == pytest.approx(a.backout_speed)
+    _undock(a, True)
+    assert a.dock_state == 'retry' and a.status != RobotState.STUCK
+
+
+def test_retried_back_out_never_aims_further_out(bay_agent):
+    """Chain 33, amr_0: a back-out stopped after ~0.55 m (a late TF sample); each retry undocked 1.0 m from there and
+    hit the robot at queue_1 at the same pose for 60 s. The retry backs up the 0.45 m left instead."""
+    a = bay_agent
+    a.check_dock('n4')
+    assert len(a.undock_sent) == 1
+    a.pose = (3.45, 0.0, 0.0)                                           # stopped partway
+    _undock(a, False)
+    assert a.dock_state == 'backout_wait'
+    a.dock_retry_at = 0.0
+    a.start_dock()
+    assert len(a.undock_sent) == 1 and len(a.backup_sent) == 1
+    assert a.backup_sent[0].target.x == pytest.approx(0.45)
+    a.pose = (3.0, 0.0, 0.0)
+    _undock(a, True)
+    assert a.dock_state == 'retry'
+
+
+def test_back_out_from_the_staging_node_docks_again_at_once(bay_agent):
+    a = bay_agent
+    a.pose = (3.05, 0.0, 0.0)
+    a.back_out('n4', 'operator acknowledged')
+    assert a.undock_sent == [] and a.backup_sent == [] and a.dock_state == 'retry'

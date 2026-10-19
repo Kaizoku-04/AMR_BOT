@@ -151,7 +151,7 @@ def zone_objects(cell, docked, deck_box=False, deck_off=None):
                 box_object('deck_zone', (sx, sy, top), (x, y, top / 2))]
     (dx, dy, dz), dyaw = cell.deck_cell()
     ox, oy, oyaw = deck_off or (0.0, 0.0, 0.0)
-    shift = cell.deck_shift(ox)
+    shift = cell.deck_shift(ox, dyaw_deg=oyaw)
     rails = [box_object(f'deck_rail_{i}', r[3:], r[:3]) for i, r in enumerate(cell.rails_cell(shift))]
     return [rm('deck_zone'), box_object('amr', AMR, (p.deck_distance + shift, 0.0, AMR[2] / 2))] + rails + [
             box_object('deck_box', p.box, (dx + ox, dy + oy, dz - p.box[2] / 2), dyaw + oyaw) if deck_box

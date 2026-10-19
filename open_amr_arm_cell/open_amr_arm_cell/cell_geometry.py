@@ -134,13 +134,18 @@ class Cell:
         return [(p.deck_distance + shift + s * off, 0.0, p.deck_top + p.rail_height / 2, 0.01, p.deck_size[1],
                  p.rail_height) for s in (-1, 1)]
 
-    def deck_shift(self, carton_dx, gap=0.003):
+    def deck_shift(self, carton_dx, gap=0.003, dyaw_deg=0.0):
         """Along-axis offset of the docked AMR's deck implied by a carton located carton_dx off the deck centre: the
         rails hold it within rail_clearance, so a carton further out (slid against a rail when the robot braked, on a
         robot docked a few mm long or short) means the deck is shifted at least the rest. Smallest such shift that
         leaves `gap` between carton and rail (fleet run 2026-10-03: carton +24 mm, robot ~9 mm long -> the lift
-        'collided' with a rail drawn at the nominal deck)."""
-        c = self.p.rail_clearance - gap
+        'collided' with a rail drawn at the nominal deck). A carton located dyaw_deg off reaches further along the axis
+        at its corners (half-extent bx/2 cos + by/2 sin): fleet runs 2026-10-19, +13..18 mm at 1.0..1.2 deg left the
+        corners 0.03..0.63 mm inside a rail drawn for a straight carton, and every lift from the deck was rejected."""
+        bx, by = self.p.box[0] / 2, self.p.box[1] / 2
+        a = math.radians(abs(dyaw_deg))
+        extra = bx * math.cos(a) + by * math.sin(a) - bx
+        c = max(0.0, self.p.rail_clearance - gap - extra)
         return carton_dx - max(-c, min(c, carton_dx))
 
     def zone_top(self):

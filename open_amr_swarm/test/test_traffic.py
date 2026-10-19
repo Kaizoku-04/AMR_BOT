@@ -105,3 +105,49 @@ def test_no_far_node_beyond_horizon_plus_overreach(tmp_path):
     assert res == [0, 1] and not blocked
     res, _ = plan_reservations(g, [0, 1, 2], 2, Peer('amr_0', 0.6, 0.0), [], held=[], p=P)
     assert 2 in res                                  # once it's the very next node it is held, however far
+
+
+@pytest.fixture
+def dock(tmp_path):
+    """A bay at x=0 (kind bay) with its queue lane behind it, nodes 1 m apart: q2 (-3) -> q1 (-2) -> q0 (-1) -> bay."""
+    nodes = [(0, 'bay', 0.0, 'bay'), (1, 'q0', -1.0, 'queue'), (2, 'q1', -2.0, 'queue'), (3, 'q2', -3.0, 'queue')]
+    feats = [{'type': 'Feature', 'properties': {'id': i, 'metadata': {'name': nm, 'kind': k}},
+              'geometry': {'type': 'Point', 'coordinates': [x, 0.0]}} for i, nm, x, k in nodes]
+    feats += [{'type': 'Feature', 'properties': {'id': 100 + a, 'startid': a, 'endid': b},
+               'geometry': {'type': 'MultiLineString', 'coordinates': [[[-a, 0], [-b, 0]]]}}
+              for a, b in ((3, 2), (2, 1), (1, 0))]
+    p = tmp_path / 'dock.geojson'
+    p.write_text(json.dumps({'features': feats}))
+    return LaneGraph(str(p))
+
+
+P6 = TrafficParams(horizon_m=4.0, max_nodes=5, turn_clearance=1.5)
+DOCK_ROUTE = [3, 2, 1, 0]
+
+
+def test_conflicts_pair_turn_nodes_with_close_neighbours(dock):
+    assert dock.conflicts(0, 1.5) == [1]             # bay <-> q0 (1.0 m); q1 is 2.0 m away
+    assert dock.conflicts(1, 1.5) == [0]
+    assert dock.conflicts(2, 1.5) == []              # queue nodes 1 m apart don't conflict: neither turns in place
+
+
+def test_robot_in_bay_keeps_the_next_one_out_of_its_turning_room(dock):
+    """Fleet run 2026-10-19: the bay robot could not turn out while the next robot stood 1.0 m behind it."""
+    docked = Peer('amr_2', 0.0, 0.0, reserved=[0])
+    me = Peer('amr_0', -2.0, 0.0)                    # standing on q1
+    res, blocked = plan_reservations(dock, DOCK_ROUTE, 2, me, [docked], held=[2], p=P6)
+    assert res == [2] and blocked                    # waits on q1, q0 stays free
+    res, blocked = plan_reservations(dock, DOCK_ROUTE, 2, me, [docked], held=[2], p=TrafficParams(turn_clearance=0.0))
+    assert 1 in res                                  # without rule 6 it moved up to q0 (the deadlock)
+
+
+def test_turning_room_frees_once_the_bay_is_released(dock):
+    left = Peer('amr_2', 0.0, 2.2, reserved=[9])     # gone north to its exit node, bay released
+    res, blocked = plan_reservations(dock, DOCK_ROUTE, 2, Peer('amr_0', -2.0, 0.0), [left], held=[2], p=P6)
+    assert res == [2, 1, 0] and not blocked
+
+
+def test_docking_robot_holds_staging_and_bay_together(dock):
+    """Rule 6 only counts peers: the robot that docks holds q0 (its staging node) and the bay at once."""
+    res, blocked = plan_reservations(dock, DOCK_ROUTE, 3, Peer('amr_0', -1.0, 0.0), [], held=[1], p=P6)
+    assert res == [1, 0] and not blocked
