@@ -108,3 +108,27 @@ def test_deck_shift_keeps_a_located_carton_between_the_rails():
         lo, hi = p.deck_distance + dx - p.box[0] / 2, p.deck_distance + dx + p.box[0] / 2
         assert back + 0.003 - 1e-9 <= lo and hi <= front - 0.003 + 1e-9
         assert abs(shift) <= abs(dx)            # the robot is never drawn further off than its carton
+
+
+def corner_gap(c, dx, dyaw_deg, shift):
+    """Smallest gap between a carton located dx / dyaw_deg off the deck centre and the rails drawn for `shift`."""
+    p = c.p
+    (r0x, *_), (r1x, *_) = c.rails_cell(shift)
+    a = math.radians(abs(dyaw_deg))
+    h = p.box[0] / 2 * math.cos(a) + p.box[1] / 2 * math.sin(a)
+    centre = p.deck_distance + dx
+    return min((centre - h) - (r0x + 0.005), (r1x - 0.005) - (centre + h))
+
+
+@pytest.mark.parametrize('dx, dyaw', [(0.018, 1.0), (0.013, -1.1), (0.018, 1.2)])   # the faults of 2026-10-19
+def test_deck_shift_counts_the_cartons_yaw(dx, dyaw):
+    c = Cell((0.0, 0.0, 0.0))
+    assert corner_gap(c, dx, dyaw, c.deck_shift(dx)) < 0.0                         # yaw-blind: corner in the rail
+    assert corner_gap(c, dx, dyaw, c.deck_shift(dx, dyaw_deg=dyaw)) >= 0.003 - 1e-9
+
+
+def test_deck_shift_with_yaw_keeps_the_straight_cases():
+    c = Cell((0.0, 0.0, 0.0))
+    for dx in (0.0, 0.010, -0.024, 0.05):
+        assert c.deck_shift(dx, dyaw_deg=0.0) == c.deck_shift(dx)
+    assert c.deck_shift(0.0, dyaw_deg=1.2) == 0.0          # centred and slightly turned: still fits, nothing moves
