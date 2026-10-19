@@ -896,8 +896,9 @@ class SwarmAgent(Node):
             # the bay zone = bay + its staging node, held until the dock is accurate: a re-dock backs out to the
             # staging pose, and with the next robot already waiting there (0.19 m behind the docked robot's tail) the
             # undock aborted on a collision, three times in 20 s -> STUCK, and after the operator's ACK the bay and its
-            # queue deadlocked for the rest of the shift (fleet run 2026-10-03). Released once docked accurately, so
-            # the next robot still pre-stages while the arm works.
+            # queue deadlocked for the rest of the shift (fleet run 2026-10-03). Released once docked accurately; the
+            # next robot still can't pre-stage there while the bay is held (traffic rule 6: the staging node is inside
+            # the bay's turning room, fleet run 2026-10-19), so it waits one queue node further back.
             self.reserved.insert(0, self.route[-2])
         if not self.has_quorum:
             # isolated: stop at the next node I hold (peers, which can't hear me, keep seeing my last reservation)

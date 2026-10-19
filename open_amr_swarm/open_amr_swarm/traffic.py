@@ -16,6 +16,10 @@ Rules, identical on every robot so both sides of a conflict reach the same decis
      controller cruises instead of stopping at every node, but never a node beyond horizon + `overreach_m` unless
      it is the very next one; release a node once `release_dist` past it.
   5. No new nodes on a stale view (`extend=False`, liveness.py rule 3): keep what is held, add nothing.
+  6. Turning room: a node closer than `turn_clearance` to a bay/charger/parking node (LaneGraph.conflicts) counts
+     as held while a peer holds the other one: a robot turning out of a bay sweeps its corners around it, and a
+     robot queued 1.0 m behind it was inside that circle (collision_monitor held the turn: deadlock, fleet run
+     2026-10-19; tools/tests/bay_exit_test.py). So the next robot waits one queue node further back.
 """
 import math
 from dataclasses import dataclass, field
@@ -38,6 +42,8 @@ class TrafficParams:
     release_dist: float = 1.0     # drop a passed node once this far beyond it
     overreach_m: float = 2.0      # never hold a node further than horizon + this, except the very next one
     occupy_dist: float = 0.9      # a robot standing this close to a node blocks it even without a reservation
+    turn_clearance: float = 1.5   # rule 6 (0 = off): bay exit with a robot behind fails at 1.2 m, passes at 1.3 m
+                                  # (collision_monitor FootprintApproach + rear ultrasonics, chain 29 2026-10-19)
     age_bucket_s: float = 10.0
 
 
@@ -77,7 +83,8 @@ def plan_reservations(graph, route, next_idx, me, peers, held, p: TrafficParams 
         prev = n
         if dist_ahead > p.horizon_m + p.overreach_m and any(m not in route[:next_idx] for m in reserved):
             break      # a stuck robot 6.6 m short of a node held it and blocked the parking exit (2026-09-25)
-        holders = [q for q in peers if n in q.reserved]
+        cf = graph.conflicts(n, p.turn_clearance) if p.turn_clearance > 0 else []
+        holders = [q for q in peers if n in q.reserved or any(m in q.reserved for m in cf)]   # rules 1, 6
         # physical presence only counts for peers that hold no reservations (not cooperating / not an agent):
         # an agent's body is always covered by its own held nodes, and at compact junctions (lanes 1.1 m apart)
         # "stands within 0.9 m of a node" made two agents block each other's next node -> deadlock (2026-09-25)

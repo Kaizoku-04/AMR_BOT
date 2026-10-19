@@ -14,7 +14,7 @@ class LaneGraph:
             features = json.load(f)['features']
         self.pos, self.name, self.kind, self.by_name = {}, {}, {}, {}
         self.succ, self.edge_kind, self.edge_id = {}, {}, {}
-        self._dist_from = {}
+        self._dist_from, self._conflicts = {}, {}
         for ft in features:
             p = ft['properties']
             if ft['geometry']['type'] == 'Point':
@@ -52,6 +52,25 @@ class LaneGraph:
 
     def of_kind(self, kind):
         return sorted(n for n, k in self.kind.items() if k == kind)
+
+    # a robot stands still here and turns in place to leave, with a queue node closer than the turning room (measured:
+    # tools/tests/bay_exit_test.py). Chargers/parking also turn to leave, but their nearest nodes are 1.7 m out; the
+    # one closer pair, charge_5 <-> west_s_south (1.24 m, diagonal), passes (chain 30, 2026-10-19)
+    TURN_KINDS = ('bay',)
+
+    def conflicts(self, n, clearance):
+        """Nodes too close to n for two robots at once: one of the pair is a TURN_KINDS node and they are less than
+        `clearance` apart (the turning robot's corners sweep its circumscribed circle; the other robot's nose reaches
+        towards it). Symmetric, cached per clearance."""
+        if clearance not in self._conflicts:
+            c = {m: set() for m in self.pos}
+            for a in (m for m in self.pos if self.kind[m] in self.TURN_KINDS):
+                for b in self.pos:
+                    if b != a and self.dist(a, b) < clearance:
+                        c[a].add(b)
+                        c[b].add(a)
+            self._conflicts[clearance] = {m: sorted(v) for m, v in c.items()}
+        return self._conflicts[clearance].get(n, [])
 
     def travel(self, a, b):
         """Length of the shortest directed route a -> b along the lanes (inf if unreachable). Local Dijkstra,
