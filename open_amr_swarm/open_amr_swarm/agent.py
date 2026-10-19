@@ -37,7 +37,8 @@ import tf2_ros
 
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Pose2D, PoseStamped
-from nav2_msgs.action import ComputeRoute, DockRobot, FollowPath, UndockRobot
+from builtin_interfaces.msg import Duration
+from nav2_msgs.action import BackUp, ComputeRoute, DockRobot, FollowPath, UndockRobot
 from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap, DynamicEdges
 from nav_msgs.msg import Path
@@ -61,6 +62,20 @@ OPERATOR_QOS = QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE, dura
 
 def stamp_s(t):
     return t.sec + t.nanosec * 1e-9
+
+
+def backout_plan(pose, bay, staging, tol, at_bay):
+    """How to reverse from `pose` to a bay's staging node: ('undock', d) from the bay itself, ('backup', d) from partway
+    out, ('done', 0) already there; d = the distance left along the bay -> staging axis. Nav2's UndockRobot stages
+    |staging_x_offset| behind the robot's *current* pose (docking_server.cpp undockRobot), not behind the dock: started
+    partway out it overshoots the staging node by that much (fleet run 2026-10-19, chain 33: a dock aborted 0.2 m short
+    and a back-out retried after 0.5 m both aimed into the robot waiting at queue_1, 905 for 60 s -> STUCK)."""
+    ux, uy = staging[0] - bay[0], staging[1] - bay[1]
+    length = math.hypot(ux, uy)
+    out = ((pose[0] - bay[0]) * ux + (pose[1] - bay[1]) * uy) / length
+    if length - out <= tol:
+        return 'done', 0.0
+    return ('undock' if out <= at_bay else 'backup'), length - out
 
 
 class Leg:
@@ -169,6 +184,11 @@ class SwarmAgent(Node):
         # blocked (a person, a robot that isn't an agent) retry every 5 s for up to backout_patience_s, then STUCK
         self.backout_patience = dp('backout_patience_s', 60.0).value
         self.backout_t0, self.backout_why = None, ''
+        # from partway out of the bay the rest of the back-out is a straight BackUp to the staging node (backout_plan);
+        # the undock only from within undock_from_bay_m of the bay, where its overshoot is that much at most
+        self.backup_client = ActionClient(self, BackUp, 'backup')
+        self.undock_from_bay = dp('undock_from_bay_m', 0.05).value
+        self.backout_speed = dp('backout_speed_mps', 0.15).value
         self.route_client = ActionClient(self, ComputeRoute, 'compute_route')
         self.follow_client = ActionClient(self, FollowPath, 'follow_path')
         self.clear_local = self.create_client(ClearEntireCostmap, 'local_costmap/clear_entirely_local_costmap')
@@ -1161,11 +1181,23 @@ class SwarmAgent(Node):
     def back_out(self, name, why):
         """Reverse out of the bay to its staging pose (the docking server's undock, ≤ 0.15 m/s inside the bay's marked
         zone) and dock again from there. Docking again from inside the bay instead "succeeds" at once with the same
-        error. A blocked back-out is retried, not counted as a docking attempt."""
+        error. A blocked back-out is retried, not counted as a docking attempt. The target is the bay's staging node
+        whatever the robot's pose (backout_plan): a retry never aims further out than the first attempt."""
         self.dock_state, self.backout_why = 'undocking', why
         self.backout_t0 = self.backout_t0 or self.now()
-        self.undock_client.send_goal_async(UndockRobot.Goal(dock_type='bay_dock')).add_done_callback(
-            lambda f, name=name: self.on_undock_handle(f, name))
+        how, d = ('undock', 0.0) if self.pose is None else backout_plan(
+            self.pose, self.graph.pos[self.route[-1]], self.graph.pos[self.route[-2]], self.staging_tol,
+            self.undock_from_bay)
+        if how == 'done':
+            return self.backed_out(name)
+        if how == 'backup':
+            g = BackUp.Goal(speed=self.backout_speed, time_allowance=Duration(sec=int(d / self.backout_speed) + 10))
+            g.target.x = d
+            self.get_logger().info(f'{self.rid}: {d:.2f} m short of the staging pose of {name}: backing up')
+            fut = self.backup_client.send_goal_async(g)
+        else:
+            fut = self.undock_client.send_goal_async(UndockRobot.Goal(dock_type='bay_dock'))
+        fut.add_done_callback(lambda f, name=name: self.on_undock_handle(f, name))
 
     def on_undock_handle(self, f, name):
         h = f.result()
@@ -1175,13 +1207,16 @@ class SwarmAgent(Node):
         h.get_result_async().add_done_callback(lambda r, name=name: self.on_undock_done(r, name))
 
     def on_undock_done(self, r, name):
+        """UndockRobot or BackUp finished (BackUp's result has no `success`: error_code 0 is success)."""
         res, status = r.result().result, r.result().status
-        if status == GoalStatus.STATUS_SUCCEEDED and res.success:
-            self.backout_t0 = None
-            self.get_logger().info(f'{self.rid}: backed out of {name} ({self.backout_why}): docking again')
-            self.dock_state, self.dock_retry_at = 'retry', self.now() + 1.0
-            return
+        if status == GoalStatus.STATUS_SUCCEEDED and getattr(res, 'success', res.error_code == 0):
+            return self.backed_out(name)
         self.backout_blocked(name, f'error {res.error_code}')
+
+    def backed_out(self, name):
+        self.backout_t0 = None
+        self.get_logger().info(f'{self.rid}: backed out of {name} ({self.backout_why}): docking again')
+        self.dock_state, self.dock_retry_at = 'retry', self.now() + 1.0
 
     def backout_blocked(self, name, why):
         if self.now() - self.backout_t0 > self.backout_patience:
