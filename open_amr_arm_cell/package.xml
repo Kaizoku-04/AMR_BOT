@@ -20,6 +20,7 @@
   <exec_depend>shape_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>controller_manager</exec_depend>
+  <exec_depend>controller_manager_msgs</exec_depend>
   <exec_depend>joint_trajectory_controller</exec_depend>
   <exec_depend>joint_state_broadcaster</exec_depend>
   <exec_depend>open_amr_isaac_hardware</exec_depend>

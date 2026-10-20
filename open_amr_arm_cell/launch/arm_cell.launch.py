@@ -10,7 +10,6 @@ hardware:=topic needs the simulator's arm bridge (OpenAMR sim/scripts/open_amr_s
 TF is namespaced (/<arm_id>/tf) like the AMRs'.
 """
 import os
-import tempfile
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -52,17 +51,17 @@ def spawn(context):
     tf = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
     ctrl = os.path.join(share, 'config', 'ros2_controllers.yaml')
 
-    # The spawner gets no `parameters`: any params file makes it set "params_file" on the controller manager through
-    # ros2param's call_set_parameters, which waits for the reply with no timeout, so one reply Fast DDS drops under load
-    # ("failed to send response ... client will not receive response") hangs it for good (chains 33 and 38: the cell
-    # never came up, 0 boxes; the same drop on list/configure_controller is retried after 10 s). The controller
-    # manager passes its own use_sim_time to the controllers. Own lock directory: spawners serialize on one
-    # machine-wide file lock ($ROS_HOME/locks), so a stuck spawner in one cell timed out the other cell's too.
+    # Controllers are brought up by controller_starter, not controller_manager's spawner. The spawner (1) with any
+    # params file sets "params_file" through ros2param's call_set_parameters, which waits with no timeout, so a reply
+    # Fast DDS drops under load ("failed to send response ... client will not receive response") hung it for good
+    # (chains 33 and 38), and (2) retries a load_controller whose reply was lost, gets "already loaded" and gives up
+    # (chain 39 base2). Either way the cell never homed: 0 boxes. The starter reads the state before every step and
+    # asks only for the next transition, so a lost reply costs one round. The controller manager passes its own
+    # use_sim_time to the controllers.
     def spawner(controllers):
-        return Node(package='controller_manager', executable='spawner', namespace=arm, output='screen',
-                    arguments=controllers + ['--controller-manager', f'/{arm}/controller_manager',
-                                             '--controller-manager-timeout', '120'],
-                    additional_env={'ROS_HOME': os.path.join(tempfile.gettempdir(), f'ros_home_{arm}')})
+        return Node(package='open_amr_arm_cell', executable='controller_starter', namespace=arm, output='screen',
+                    parameters=[{'controllers': controllers, 'controller_manager': f'/{arm}/controller_manager',
+                                 'timeout': 120.0}])
     if hw == 'ur':                       # the real arm / URSim: ur_robot_driver's hardware interface and controllers
         return [
             Node(package='robot_state_publisher', executable='robot_state_publisher', namespace=arm, output='screen',
