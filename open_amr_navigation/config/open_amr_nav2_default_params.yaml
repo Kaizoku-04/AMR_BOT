@@ -457,7 +457,11 @@ docking_server:
       use_collision_detection: true
       costmap_topic: "/local_costmap/costmap_raw"
       footprint_topic: "/local_costmap/published_footprint"
-      transform_tolerance: 0.1
+      # how long the collision check waits (sim time) for the pose at now(), not how old a pose it accepts
+      # (opennav_docking 1.3.13 controller.cpp:171, lookupTransform with a timeout): 0.1 s aborted 5 docks in chains
+      # 37-38 on a TF listener thread starved under load, 0.3 s aborted none in chain 39; a stalled cycle drives the
+      # last command for at most 0.3 s (<= 4.5 cm at 0.15 m/s; the base stops a command 0.5 s old)
+      transform_tolerance: 0.3
       projection_time: 5.0
       simulation_step: 0.1
       dock_collision_threshold: 0.3
