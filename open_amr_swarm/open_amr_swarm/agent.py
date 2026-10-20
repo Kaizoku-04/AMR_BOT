@@ -164,7 +164,7 @@ class SwarmAgent(Node):
         # centred carton or a drop with one still on, stop at once if the load is lost or shifts on the way
         self.deck_sensor = dp('deck_sensor', False).value
         self.deck_load, self.load_wait_since, self.load_fault = None, None, ''
-        self.recenter_since = None
+        self.recenter_since, self.recenter_sent = None, None
         if self.deck_sensor:
             self.create_subscription(UInt8, 'deck/load', lambda m: setattr(self, 'deck_load', m.data), 10)
             self.recenter_cli = self.create_client(Trigger, 'deck/recenter')
@@ -1423,6 +1423,11 @@ class SwarmAgent(Node):
                 self.load_fault = 'carton lost from the deck' if self.deck_load == 0 else 'carton would not re-centre'
                 self.get_logger().error(f'{self.rid}: {self.load_fault}: stopped')
                 self.status, self.phase = RobotState.STUCK, 'load_fault'
+            elif self.now() - self.recenter_sent > 1.5 and self.recenter_cli.service_is_ready():
+                # still shifted after the 1 s jog: the request may have been lost (DDS under load). A repeat is harmless:
+                # the deck ignores it while it is still jogging the carton
+                self.recenter_cli.call_async(Trigger.Request())
+                self.recenter_sent = self.now()
             return
         if not (self.loaded and self.phase == 'driving') or self.deck_load in (None, 1):
             return
@@ -1431,6 +1436,7 @@ class SwarmAgent(Node):
             self.get_logger().warn(f'{self.rid}: carton shifted on the deck: stopping to re-centre it')
             self.recenter_cli.call_async(Trigger.Request())
             self.phase, self.recenter_since = 'recentring', self.now()
+            self.recenter_sent = self.recenter_since
             return
         why = 'carton lost from the deck' if self.deck_load == 0 else 'carton shifted on the deck'
         if self.status != RobotState.STUCK:

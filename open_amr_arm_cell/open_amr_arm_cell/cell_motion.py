@@ -69,13 +69,20 @@ class VacuumIO:
     def ready(self, timeout=30.0):
         return self.cli.wait_for_service(timeout_sec=timeout)
 
-    def _call(self, cli, req, what):
-        fut = cli.call_async(req)
-        t0 = time.monotonic()
-        while not fut.done() and time.monotonic() - t0 < 5.0:
-            time.sleep(0.005)
-        if not fut.done() or not fut.result().success:
-            raise CellFault(f'{what} failed')
+    def _call(self, cli, req, what, attempts=3, timeout=2.0):
+        """set_io and set_payload set a value, so a call whose reply is lost (DDS under load: chains 33, 38, 39) is
+        simply sent again; only a refusal or no reply to any attempt is a fault."""
+        for _ in range(attempts):
+            fut = cli.call_async(req)
+            t0 = time.monotonic()
+            while not fut.done() and time.monotonic() - t0 < timeout:
+                time.sleep(0.005)
+            if fut.done():
+                if fut.result().success:
+                    return
+                raise CellFault(f'{what} failed (refused)')
+            cli.remove_pending_request(fut)
+        raise CellFault(f'{what} failed (no reply to {attempts} attempts)')
 
     def vacuum(self, on):
         self._call(self.cli, self.SetIO.Request(fun=self.SetIO.Request.FUN_SET_DIGITAL_OUT, pin=VACUUM_OUT, state=float(
