@@ -26,7 +26,8 @@ from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
 from . import cell_program as prog
 from .carton_locator import LocateFault, NominalLocator
 from .cell_geometry import Cell, CellParams
-from .reach_study import JOINTS, TRANSFER_MARGIN, box_object, dense_collision, tool_down, zone_objects
+from .reach_study import (CARRY_ACC_SCALE, CARRY_VEL_SCALE, JOINTS, TRANSFER_MARGIN, box_object, dense_collision, plan_params,
+                          tool_down, zone_objects)
 
 VACUUM_OUT, PART_PRESENT_IN = 16, 16
 # where the carton of the current cycle is
@@ -109,20 +110,19 @@ class CellMotion:
                  gripper_mass=2.0, carton_mass=8.0):
         """vel_scale / acc_scale override the configured scaling (moveit_cpp.yaml: the production speeds) for every
         move; 1.0 = the arm's full speed (UR's joint velocity limits, UR MoveIt's acceleration limits)."""
-        from moveit.planning import PlanRequestParameters
         self.moveit, self.io, self.cell, self.p = moveit, io, cell, cell.p
         self.pattern = pattern['pattern']
         self.locator = locator or NominalLocator()
         self.arm = moveit.get_planning_component('arm')
         self.psm = moveit.get_planning_scene_monitor()
         self.tem = moveit.get_trajectory_execution_manager()
-        self.ptp, self.lin = PlanRequestParameters(moveit, 'ptp'), PlanRequestParameters(moveit, 'lin')
-        self.lin_place = PlanRequestParameters(moveit, 'lin_place')
-        for prm in (self.ptp, self.lin):
+        self.prm = plan_params(moveit)          # (lin, carrying) -> profile; PTP transfers with a carton slower
+        for key in ((False, False), (True, False), (False, True)):   # (True, True) is the same object as (True, False)
+            slow = key == (False, True)
             if vel_scale is not None:
-                prm.max_velocity_scaling_factor = float(vel_scale)
+                self.prm[key].max_velocity_scaling_factor = float(vel_scale) * (CARRY_VEL_SCALE if slow else 1.0)
             if acc_scale is not None:
-                prm.max_acceleration_scaling_factor = float(acc_scale)
+                self.prm[key].max_acceleration_scaling_factor = float(acc_scale) * (CARRY_ACC_SCALE if slow else 1.0)
         self.log = logger
         self.gripper_mass, self.carton_mass = gripper_mass, carton_mass
         self.guard = lambda in_zone: None        # -> reason to stop now, or None (set by the cell controller)
@@ -205,7 +205,7 @@ class CellMotion:
             ps.pose = goal_pose
             self.arm.set_goal_state(pose_stamped_msg=ps, pose_link='tcp')
         t0 = time.monotonic()
-        res = self.arm.plan(single_plan_parameters=self.lin_place if place else self.lin if lin else self.ptp)
+        res = self.arm.plan(single_plan_parameters=self.prm['place' if place else (bool(lin), self.carrying is not None)])
         t_plan = time.monotonic()
         if not res:
             raise CellFault(f'plan rejected: {name}')
