@@ -10,6 +10,7 @@ hardware:=topic needs the simulator's arm bridge (OpenAMR sim/scripts/open_amr_s
 TF is namespaced (/<arm_id>/tf) like the AMRs'.
 """
 import os
+import tempfile
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -50,6 +51,18 @@ def spawn(context):
         'pedestal_size': str(cell.get('pedestal_size', 0.5)), 'tool_length': str(cell.get('tool_length', 0.2))}).toxml()
     tf = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
     ctrl = os.path.join(share, 'config', 'ros2_controllers.yaml')
+
+    # The spawner gets no `parameters`: any params file makes it set "params_file" on the controller manager through
+    # ros2param's call_set_parameters, which waits for the reply with no timeout, so one reply Fast DDS drops under load
+    # ("failed to send response ... client will not receive response") hangs it for good (chains 33 and 38: the cell
+    # never came up, 0 boxes; the same drop on list/configure_controller is retried after 10 s). The controller
+    # manager passes its own use_sim_time to the controllers. Own lock directory: spawners serialize on one
+    # machine-wide file lock ($ROS_HOME/locks), so a stuck spawner in one cell timed out the other cell's too.
+    def spawner(controllers):
+        return Node(package='controller_manager', executable='spawner', namespace=arm, output='screen',
+                    arguments=controllers + ['--controller-manager', f'/{arm}/controller_manager',
+                                             '--controller-manager-timeout', '120'],
+                    additional_env={'ROS_HOME': os.path.join(tempfile.gettempdir(), f'ros_home_{arm}')})
     if hw == 'ur':                       # the real arm / URSim: ur_robot_driver's hardware interface and controllers
         return [
             Node(package='robot_state_publisher', executable='robot_state_publisher', namespace=arm, output='screen',
@@ -64,11 +77,8 @@ def spawn(context):
                  parameters=[{'headless_mode': True, 'joint_controller_active': True,
                               'consistent_controllers': ['io_and_status_controller', 'speed_scaling_state_broadcaster',
                                                          'joint_state_broadcaster']}]),
-            Node(package='controller_manager', executable='spawner', namespace=arm, output='screen',
-                 arguments=['joint_state_broadcaster', 'io_and_status_controller', 'speed_scaling_state_broadcaster',
-                            'scaled_joint_trajectory_controller', '--controller-manager', f'/{arm}/controller_manager',
-                            '--controller-manager-timeout', '120'],
-                 parameters=[{'use_sim_time': sim}]),
+            spawner(['joint_state_broadcaster', 'io_and_status_controller', 'speed_scaling_state_broadcaster',
+                     'scaled_joint_trajectory_controller']),
         ]
     return [
         Node(package='robot_state_publisher', executable='robot_state_publisher', namespace=arm, output='screen',
@@ -77,10 +87,7 @@ def spawn(context):
              parameters=[ctrl, {'use_sim_time': sim}] + (
                  [] if lc('hardware') == 'topic' else [os.path.join(share, 'config', 'ros2_controllers_mock.yaml')]),
              remappings=tf + [('~/robot_description', 'robot_description')]),
-        Node(package='controller_manager', executable='spawner', namespace=arm, output='screen',
-             arguments=['joint_state_broadcaster', 'joint_trajectory_controller', '--controller-manager',
-                        f'/{arm}/controller_manager', '--controller-manager-timeout', '120'],
-             parameters=[{'use_sim_time': sim}]),
+        spawner(['joint_state_broadcaster', 'joint_trajectory_controller']),
     ]
 
 
