@@ -232,6 +232,9 @@ class SwarmAgent(Node):
         self.follow_handle, self.follow_end, self.follow_state = None, None, None
         self.route_pending, self.bid_pending = False, False
         self.route_req, self.bid_req, self.follow_req = Pending(), Pending(), Pending()
+        # the dock and back-out goals: the same lost-ack resend and lost-result re-poll as FollowPath
+        self.dock_req, self.backout_req, self.dock_handle, self.backout_handle = Pending(), Pending(), None, None
+        self.act_still_since, self.act_polled_at = None, 0.0
         self.result_polled_at, self.still_since = 0.0, None
         self.leg_fail = 0
         self.create_timer(0.2, self.tick)
@@ -529,6 +532,27 @@ class SwarmAgent(Node):
                 h.get_result_async().add_done_callback(lambda r, h=h: self.on_follow_done(h, r))
         else:
             self.still_since = None
+        # DockRobot / UndockRobot / BackUp: the same two losses (chain 38: a lost answer would hold the bay for the shift)
+        bay = self.graph.name[self.route[-1]] if self.route else ''
+        if self.dock_req.overdue(t, self.ack_timeout):
+            self.get_logger().warn(f'{self.rid}: DockRobot goal not acknowledged in {self.ack_timeout:.0f} s; resending')
+            self.dock_req.clear()
+            self.dock_state = None                             # drive() -> start_dock() sends it again
+        if self.backout_req.overdue(t, self.ack_timeout):
+            self.get_logger().warn(f'{self.rid}: back-out goal not acknowledged in {self.ack_timeout:.0f} s; resending')
+            self.backout_req.clear()
+            self.back_out(bay, self.backout_why)
+        h = self.dock_handle or self.backout_handle
+        if h is not None and self.speed_est < 0.02:
+            self.act_still_since = self.act_still_since or t
+            if t - self.act_still_since > self.result_poll and t - self.act_polled_at > self.result_poll:
+                self.act_polled_at = t
+                self.get_logger().info(f'{self.rid}: no {"DockRobot" if h is self.dock_handle else "back-out"} result '
+                                       f'after {t - self.act_still_since:.0f} s standing still; requesting it again')
+                done = self.on_dock_done if h is self.dock_handle else self.on_undock_done
+                h.get_result_async().add_done_callback(lambda r, h=h, done=done: done(r, bay, h))
+        else:
+            self.act_still_since = None
 
     def edges(self):
         """This robot's route_server adjust_edges client (None until the service is found)."""
@@ -1124,16 +1148,26 @@ class SwarmAgent(Node):
         g = DockRobot.Goal(use_dock_id=True, dock_id=name, navigate_to_staging_pose=False)
         self.dock_state, self.dock_t0 = 'sending', self.now()
         self.get_logger().info(f'{self.rid}: docking at {name}')
-        self.dock_client.send_goal_async(g).add_done_callback(lambda f, name=name: self.on_dock_handle(f, name))
+        tok = self.dock_req.send(wallclock.monotonic())
+        self.dock_client.send_goal_async(g).add_done_callback(lambda f, name=name, tok=tok: self.on_dock_handle(f, name, tok))
 
-    def on_dock_handle(self, f, name):
+    def on_dock_handle(self, f, name, tok=None):
         h = f.result()
+        if tok is not None and not self.dock_req.ack(tok):
+            if h.accepted:
+                h.cancel_goal_async()            # abandoned (resent after a lost ack): must not drive
+            return
         if not h.accepted:
             self.dock_failed(name, 'goal rejected')
             return
-        h.get_result_async().add_done_callback(lambda r, name=name: self.on_dock_done(r, name))
+        self.dock_handle = h
+        h.get_result_async().add_done_callback(lambda r, name=name, h=h: self.on_dock_done(r, name, h))
 
-    def on_dock_done(self, r, name):
+    def on_dock_done(self, r, name, h=None):
+        if h is not None:
+            if h is not self.dock_handle:
+                return                           # a re-polled result already handled, or an abandoned goal's
+            self.dock_handle = None
         res, status = r.result().result, r.result().status
         if status == GoalStatus.STATUS_SUCCEEDED and res.success:
             # docked only at a confirmed standstill: the docking server's 'success' comes while the 60 kg robot still
@@ -1204,17 +1238,27 @@ class SwarmAgent(Node):
             fut = self.backup_client.send_goal_async(g)
         else:
             fut = self.undock_client.send_goal_async(UndockRobot.Goal(dock_type='bay_dock'))
-        fut.add_done_callback(lambda f, name=name: self.on_undock_handle(f, name))
+        tok = self.backout_req.send(wallclock.monotonic())
+        fut.add_done_callback(lambda f, name=name, tok=tok: self.on_undock_handle(f, name, tok))
 
-    def on_undock_handle(self, f, name):
+    def on_undock_handle(self, f, name, tok=None):
         h = f.result()
+        if tok is not None and not self.backout_req.ack(tok):
+            if h.accepted:
+                h.cancel_goal_async()            # abandoned (resent after a lost ack): must not drive
+            return
         if not h.accepted:
             self.backout_blocked(name, 'undock rejected')
             return
-        h.get_result_async().add_done_callback(lambda r, name=name: self.on_undock_done(r, name))
+        self.backout_handle = h
+        h.get_result_async().add_done_callback(lambda r, name=name, h=h: self.on_undock_done(r, name, h))
 
-    def on_undock_done(self, r, name):
+    def on_undock_done(self, r, name, h=None):
         """UndockRobot or BackUp finished (BackUp's result has no `success`: error_code 0 is success)."""
+        if h is not None:
+            if h is not self.backout_handle:
+                return                           # a re-polled result already handled, or an abandoned goal's
+            self.backout_handle = None
         res, status = r.result().result, r.result().status
         if status == GoalStatus.STATUS_SUCCEEDED and getattr(res, 'success', res.error_code == 0):
             return self.backed_out(name)

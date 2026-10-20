@@ -204,3 +204,91 @@ def test_dock_aborted_past_the_staging_node_still_docks_again(bay_agent):
         a.drive()
     assert len(a.dock_sent) == 1, 'the agent sent nothing: it waits for a result that never comes'
     assert a.status != RobotState.STUCK and a.dock_fails == 1
+
+
+class _Fut:
+    """A send_goal_async future whose answer arrives only when the test says so (or never: lost)."""
+    def __init__(self):
+        self.cbs = []
+
+    def add_done_callback(self, cb):
+        self.cbs.append(cb)
+
+    def answer(self, value):
+        for cb in self.cbs:
+            cb(type('F', (), {'result': lambda s: value})())
+
+
+class _Handle:
+    def __init__(self):
+        self.accepted, self.cancelled, self.result_futs = True, False, []
+
+    def cancel_goal_async(self):
+        self.cancelled = True
+
+    def get_result_async(self):
+        f = _Fut()
+        self.result_futs.append(f)
+        return f
+
+
+@pytest.fixture
+def lossy(agent):
+    """The docking server's answers can be lost (a DDS reply dropped under load, as in chains 33 and 38)."""
+    import time
+    agent.futs = []
+    agent.dock_client.send_goal_async = lambda g: agent.futs.append(_Fut()) or agent.futs[-1]
+    agent.clock = [time.monotonic()]
+    import open_amr_swarm.agent as mod
+    mod.wallclock = type('W', (), {'monotonic': staticmethod(lambda: agent.clock[0])})
+    yield agent
+    mod.wallclock = time
+
+
+def test_lost_dock_ack_is_resent_and_the_late_one_cancelled(lossy):
+    a = lossy
+    a.start_dock()
+    assert len(a.futs) == 1 and a.dock_state == 'sending'
+    a.clock[0] += a.ack_timeout + 0.1                                  # no acceptance came back
+    a.check_requests()
+    assert a.dock_state is None
+    a.start_dock()                                                     # drive() calls it again at the staging node
+    assert len(a.futs) == 2
+    late = _Handle()
+    a.futs[0].answer(late)                                             # the first acceptance turns up after all
+    assert late.cancelled and a.dock_handle is None                    # abandoned: must not drive
+    cur = _Handle()
+    a.futs[1].answer(cur)
+    assert a.dock_handle is cur and not cur.cancelled
+
+
+def test_lost_dock_result_is_requested_again_and_handled_once(lossy):
+    a = lossy
+    a.start_dock()
+    h = _Handle()
+    a.futs[0].answer(h)
+    assert len(h.result_futs) == 1
+    a.speed_est = 0.0                                                  # standing still, no result
+    a.check_requests()
+    a.clock[0] += a.result_poll + 0.1
+    a.check_requests()
+    assert len(h.result_futs) == 2                                     # asked again
+    ok = _Res(True)
+    ok.result = type('R', (), {'success': True, 'error_code': 0, 'num_retries': 0})()
+    for f in h.result_futs:                                            # both requests answer
+        f.answer(ok)
+    assert a.dock_state == 'settling' and a.dock_handle is None and a.dock_fails == 0
+
+
+def test_lost_back_out_ack_is_resent(lossy):
+    a = lossy
+    a.undock_client.send_goal_async = lambda g: a.futs.append(_Fut()) or a.futs[-1]
+    a.pose = (4.0, 0.0, 0.0)                                           # in the bay: an undock
+    a.back_out('n4', 'inaccurate dock')
+    assert len(a.futs) == 1 and a.dock_state == 'undocking'
+    a.clock[0] += a.ack_timeout + 0.1
+    a.check_requests()
+    assert len(a.futs) == 2                                            # sent again
+    late = _Handle()
+    a.futs[0].answer(late)
+    assert late.cancelled and a.backout_handle is None
