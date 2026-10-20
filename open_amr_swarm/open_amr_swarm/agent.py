@@ -974,8 +974,15 @@ class SwarmAgent(Node):
             # 0.25 m past the turn node (loose checker, arriving at street speed) carried a 0.3 m sideways offset
             # straight into the first bay of an aisle (2026-09-25)
             pre_final = end_k == len(self.route) - 2 and end_k in self.stop_at
-            self.send_path(ridx, self.node_idx[end_k], (final or pre_final or staging) and self.leg.precise)
+            sent = self.send_path(ridx, self.node_idx[end_k], (final or pre_final or staging) and self.leg.precise)
             self.follow_end = end_node
+            if not sent:
+                # the robot is already at or past the segment's end (a dock aborted past the staging node, chain 38
+                # base2): nothing to send, so no result would ever come and the agent waited the shift out; count it
+                # as an attempt the controller gave up on, which the node's own fallback handles
+                self.follow_state = GoalStatus.STATUS_ABORTED
+                self.get_logger().warn(f'{self.rid}: already past {self.graph.name[end_node]}: no path to send',
+                                       throttle_duration_sec=20.0)
 
     def node_reached(self, k, ridx, x, y):
         n = self.route[k]
@@ -1263,13 +1270,14 @@ class SwarmAgent(Node):
         p = Path(); p.header = self.path.header; p.header.stamp = self.get_clock().now().to_msg()
         p.poses = self.path.poses[max(0, i0 - 1): i1 + 1]
         if len(p.poses) < 2:
-            return
+            return False
         g = FollowPath.Goal(); g.path = p; g.controller_id = 'FollowPath'
         g.goal_checker_id = 'precise_goal_checker' if precise else 'general_goal_checker'
         self.follow_state = GoalStatus.STATUS_EXECUTING
         self.follow_handle, self.still_since = None, None
         tok = self.follow_req.send(wallclock.monotonic())
         self.follow_client.send_goal_async(g).add_done_callback(lambda f, tok=tok: self.on_follow_handle(f, tok))
+        return True
 
     def on_follow_handle(self, f, tok):
         h = f.result()

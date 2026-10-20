@@ -163,3 +163,44 @@ def test_back_out_from_the_staging_node_docks_again_at_once(bay_agent):
     a.pose = (3.05, 0.0, 0.0)
     a.back_out('n4', 'operator acknowledged')
     assert a.undock_sent == [] and a.backup_sent == [] and a.dock_state == 'retry'
+
+
+def _path(agent, step=0.05):
+    """The docking leg's path n0 -> n4 along x (as ComputeRoute gives it) and its node indices."""
+    from nav_msgs.msg import Path
+    from geometry_msgs.msg import PoseStamped
+    p = Path()
+    p.header.frame_id = 'map'
+    for k in range(int(4 / step) + 1):
+        ps = PoseStamped()
+        ps.pose.position.x = k * step
+        p.poses.append(ps)
+    agent.path, agent.node_idx = p, agent.index_nodes(agent.route, p)
+
+
+def test_dock_aborted_past_the_staging_node_still_docks_again(bay_agent):
+    """Chain 38 base2 (2026-10-20): a dock aborted on a late TF sample 0.85 m short of the bay, i.e. past the staging
+    node (beyond backing out, which starts 0.5 m from the bay) -> restage. The segment back to the staging node, which
+    lay behind the robot, was too short to send; nothing was sent, nothing came back, and the agent waited for it for the
+    rest of the shift (no Nav2 goal for 14 min, the outbound queue blocked behind it). An unsendable segment must count
+    as a controller attempt that ended, so the staging fallback (dock from where it stands after 3) takes over."""
+    a = bay_agent
+    _path(a)
+    a.leg = type('L', (), {'precise': True, 'station': True, 'target': 4, 'dwell_s': 0})()
+    a.dock_bays, a.has_quorum = True, True
+    a.graph.kind[4] = "bay"                                              # n4 is an arm bay (docking leg)
+    a.confirm = lambda: set(a.route)
+    a.live_peers = lambda: []
+    a.follow_sent = []
+    a.follow_client.send_goal_async = lambda g: a.follow_sent.append(g) or \
+        type('F', (), {'add_done_callback': lambda s, cb: None})()
+    a.pose = (3.15, 0.23, -0.2)                                         # 0.85 m from the bay n4, past staging n3
+    assert not a.in_bay()
+    a.dock_failed('n4', 'error 905')
+    assert a.dock_state == 'restaging' and a.next_idx == 3
+    for _ in range(10):                                                 # drive ticks
+        if a.dock_sent:
+            break
+        a.drive()
+    assert len(a.dock_sent) == 1, 'the agent sent nothing: it waits for a result that never comes'
+    assert a.status != RobotState.STUCK and a.dock_fails == 1
