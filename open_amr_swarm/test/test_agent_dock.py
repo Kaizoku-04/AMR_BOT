@@ -163,3 +163,181 @@ def test_back_out_from_the_staging_node_docks_again_at_once(bay_agent):
     a.pose = (3.05, 0.0, 0.0)
     a.back_out('n4', 'operator acknowledged')
     assert a.undock_sent == [] and a.backup_sent == [] and a.dock_state == 'retry'
+
+
+def _path(agent, step=0.05):
+    """The docking leg's path n0 -> n4 along x (as ComputeRoute gives it) and its node indices."""
+    from nav_msgs.msg import Path
+    from geometry_msgs.msg import PoseStamped
+    p = Path()
+    p.header.frame_id = 'map'
+    for k in range(int(4 / step) + 1):
+        ps = PoseStamped()
+        ps.pose.position.x = k * step
+        p.poses.append(ps)
+    agent.path, agent.node_idx = p, agent.index_nodes(agent.route, p)
+
+
+def test_dock_aborted_past_the_staging_node_still_docks_again(bay_agent):
+    """Chain 38 base2 (2026-10-20): a dock aborted on a late TF sample 0.85 m short of the bay, i.e. past the staging
+    node (beyond backing out, which starts 0.5 m from the bay) -> restage. The segment back to the staging node, which
+    lay behind the robot, was too short to send; nothing was sent, nothing came back, and the agent waited for it for the
+    rest of the shift (no Nav2 goal for 14 min, the outbound queue blocked behind it). An unsendable segment must count
+    as a controller attempt that ended, so the staging fallback (dock from where it stands after 3) takes over."""
+    a = bay_agent
+    _path(a)
+    a.leg = type('L', (), {'precise': True, 'station': True, 'target': 4, 'dwell_s': 0})()
+    a.dock_bays, a.has_quorum = True, True
+    a.graph.kind[4] = "bay"                                              # n4 is an arm bay (docking leg)
+    a.confirm = lambda: set(a.route)
+    a.live_peers = lambda: []
+    a.follow_sent = []
+    a.follow_client.send_goal_async = lambda g: a.follow_sent.append(g) or \
+        type('F', (), {'add_done_callback': lambda s, cb: None})()
+    a.pose = (3.15, 0.23, -0.2)                                         # 0.85 m from the bay n4, past staging n3
+    assert not a.in_bay()
+    a.dock_failed('n4', 'error 905')
+    assert a.dock_state == 'restaging' and a.next_idx == 3
+    for _ in range(10):                                                 # drive ticks
+        if a.dock_sent:
+            break
+        a.drive()
+    assert len(a.dock_sent) == 1, 'the agent sent nothing: it waits for a result that never comes'
+    assert a.status != RobotState.STUCK and a.dock_fails == 1
+
+
+class _Fut:
+    """A send_goal_async future whose answer arrives only when the test says so (or never: lost)."""
+    def __init__(self):
+        self.cbs = []
+
+    def add_done_callback(self, cb):
+        self.cbs.append(cb)
+
+    def answer(self, value):
+        for cb in self.cbs:
+            cb(type('F', (), {'result': lambda s: value})())
+
+
+class _Handle:
+    def __init__(self):
+        self.accepted, self.cancelled, self.result_futs = True, False, []
+
+    def cancel_goal_async(self):
+        self.cancelled = True
+
+    def get_result_async(self):
+        f = _Fut()
+        self.result_futs.append(f)
+        return f
+
+
+@pytest.fixture
+def lossy(agent):
+    """The docking server's answers can be lost (a DDS reply dropped under load, as in chains 33 and 38)."""
+    import time
+    agent.futs = []
+    agent.dock_client.send_goal_async = lambda g: agent.futs.append(_Fut()) or agent.futs[-1]
+    agent.clock = [time.monotonic()]
+    import open_amr_swarm.agent as mod
+    mod.wallclock = type('W', (), {'monotonic': staticmethod(lambda: agent.clock[0])})
+    yield agent
+    mod.wallclock = time
+
+
+def test_lost_dock_ack_is_resent_and_the_late_one_cancelled(lossy):
+    a = lossy
+    a.start_dock()
+    assert len(a.futs) == 1 and a.dock_state == 'sending'
+    a.clock[0] += a.ack_timeout + 0.1                                  # no acceptance came back
+    a.check_requests()
+    assert a.dock_state is None
+    a.start_dock()                                                     # drive() calls it again at the staging node
+    assert len(a.futs) == 2
+    late = _Handle()
+    a.futs[0].answer(late)                                             # the first acceptance turns up after all
+    assert late.cancelled and a.dock_handle is None                    # abandoned: must not drive
+    cur = _Handle()
+    a.futs[1].answer(cur)
+    assert a.dock_handle is cur and not cur.cancelled
+
+
+def test_lost_dock_result_is_requested_again_and_handled_once(lossy):
+    a = lossy
+    a.start_dock()
+    h = _Handle()
+    a.futs[0].answer(h)
+    assert len(h.result_futs) == 1
+    a.speed_est = 0.0                                                  # standing still, no result
+    a.check_requests()
+    a.clock[0] += a.result_poll + 0.1
+    a.check_requests()
+    assert len(h.result_futs) == 2                                     # asked again
+    ok = _Res(True)
+    ok.result = type('R', (), {'success': True, 'error_code': 0, 'num_retries': 0})()
+    for f in h.result_futs:                                            # both requests answer
+        f.answer(ok)
+    assert a.dock_state == 'settling' and a.dock_handle is None and a.dock_fails == 0
+
+
+def test_lost_back_out_ack_is_resent(lossy):
+    a = lossy
+    a.undock_client.send_goal_async = lambda g: a.futs.append(_Fut()) or a.futs[-1]
+    a.pose = (4.0, 0.0, 0.0)                                           # in the bay: an undock
+    a.back_out('n4', 'inaccurate dock')
+    assert len(a.futs) == 1 and a.dock_state == 'undocking'
+    a.clock[0] += a.ack_timeout + 0.1
+    a.check_requests()
+    assert len(a.futs) == 2                                            # sent again
+    late = _Handle()
+    a.futs[0].answer(late)
+    assert late.cancelled and a.backout_handle is None
+
+
+class _EdgesClient:
+    def __init__(self):
+        self.reqs, self.futs = [], []
+
+    def call_async(self, req):
+        self.reqs.append((sorted(req.closed_edges), sorted(req.opened_edges)))
+        self.futs.append(_Fut())
+        return self.futs[-1]
+
+
+def _ok(success=True):
+    return type('R', (), {'success': success})()
+
+
+def test_lost_lane_request_is_sent_again_until_confirmed(lossy):
+    """A silent robot's lanes closed in the route server: the request (a DDS service call) can be lost; the agent then
+    believed them closed and never asked again, so routes kept passing the silent robot."""
+    a = lossy
+    a.edges_client = _EdgesClient()
+    a.ghost_closed = {101: 1, 102: 1}
+    a.sync_edges()
+    assert a.edges_client.reqs == [([101, 102], [])]
+    a.check_requests()                                                 # unanswered, not yet overdue: no repeat
+    assert len(a.edges_client.reqs) == 1
+    a.clock[0] += a.ack_timeout + 0.1
+    a.check_requests()                                                 # lost: sent again
+    assert a.edges_client.reqs[-1] == ([101, 102], []) and len(a.edges_client.reqs) == 2
+    a.edges_client.futs[1].answer(_ok())
+    assert a.edges_acked == {101, 102}
+    a.clock[0] += 10 * a.ack_timeout
+    a.check_requests()
+    assert len(a.edges_client.reqs) == 2                               # confirmed: nothing more to send
+    a.edges_client.futs[0].answer(_ok())                               # the first (stale) answer changes nothing
+    assert a.edges_acked == {101, 102}
+
+
+def test_deadlock_lane_reopens_after_the_reroute_but_not_a_ghosts(lossy):
+    a = lossy
+    a.edges_client = _EdgesClient()
+    a.ghost_closed = {101: 1}
+    a.reopen_edge = 102                                                # closed for my deadlock re-route
+    a.sync_edges()
+    a.edges_client.futs[-1].answer(_ok())
+    assert a.edges_acked == {101, 102}
+    a.reopen_edge = None                                               # (on_route: the re-route is planned)
+    a.sync_edges()
+    assert a.edges_client.reqs[-1] == ([], [102])                      # only my lane reopens, the ghost's stays closed
