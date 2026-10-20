@@ -83,6 +83,27 @@ def moveit_py(node_name, cfg, name_space=''):
 
 DENSE_STEP_RAD = 0.01                # dense path check: max joint step between checked states
 TRANSFER_MARGIN = 0.02              # m: PTP transfers keep the carried carton this far from everything
+# carrying moves (a carton on the pad) plan at these fractions of the production speed and acceleration: the pad's
+# shear is the carton's horizontal acceleration, and 1.0 left the FXCB class 1.6x on its 80 N rating where Schmalz asks
+# >= 2.0 on cardboard (ADR-030). Acceleration alone barely helps: the worst shear is in the PTP transfer, where the
+# carton swings on a ~1 m arc and the centripetal part (speed squared) dominates (0.75 acc alone: 49.9 -> 46.0 N;
+# both 0.75: 36.0 N over the pattern, 2.2x, 2026-10-20). Only the PTP transfers: the straight carrying moves stay
+# under 1 N of shear, and slowing them made Pilz LIN lose IK on two lifts.
+CARRY_VEL_SCALE = 0.75
+CARRY_ACC_SCALE = 0.75
+
+
+def plan_params(moveit):
+    """{(lin, carrying): PlanRequestParameters} plus 'place': the production profiles of moveit_cpp.yaml, PTP transfers
+    with a carton at CARRY_VEL_SCALE / CARRY_ACC_SCALE of their speed / acceleration."""
+    from moveit.planning import PlanRequestParameters
+    prm = {'place': PlanRequestParameters(moveit, 'lin_place')}
+    for lin, name in ((False, 'ptp'), (True, 'lin')):
+        prm[(lin, False)] = prm[(lin, True)] = PlanRequestParameters(moveit, name)
+    prm[(False, True)] = carry = PlanRequestParameters(moveit, 'ptp')
+    carry.max_velocity_scaling_factor = prm[(False, False)].max_velocity_scaling_factor * CARRY_VEL_SCALE
+    carry.max_acceleration_scaling_factor = prm[(False, False)].max_acceleration_scaling_factor * CARRY_ACC_SCALE
+    return prm
 
 
 def dense_collision(psm, jt, step=DENSE_STEP_RAD):
@@ -160,7 +181,7 @@ def zone_objects(cell, docked, deck_box=False, deck_off=None):
 
 class Study:
     def __init__(self, cell: Cell):
-        from moveit.planning import MoveItPy, PlanRequestParameters
+        from moveit.planning import MoveItPy
         self.cell, self.p = cell, cell.p
         cfg = moveit_configs(self.p).to_dict()
         # offline: no robot publishes joint states, every plan gets its start state explicitly
@@ -169,9 +190,7 @@ class Study:
         self.arm = self.moveit.get_planning_component('arm')
         self.psm = self.moveit.get_planning_scene_monitor()
         self.model = self.moveit.get_robot_model()
-        self.ptp = PlanRequestParameters(self.moveit, 'ptp')
-        self.lin = PlanRequestParameters(self.moveit, 'lin')
-        self.lin_place = PlanRequestParameters(self.moveit, 'lin_place')
+        self.prm = plan_params(self.moveit)
         self.objects = set()
         self.carrying = False
         self.record = None
@@ -288,7 +307,7 @@ class Study:
             ps.header.frame_id = 'world'
             ps.pose = goal_pose
             self.arm.set_goal_state(pose_stamped_msg=ps, pose_link='tcp')
-        res = self.arm.plan(single_plan_parameters=self.lin_place if place else self.lin if lin else self.ptp)
+        res = self.arm.plan(single_plan_parameters=self.prm['place' if place else (bool(lin), bool(self.carrying))])
         if not res:
             return None
         # dense check; PTP transfers with the carried carton padded by TRANSFER_MARGIN
