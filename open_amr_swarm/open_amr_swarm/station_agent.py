@@ -26,6 +26,7 @@ from open_amr_msgs.msg import ArmCellState, RobotState, StationState, Transfer
 
 from .agent import EVENT_QOS, STATE_QOS
 from .lane_graph import LaneGraph
+from .liveness import Pending
 from .station import C_NONE, DEPALLETIZE, FAULT, JOB_NAMES, PREPARE, STARVED, STATE_NAMES, CellStation, Station, \
     StationParams
 
@@ -50,6 +51,12 @@ class StationAgent(Node):
             self.cell_state, self.cell_rx = None, 0.0
             self.goal, self.sending, self.phase, self.left_since = None, False, '', None
             self.client = ActionClient(self, ArmTransfer, f'/{self.sid}/cell/transfer')
+            # a transfer goal not accepted in ack_timeout (wall s) is resent, a result is re-requested every
+            # result_poll s: both travel as DDS service replies that get lost under load (chain 39 base2: the first
+            # prepare goal never reached the cell and the station waited the whole shift, 0 boxes in)
+            self.ack_timeout = dp('ack_timeout_s', 3.0).value
+            self.result_poll = dp('result_poll_s', 30.0).value
+            self.req, self.sent_job, self.polled_at = Pending(), None, 0.0
             self.create_subscription(ArmCellState, f'/{self.sid}/cell/state', self.on_cell, 10)
         self.fault_at, self.fault_for = dp('fault_at_s', 0.0).value, dp('fault_for_s', 0.0).value
         self.peer_timeout = dp('peer_timeout_s', 3.0).value
@@ -88,12 +95,19 @@ class StationAgent(Node):
             g.stock[job.pallet] += 1
         elif job.kind == DEPALLETIZE and not job.held:
             g.stock[job.pallet] += 1
-        self.goal, self.sending = None, True
+        self.goal, self.sending, self.sent_job = None, True, job
+        tok = self.req.send(wallclock.monotonic())
+        if not self.client.server_is_ready():
+            return                           # not discovered yet: guard_lost() sends it again after ack_timeout
         fut = self.client.send_goal_async(g, feedback_callback=self.on_feedback)
-        fut.add_done_callback(lambda f, j=job: self.on_accepted(f, j))
+        fut.add_done_callback(lambda f, j=job, tok=tok: self.on_accepted(f, j, tok))
 
-    def on_accepted(self, fut, job):
+    def on_accepted(self, fut, job, tok):
         gh = fut.result()
+        if not self.req.ack(tok):
+            if gh.accepted:
+                gh.cancel_goal_async()       # abandoned (resent after a lost acceptance): the arm must not run it
+            return
         self.sending = False
         if not gh.accepted:
             self.get_logger().warn(f'{self.sid}: cell rejected {JOB_NAMES[job.kind]} pallet {job.pallet} slot {job.slot}')
@@ -102,15 +116,17 @@ class StationAgent(Node):
             else:
                 self.st.finished(self.now(), False, C_NONE, 'rejected by the cell')
             return
-        self.goal = gh
-        gh.get_result_async().add_done_callback(lambda f, j=job: self.on_result(f, j))
+        self.goal, self.polled_at = gh, wallclock.monotonic()
+        gh.get_result_async().add_done_callback(lambda f, j=job, gh=gh: self.on_result(f, j, gh))
 
     def on_feedback(self, m):
         self.phase = m.feedback.phase
         if self.phase == 'deck_clear':
             self.st.deck_clear(self.now())
 
-    def on_result(self, fut, job):
+    def on_result(self, fut, job, gh):
+        if gh is not self.goal:
+            return                           # a re-polled result already handled, or an abandoned goal's
         r, status = fut.result().result, fut.result().status
         self.goal, now = None, self.now()
         if status == GoalStatus.STATUS_SUCCEEDED:
@@ -123,7 +139,23 @@ class StationAgent(Node):
         else:
             self.st.finished(now, False, r.carton, r.fault or f'status {status}')
 
+    def guard_lost(self):
+        """Resend a goal whose acceptance never came; re-request the result of one running long."""
+        t = wallclock.monotonic()
+        if self.req.overdue(t, self.ack_timeout) and self.st.job is not self.sent_job:
+            self.req.clear()                 # the station dropped that job meanwhile (fault): nothing to resend
+        elif self.req.overdue(t, self.ack_timeout):
+            self.get_logger().warn(f'{self.sid}: {JOB_NAMES[self.sent_job.kind]} goal not acknowledged in '
+                                   f'{self.ack_timeout:.0f} s; resending')
+            self.send(self.sent_job)
+        elif self.goal is not None and t - self.polled_at > self.result_poll:
+            self.polled_at, gh, job = t, self.goal, self.sent_job
+            self.get_logger().info(f'{self.sid}: no {JOB_NAMES[job.kind]} result after {self.result_poll:.0f} s; '
+                                   'requesting it again')
+            gh.get_result_async().add_done_callback(lambda f, j=job, gh=gh: self.on_result(f, j, gh))
+
     def cell_tick(self, now, at_bay, fault):
+        self.guard_lost()
         if fault is None and self.cell_state is not None and self.cell_state.state == ArmCellState.READY \
                 and self.st.held and self.st.job is None:
             self.st.tool_cleared(now)                        # reset with the gripper empty: a person took it off
