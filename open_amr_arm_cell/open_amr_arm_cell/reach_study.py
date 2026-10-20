@@ -281,6 +281,13 @@ class Study:
             scene.current_state.joint_positions = dict(zip(JOINTS, start))
             scene.current_state.update()
         self.arm.set_start_state_to_current_state()
+        if goal_q is None and lin:
+            # Pilz LIN takes a joint goal too (the TCP still moves on the straight line to its FK): the closed-form IK
+            # nearest the start, not KDL's goal IK, whose random restarts lose to the 0.05 s wall-clock timeout now and
+            # then (NO_IK_SOLUTION on one lift in 3 of 40 payload studies, a different cycle each time, 2026-10-20)
+            goal_q = self.ik(goal_pose, start)
+            if goal_q is None:
+                return None
         if goal_q is not None:
             self.arm.set_goal_state(robot_state=self.state(goal_q))
         else:

@@ -29,5 +29,6 @@ setup(
         'cell_test = open_amr_arm_cell.cell_test:main',
         'driver_test = open_amr_arm_cell.driver_test:main',
         'payload_study = open_amr_arm_cell.payload_study:main',
+        'controller_starter = open_amr_arm_cell.controller_starter:main',
     ]},
 )

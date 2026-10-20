@@ -26,7 +26,7 @@ from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
 from . import cell_program as prog
 from .carton_locator import LocateFault, NominalLocator
 from .cell_geometry import Cell, CellParams
-from .reach_study import JOINTS, TRANSFER_MARGIN, box_object, dense_collision, tool_down, zone_objects
+from .reach_study import JOINTS, TRANSFER_MARGIN, box_object, dense_collision, taught_ik, tool_down, zone_objects
 
 VACUUM_OUT, PART_PRESENT_IN = 16, 16
 # where the carton of the current cycle is
@@ -69,13 +69,20 @@ class VacuumIO:
     def ready(self, timeout=30.0):
         return self.cli.wait_for_service(timeout_sec=timeout)
 
-    def _call(self, cli, req, what):
-        fut = cli.call_async(req)
-        t0 = time.monotonic()
-        while not fut.done() and time.monotonic() - t0 < 5.0:
-            time.sleep(0.005)
-        if not fut.done() or not fut.result().success:
-            raise CellFault(f'{what} failed')
+    def _call(self, cli, req, what, attempts=3, timeout=2.0):
+        """set_io and set_payload set a value, so a call whose reply is lost (DDS under load: chains 33, 38, 39) is
+        simply sent again; only a refusal or no reply to any attempt is a fault."""
+        for _ in range(attempts):
+            fut = cli.call_async(req)
+            t0 = time.monotonic()
+            while not fut.done() and time.monotonic() - t0 < timeout:
+                time.sleep(0.005)
+            if fut.done():
+                if fut.result().success:
+                    return
+                raise CellFault(f'{what} failed (refused)')
+            cli.remove_pending_request(fut)
+        raise CellFault(f'{what} failed (no reply to {attempts} attempts)')
 
     def vacuum(self, on):
         self._call(self.cli, self.SetIO.Request(fun=self.SetIO.Request.FUN_SET_DIGITAL_OUT, pin=VACUUM_OUT, state=float(
@@ -194,6 +201,12 @@ class CellMotion:
         if why:
             raise CellFault(f'{why} (before {name})')
         self.arm.set_start_state_to_current_state()
+        if goal_q is None and lin:               # a joint goal from the closed-form IK, as in Study.plan (KDL flaky)
+            with self.psm.read_only() as scene:
+                q = scene.current_state.joint_positions
+            goal_q = taught_ik(goal_pose, [q[j] for j in JOINTS], self.p)
+            if goal_q is None:
+                raise CellFault(f'plan rejected: {name} (out of reach)')
         if goal_q is not None:
             s = RobotState(self.moveit.get_robot_model())
             s.joint_positions = dict(zip(JOINTS, goal_q))
