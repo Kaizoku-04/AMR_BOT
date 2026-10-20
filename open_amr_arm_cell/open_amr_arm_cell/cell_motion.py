@@ -26,7 +26,7 @@ from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
 from . import cell_program as prog
 from .carton_locator import LocateFault, NominalLocator
 from .cell_geometry import Cell, CellParams
-from .reach_study import JOINTS, TRANSFER_MARGIN, box_object, dense_collision, tool_down, zone_objects
+from .reach_study import JOINTS, TRANSFER_MARGIN, box_object, dense_collision, taught_ik, tool_down, zone_objects
 
 VACUUM_OUT, PART_PRESENT_IN = 16, 16
 # where the carton of the current cycle is
@@ -194,6 +194,12 @@ class CellMotion:
         if why:
             raise CellFault(f'{why} (before {name})')
         self.arm.set_start_state_to_current_state()
+        if goal_q is None and lin:               # a joint goal from the closed-form IK, as in Study.plan (KDL flaky)
+            with self.psm.read_only() as scene:
+                q = scene.current_state.joint_positions
+            goal_q = taught_ik(goal_pose, [q[j] for j in JOINTS], self.p)
+            if goal_q is None:
+                raise CellFault(f'plan rejected: {name} (out of reach)')
         if goal_q is not None:
             s = RobotState(self.moveit.get_robot_model())
             s.joint_positions = dict(zip(JOINTS, goal_q))
