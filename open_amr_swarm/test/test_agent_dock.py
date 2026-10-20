@@ -292,3 +292,52 @@ def test_lost_back_out_ack_is_resent(lossy):
     late = _Handle()
     a.futs[0].answer(late)
     assert late.cancelled and a.backout_handle is None
+
+
+class _EdgesClient:
+    def __init__(self):
+        self.reqs, self.futs = [], []
+
+    def call_async(self, req):
+        self.reqs.append((sorted(req.closed_edges), sorted(req.opened_edges)))
+        self.futs.append(_Fut())
+        return self.futs[-1]
+
+
+def _ok(success=True):
+    return type('R', (), {'success': success})()
+
+
+def test_lost_lane_request_is_sent_again_until_confirmed(lossy):
+    """A silent robot's lanes closed in the route server: the request (a DDS service call) can be lost; the agent then
+    believed them closed and never asked again, so routes kept passing the silent robot."""
+    a = lossy
+    a.edges_client = _EdgesClient()
+    a.ghost_closed = {101: 1, 102: 1}
+    a.sync_edges()
+    assert a.edges_client.reqs == [([101, 102], [])]
+    a.check_requests()                                                 # unanswered, not yet overdue: no repeat
+    assert len(a.edges_client.reqs) == 1
+    a.clock[0] += a.ack_timeout + 0.1
+    a.check_requests()                                                 # lost: sent again
+    assert a.edges_client.reqs[-1] == ([101, 102], []) and len(a.edges_client.reqs) == 2
+    a.edges_client.futs[1].answer(_ok())
+    assert a.edges_acked == {101, 102}
+    a.clock[0] += 10 * a.ack_timeout
+    a.check_requests()
+    assert len(a.edges_client.reqs) == 2                               # confirmed: nothing more to send
+    a.edges_client.futs[0].answer(_ok())                               # the first (stale) answer changes nothing
+    assert a.edges_acked == {101, 102}
+
+
+def test_deadlock_lane_reopens_after_the_reroute_but_not_a_ghosts(lossy):
+    a = lossy
+    a.edges_client = _EdgesClient()
+    a.ghost_closed = {101: 1}
+    a.reopen_edge = 102                                                # closed for my deadlock re-route
+    a.sync_edges()
+    a.edges_client.futs[-1].answer(_ok())
+    assert a.edges_acked == {101, 102}
+    a.reopen_edge = None                                               # (on_route: the re-route is planned)
+    a.sync_edges()
+    assert a.edges_client.reqs[-1] == ([], [102])                      # only my lane reopens, the ghost's stays closed

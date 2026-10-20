@@ -235,6 +235,10 @@ class SwarmAgent(Node):
         # the dock and back-out goals: the same lost-ack resend and lost-result re-poll as FollowPath
         self.dock_req, self.backout_req, self.dock_handle, self.backout_handle = Pending(), Pending(), None, None
         self.act_still_since, self.act_polled_at = None, 0.0
+        # lanes closed in my route server: what I want (ghosts' lanes + a deadlock re-route's lane) vs what it confirmed;
+        # sync_edges() sends the difference, again after ack_timeout if no answer came (a lost request used to leave a
+        # ghost's lanes open for good while the agent believed them closed)
+        self.edges_acked, self.edges_inflight, self.edges_req = set(), None, Pending()
         self.result_polled_at, self.still_since = 0.0, None
         self.leg_fail = 0
         self.create_timer(0.2, self.tick)
@@ -553,6 +557,7 @@ class SwarmAgent(Node):
                 h.get_result_async().add_done_callback(lambda r, h=h, done=done: done(r, bay, h))
         else:
             self.act_still_since = None
+        self.sync_edges()                                      # a lost lane request is sent again
 
     def edges(self):
         """This robot's route_server adjust_edges client (None until the service is found)."""
@@ -562,6 +567,27 @@ class SwarmAgent(Node):
             if names:
                 self.edges_client = self.create_client(DynamicEdges, names[0])
         return self.edges_client
+
+    def wanted_edges(self):
+        return set(self.ghost_closed) | ({self.reopen_edge} if self.reopen_edge is not None else set())
+
+    def sync_edges(self):
+        """Bring the route server's closed lanes to wanted_edges(): send the difference now if the wish changed, else
+        again once the last request has gone unanswered for ack_timeout."""
+        want, t = self.wanted_edges(), wallclock.monotonic()
+        if want == self.edges_acked or self.edges() is None:
+            return
+        if want == self.edges_inflight and not self.edges_req.overdue(t, self.ack_timeout):
+            return
+        tok = self.edges_req.send(t)
+        self.edges_inflight = want
+        self.edges_client.call_async(DynamicEdges.Request(closed_edges=sorted(want - self.edges_acked),
+                                                          opened_edges=sorted(self.edges_acked - want))
+                                     ).add_done_callback(lambda f, tok=tok, want=want: self.on_edges(f, tok, want))
+
+    def on_edges(self, f, tok, want):
+        if self.edges_req.ack(tok) and f.result() is not None and f.result().success:
+            self.edges_acked, self.edges_inflight = want, None
 
     def update_ghost_edges(self):
         """Routing avoids silent robots: the lanes into the nodes a ghost holds are closed in this robot's route
@@ -583,8 +609,8 @@ class SwarmAgent(Node):
             return
         closed = sorted(set(want) - set(self.ghost_closed))
         opened = sorted(set(self.ghost_closed) - set(want))
-        self.edges_client.call_async(DynamicEdges.Request(closed_edges=closed, opened_edges=opened))
         self.ghost_closed = want
+        self.sync_edges()
         self.get_logger().info(f'{self.rid}: routing around silent {sorted(ghosts) or "nobody"} '
                                f'({len(closed)} lanes closed, {len(opened)} reopened, {len(cut)} nodes cut off)')
         blocked = held | cut
@@ -833,10 +859,9 @@ class SwarmAgent(Node):
             return
         res = f.result().result
         self.route_pending = False
-        if self.reopen_edge is not None and self.edges_client is not None:   # the closure was only for this re-route
-            if self.reopen_edge not in self.ghost_closed:
-                self.edges_client.call_async(DynamicEdges.Request(opened_edges=[self.reopen_edge]))
+        if self.reopen_edge is not None:                 # the closure was only for this re-route
             self.reopen_edge = None
+            self.sync_edges()
         if res.error_code != 0 or not res.route.nodes:
             self.get_logger().warn(f'{self.rid}: no route to {self.graph.name[self.leg.target]} (error {res.error_code}), '
                                    f'retrying', throttle_duration_sec=30.0)
@@ -1114,8 +1139,8 @@ class SwarmAgent(Node):
             return
         self.last_reroute = self.now()
         self.get_logger().warn(f'{self.rid}: {why} -> closing {self.graph.name[a]}->{self.graph.name[b]} for me and re-routing')
-        self.edges_client.call_async(DynamicEdges.Request(closed_edges=[eid]))
         self.reopen_edge = eid
+        self.sync_edges()
         self.stop_following()
         self.legs.insert(0, self.leg)
         self.last_node, self.phase = a, 'rerouting'   # start_node() must be where I stand, not the blocked node
