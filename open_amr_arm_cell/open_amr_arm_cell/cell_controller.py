@@ -261,16 +261,20 @@ class CellController(Node):
         def on_dock():
             marks['wait'] = self.now()
             self.feedback(gh, 'waiting_interlock')
-            last = None
+            last, said = None, time.monotonic()
             while True:
                 if gh.is_cancel_requested:
                     raise Cancelled()
                 why = self.interlock(g.robot_id)
                 if why is None:
                     break
-                if why != last:
-                    self.log(f'waiting for the interlock: {why}')
-                    last = why
+                if why != last or time.monotonic() - said > 30.0:
+                    # repeated every 30 s while unchanged: a wait that never ends is visible in the log, not one line
+                    # at its start (c41_base 2026-10-21: both arms waited 14 min on one line each)
+                    waited = self.now() - marks['wait']
+                    self.log(f'waiting for the interlock: {why}' + (f' ({waited:.0f} s)' if waited >= 1 else ''),
+                             warn=waited >= 30)
+                    last, said = why, time.monotonic()
                 time.sleep(0.05)
             with self.lock:
                 m = self.robots[g.robot_id][0]

@@ -36,7 +36,7 @@ from rclpy.time import Time
 import tf2_ros
 
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import Pose2D, PoseStamped
+from geometry_msgs.msg import Pose2D, PoseStamped, PoseWithCovarianceStamped
 from builtin_interfaces.msg import Duration
 from nav2_msgs.action import BackUp, ComputeRoute, DockRobot, FollowPath, UndockRobot
 from nav2_msgs.msg import SpeedLimit
@@ -179,6 +179,17 @@ class SwarmAgent(Node):
         self.staging_tol = dp('staging_tol_m', 0.12).value
         self.dock_pose_msg = None
         self.create_subscription(PoseStamped, 'dock_pose', lambda m: setattr(self, 'dock_pose_msg', m), 10)
+        # docked at a bay, the bay's surveyed pose + the marker-measured dock error is the robot's pose to millimetres;
+        # AMCL can be 0.3-0.4 m off there (it stops updating at standstill): the cells' interlock then never saw the
+        # robot at its bay and both arms waited all shift (fleet run c41_base, 2026-10-21). AMCL is reset BEFORE the
+        # robot reports docked: a reset after it moved the reported pose 0.12 m under a descending arm and the cell
+        # faulted ("moved under the arm", c41_base rerun). Beyond relocalize_tol_m: reset, resent every
+        # relocalize_every_s up to 3 times; beyond relocalize_max_m the dock is suspect and nothing is reset
+        self.reloc_tol = dp('relocalize_tol_m', 0.10).value
+        self.reloc_max = dp('relocalize_max_m', 1.0).value
+        self.reloc_every = dp('relocalize_every_s', 2.0).value
+        self.reloc_at, self.reloc_tries = -1e9, 0
+        self.pub_initialpose = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
         self.dock_state, self.dock_fails, self.docked, self.docking = None, 0, False, False
         # backing out of a bay (to dock again): the docking server's undock reverses to the staging pose; when that is
         # blocked (a person, a robot that isn't an agent) retry every 5 s for up to backout_patience_s, then STUCK
@@ -1061,6 +1072,8 @@ class SwarmAgent(Node):
         if self.docking:
             if self.dock_state == 'settling' and self.settled():
                 self.check_dock(self.dock_name)
+            elif self.dock_state == 'localizing':
+                self.localize_at_bay(self.dock_name)
             return self.dock_state == GoalStatus.STATUS_SUCCEEDED
         if self.follow_state == GoalStatus.STATUS_SUCCEEDED:
             return True
@@ -1221,6 +1234,11 @@ class SwarmAgent(Node):
                 return self.give_up_dock(name)
             self.back_out(name, 'inaccurate dock')
             return
+        self.dock_state, self.reloc_at, self.reloc_tries = 'localizing', -1e9, 0
+        self.localize_at_bay(name)
+
+    def mark_docked(self, name):
+        err = self.dock_error()
         self.docked, self.dock_state = True, GoalStatus.STATUS_SUCCEEDED
         self.get_logger().info(f'{self.rid}: docked at {name} in {self.now() - self.dock_t0:.1f} s'
                                + (f' ({self.dock_retries} retries)' if self.dock_retries else '')
@@ -1243,6 +1261,46 @@ class SwarmAgent(Node):
         dx, dy = t.transform.translation.x - m.pose.position.x, t.transform.translation.y - m.pose.position.y
         c, s = math.cos(dyaw), math.sin(dyaw)
         return c * dx + s * dy, -s * dx + c * dy, math.remainder(ryaw - dyaw, math.tau)
+
+    def bay_pose_from_dock(self):
+        """Docked at a bay: (x, y, yaw) in map from the bay's lane-graph pose and the marker-measured dock error (the
+        error is in the dock's frame; its heading is taken from the current yaw, enough for an error of millimetres)."""
+        nid = self.graph.by_name.get(self.dock_name)
+        err = self.dock_error()
+        if nid is None or self.graph.kind.get(nid) != 'bay' or err is None or self.pose is None:
+            return None
+        (bx, by), yaw = self.graph.pos[nid][:2], self.pose[2]
+        dyaw = yaw - err[2]
+        c, s = math.cos(dyaw), math.sin(dyaw)
+        return bx + c * err[0] - s * err[1], by + s * err[0] + c * err[1], yaw
+
+    def localize_at_bay(self, name):
+        """Accurately docked, before reporting it: AMCL within reloc_tol of the bay's pose and the robot still -> docked.
+        Else reset AMCL (resent every reloc_every s, 3 times at most, then docked anyway with a warning: the cell's
+        interlock then shows what is wrong). Not at a bay (a charger), or a suspect dock: docked at once."""
+        p = self.bay_pose_from_dock()
+        off = None if p is None else math.hypot(p[0] - self.pose[0], p[1] - self.pose[1])
+        if off is not None and off > self.reloc_max:
+            self.get_logger().error(f'{self.rid}: docked at {name} but AMCL is {off:.2f} m from the bay: not '
+                                    f're-localizing (check the dock and the map)')
+            off = None
+        if off is None or (off <= self.reloc_tol and self.speed_est == 0.0):
+            return self.mark_docked(name)
+        if off <= self.reloc_tol or self.now() - self.reloc_at < self.reloc_every:
+            return                                       # reset applied, the speed estimate settling; or reset in flight
+        if self.reloc_tries >= 3:
+            self.get_logger().warn(f'{self.rid}: AMCL still {off:.2f} m off {name} after 3 resets: reporting docked')
+            return self.mark_docked(name)
+        self.reloc_tries, self.reloc_at = self.reloc_tries + 1, self.now()
+        m = PoseWithCovarianceStamped()
+        m.header.frame_id = 'map'          # stamp 0: AMCL takes the latest odom transform (robot at standstill)
+        m.pose.pose.position.x, m.pose.pose.position.y = p[0], p[1]
+        m.pose.pose.orientation.z, m.pose.pose.orientation.w = math.sin(p[2] / 2), math.cos(p[2] / 2)
+        m.pose.covariance[0] = m.pose.covariance[7] = 0.02 ** 2
+        m.pose.covariance[35] = math.radians(2.0) ** 2
+        self.pub_initialpose.publish(m)
+        self.get_logger().info(f'{self.rid}: re-localizing at {name} before reporting docked: AMCL {off:.2f} m off the '
+                               f'bay (marker-measured pose)')
 
     def back_out(self, name, why):
         """Reverse out of the bay to its staging pose (the docking server's undock, ≤ 0.15 m/s inside the bay's marked
