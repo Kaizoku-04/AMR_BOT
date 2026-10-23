@@ -251,6 +251,7 @@ class SwarmAgent(Node):
         # the dock and back-out goals: the same lost-ack resend and lost-result re-poll as FollowPath
         self.dock_req, self.backout_req, self.dock_handle, self.backout_handle = Pending(), Pending(), None, None
         self.exitbk_req, self.exitbk_handle = Pending(), None      # the BackUp out of a bay before leaving it
+        self.exitbk_from = None          # my pose when that BackUp was first sent (cleared on the next arrival)
         self.act_still_since, self.act_polled_at = None, 0.0
         # lanes closed in my route server: what I want (ghosts' lanes + a deadlock re-route's lane) vs what it confirmed;
         # sync_edges() sends the difference, again after ack_timeout if no answer came (a lost request used to leave a
@@ -1444,6 +1445,7 @@ class SwarmAgent(Node):
 
     def arrived(self):
         self.last_node = self.leg.target if self.leg else self.last_node
+        self.exitbk_from = None
         self.reserved = [self.last_node]
         self.follow_handle, self.follow_end, self.follow_state = None, None, None
         if self.leg and self.leg.dwell_s > 0:
@@ -1482,14 +1484,17 @@ class SwarmAgent(Node):
             self.get_logger().error(f'{self.rid}: {why}: staying here until a person clears it')
 
     def leave_bay(self, retry=False):
-        """Leave the transfer spot. From an arm bay, first back straight out to bay_exit_backup_m from the bay node (a
-        BackUp of the distance left, so a resent goal never backs further than the first), then next_leg() plans from
-        the bay's exit. Not at an arm bay, switched off, no BackUp server, 3 unanswered sends: leave at once (the turn
-        at the bay, as before)."""
+        """Leave the transfer spot. From an arm bay, first back straight out bay_exit_backup_m, then next_leg() plans
+        from the bay's exit. The distance counts from where the robot stood when the first BackUp was sent (docked, to
+        the marker's 12 mm), never from the bay node in AMCL's pose: AMCL may be up to relocalize_tol_m off at a bay
+        (chain 42: 9 cm, and the robot backed only 0.11 m). A resent goal backs only the distance still left. Not at an
+        arm bay, switched off, no BackUp server, 3 unanswered sends: leave at once (the turn at the bay, as before)."""
         n = self.last_node
         if self.bay_exit_backup <= 0.0 or self.graph.kind.get(n) != 'bay' or self.pose is None:
             return self.next_leg()
-        left = self.bay_exit_backup - math.hypot(self.pose[0] - self.graph.pos[n][0], self.pose[1] - self.graph.pos[n][1])
+        if not retry or self.exitbk_from is None:
+            self.exitbk_from = self.pose
+        left = self.bay_exit_backup - self.moved_since(self.exitbk_from)
         if left < 0.03:
             return self.next_leg()
         if not self.backup_client.server_is_ready() or (retry and self.exitbk_req.tries >= 3):
@@ -1534,15 +1539,17 @@ class SwarmAgent(Node):
                                f'from here')
         self.next_leg()
 
+    def moved_since(self, p):
+        return math.hypot(self.pose[0] - p[0], self.pose[1] - p[1])
+
     def backed_off_bay(self, n):
-        """Last at bay node n, now 0.05 m to bay_exit_backup_m + 0.10 m off it (leave_bay backed out): a route from n
-        starts at its one exit instead, with on_route's lead-in from here. A path from the bay node itself would pull
-        the controller back towards the pedestal while it turns."""
-        if self.bay_exit_backup <= 0.0 or self.graph.kind.get(n) != 'bay' or self.pose is None or \
+        """Last at bay node n and leave_bay backed out more than 0.05 m: a route from n starts at its one exit instead,
+        with on_route's lead-in from here. A path from the bay node itself would pull the controller back towards the
+        pedestal while it turns."""
+        if self.exitbk_from is None or self.graph.kind.get(n) != 'bay' or self.pose is None or \
                 len(self.graph.succ.get(n, [])) != 1:
             return False
-        out = math.hypot(self.pose[0] - self.graph.pos[n][0], self.pose[1] - self.graph.pos[n][1])
-        return 0.05 < out <= self.bay_exit_backup + 0.10
+        return self.moved_since(self.exitbk_from) > 0.05
 
     def watch_load(self):
         """While carrying: the carton must stay on the deck, centred. Shifted (sideways, towards the conveyor's end) ->

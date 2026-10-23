@@ -123,3 +123,24 @@ def test_a_late_result_after_the_robot_moved_on_is_ignored(agent):
     _finish_backup(a, True)
     _finish_backup(a, True)                                              # the re-polled result, answered twice
     assert len(a.routes) == 1
+
+
+def test_amcl_off_at_the_bay_still_backs_the_full_distance(agent):
+    """Chain 42 (2026-10-24): docked to 1 mm by the marker, AMCL 9 cm towards the staging node (under relocalize_tol_m,
+    so not reset); counting from the bay node in AMCL's pose the robot backed 0.11 m instead of 0.20."""
+    a = agent
+    a.pose = (BAY[0] + 0.09, BAY[1], 3.1416)
+    a.leave_bay()
+    assert a.backup_sent[0].target.x == pytest.approx(0.20)
+    a.pose = (BAY[0] + 0.09 + 0.20, BAY[1], 3.1416)
+    _finish_backup(a, True)
+    assert a.routes[0].start_id == 2
+
+
+def test_a_failed_back_up_with_amcl_off_routes_from_the_bay(agent):
+    """AMCL 9 cm off and the back-up blocked at once: the robot has not moved, so the route starts at the bay node."""
+    a = agent
+    a.pose = (BAY[0] + 0.09, BAY[1], 3.1416)
+    a.leave_bay()
+    _finish_backup(a, False, error_code=712)
+    assert a.routes[0].start_id == 1
