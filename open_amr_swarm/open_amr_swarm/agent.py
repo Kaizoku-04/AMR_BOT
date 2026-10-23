@@ -200,6 +200,11 @@ class SwarmAgent(Node):
         self.backup_client = ActionClient(self, BackUp, 'backup')
         self.undock_from_bay = dp('undock_from_bay_m', 0.05).value
         self.backout_speed = dp('backout_speed_mps', 0.15).value
+        # leaving an arm bay: a straight BackUp of bay_exit_backup_m along the docking line first, so the ~90 deg turn
+        # towards the exit happens off the arm pedestal (chain 41, 2026-10-23: the turn at the bay passes the pedestal
+        # by 2-5 cm; MPPI's forward creep in the turn, or the RotationShim handing the turn to MPPI after a late TF
+        # sample, wedged 3 robots for the shift). Rule 6 keeps the docking line clear. 0 = turn at the bay as before
+        self.bay_exit_backup = dp('bay_exit_backup_m', 0.20).value
         self.route_client = ActionClient(self, ComputeRoute, 'compute_route')
         self.follow_client = ActionClient(self, FollowPath, 'follow_path')
         self.clear_local = self.create_client(ClearEntireCostmap, 'local_costmap/clear_entirely_local_costmap')
@@ -237,7 +242,7 @@ class SwarmAgent(Node):
         self.last_node, self.route, self.path, self.node_idx = None, [], None, []
         self.next_idx, self.reserved, self.blocked = 0, [], False
         self.stop_at = set()
-        self.wait_s, self.phase = 0.0, 'idle'   # idle | routing | driving | dwelling | retry
+        self.wait_s, self.phase = 0.0, 'idle'   # idle | routing | driving | dwelling | bay_exit | retry
         self.retry_at = 0.0
         self.dwell_until, self.idle_since = 0.0, 0.0
         self.follow_handle, self.follow_end, self.follow_state = None, None, None
@@ -245,6 +250,7 @@ class SwarmAgent(Node):
         self.route_req, self.bid_req, self.follow_req = Pending(), Pending(), Pending()
         # the dock and back-out goals: the same lost-ack resend and lost-result re-poll as FollowPath
         self.dock_req, self.backout_req, self.dock_handle, self.backout_handle = Pending(), Pending(), None, None
+        self.exitbk_req, self.exitbk_handle = Pending(), None      # the BackUp out of a bay before leaving it
         self.act_still_since, self.act_polled_at = None, 0.0
         # lanes closed in my route server: what I want (ghosts' lanes + a deadlock re-route's lane) vs what it confirmed;
         # sync_edges() sends the difference, again after ack_timeout if no answer came (a lost request used to leave a
@@ -557,14 +563,21 @@ class SwarmAgent(Node):
             self.get_logger().warn(f'{self.rid}: back-out goal not acknowledged in {self.ack_timeout:.0f} s; resending')
             self.backout_req.clear()
             self.back_out(bay, self.backout_why)
-        h = self.dock_handle or self.backout_handle
+        if self.exitbk_req.overdue(t, self.ack_timeout) and self.phase == 'bay_exit':
+            self.get_logger().warn(f'{self.rid}: bay-exit BackUp goal not acknowledged in {self.ack_timeout:.0f} s; '
+                                   f'resending')
+            self.exitbk_req.clear()
+            self.leave_bay(retry=True)
+        h = self.dock_handle or self.backout_handle or self.exitbk_handle
         if h is not None and self.speed_est < 0.02:
             self.act_still_since = self.act_still_since or t
             if t - self.act_still_since > self.result_poll and t - self.act_polled_at > self.result_poll:
                 self.act_polled_at = t
-                self.get_logger().info(f'{self.rid}: no {"DockRobot" if h is self.dock_handle else "back-out"} result '
-                                       f'after {t - self.act_still_since:.0f} s standing still; requesting it again')
-                done = self.on_dock_done if h is self.dock_handle else self.on_undock_done
+                what = 'DockRobot' if h is self.dock_handle else 'back-out' if h is self.backout_handle else 'bay-exit'
+                self.get_logger().info(f'{self.rid}: no {what} result after {t - self.act_still_since:.0f} s standing '
+                                       f'still; requesting it again')
+                done = self.on_dock_done if h is self.dock_handle else self.on_undock_done if h is self.backout_handle \
+                    else lambda r, _bay, h: self.on_exitbk_done(r, h)
                 h.get_result_async().add_done_callback(lambda r, h=h, done=done: done(r, bay, h))
         else:
             self.act_still_since = None
@@ -845,6 +858,8 @@ class SwarmAgent(Node):
         self.status = self.leg.drive_status
         self.dock_state, self.dock_fails, self.docked = None, 0, False
         start = self.start_node()
+        if self.backed_off_bay(start):
+            start = self.graph.succ[start][0]   # plan from the bay's exit: on_route's lead-in runs from where I stopped
         if start == self.leg.target:
             self.arrived(); return
         self.phase, self.route_pending, self.leg_fail = 'routing', True, 0
@@ -1458,13 +1473,76 @@ class SwarmAgent(Node):
         why = self.load_check()
         if why is None:
             self.load_wait_since = None
-            self.next_leg()
+            self.leave_bay()
             return
         now = self.now()
         self.load_wait_since = self.load_wait_since or now
         if now - self.load_wait_since > 3.0 and self.status != RobotState.STUCK:
             self.status, self.load_fault = RobotState.STUCK, why
             self.get_logger().error(f'{self.rid}: {why}: staying here until a person clears it')
+
+    def leave_bay(self, retry=False):
+        """Leave the transfer spot. From an arm bay, first back straight out to bay_exit_backup_m from the bay node (a
+        BackUp of the distance left, so a resent goal never backs further than the first), then next_leg() plans from
+        the bay's exit. Not at an arm bay, switched off, no BackUp server, 3 unanswered sends: leave at once (the turn
+        at the bay, as before)."""
+        n = self.last_node
+        if self.bay_exit_backup <= 0.0 or self.graph.kind.get(n) != 'bay' or self.pose is None:
+            return self.next_leg()
+        left = self.bay_exit_backup - math.hypot(self.pose[0] - self.graph.pos[n][0], self.pose[1] - self.graph.pos[n][1])
+        if left < 0.03:
+            return self.next_leg()
+        if not self.backup_client.server_is_ready() or (retry and self.exitbk_req.tries >= 3):
+            return self.exitbk_failed('no BackUp server' if not retry else 'BackUp goal unanswered 3 times')
+        self.phase = 'bay_exit'
+        g = BackUp.Goal(speed=self.backout_speed, time_allowance=Duration(sec=int(left / self.backout_speed) + 10))
+        g.target.x = left
+        if not retry:
+            self.get_logger().info(f'{self.rid}: backing {left:.2f} m out of {self.graph.name[n]} before turning to '
+                                   f'its exit')
+        tok = self.exitbk_req.send(wallclock.monotonic(), retry)
+        self.backup_client.send_goal_async(g).add_done_callback(lambda f, tok=tok: self.on_exitbk_handle(f, tok))
+
+    def on_exitbk_handle(self, f, tok):
+        h = f.result()
+        if not self.exitbk_req.ack(tok):
+            if h.accepted:
+                h.cancel_goal_async()            # abandoned (resent after a lost ack): must not drive
+            return
+        if not h.accepted:
+            return self.exitbk_failed('BackUp rejected')
+        self.exitbk_handle = h
+        h.get_result_async().add_done_callback(lambda r, h=h: self.on_exitbk_done(r, h))
+
+    def on_exitbk_done(self, r, h):
+        """BackUp's result has no `success`: error_code 0 is success."""
+        if h is not self.exitbk_handle:
+            return                               # a re-polled result already handled, or an abandoned goal's
+        self.exitbk_handle = None
+        res, status = r.result().result, r.result().status
+        if status == GoalStatus.STATUS_SUCCEEDED and res.error_code == 0:
+            if self.phase == 'bay_exit':
+                self.next_leg()
+            return
+        self.exitbk_failed(f'error {res.error_code}')
+
+    def exitbk_failed(self, why):
+        """A blocked back-up (something behind the robot) still leaves: the turn from wherever it stopped."""
+        if self.phase not in ('bay_exit', 'dwelling'):
+            return
+        self.get_logger().warn(f'{self.rid}: backing out of {self.graph.name[self.last_node]} failed ({why}): turning '
+                               f'from here')
+        self.next_leg()
+
+    def backed_off_bay(self, n):
+        """Last at bay node n, now 0.05 m to bay_exit_backup_m + 0.10 m off it (leave_bay backed out): a route from n
+        starts at its one exit instead, with on_route's lead-in from here. A path from the bay node itself would pull
+        the controller back towards the pedestal while it turns."""
+        if self.bay_exit_backup <= 0.0 or self.graph.kind.get(n) != 'bay' or self.pose is None or \
+                len(self.graph.succ.get(n, [])) != 1:
+            return False
+        out = math.hypot(self.pose[0] - self.graph.pos[n][0], self.pose[1] - self.graph.pos[n][1])
+        return 0.05 < out <= self.bay_exit_backup + 0.10
 
     def watch_load(self):
         """While carrying: the carton must stay on the deck, centred. Shifted (sideways, towards the conveyor's end) ->
