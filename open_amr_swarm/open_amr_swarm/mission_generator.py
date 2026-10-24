@@ -66,6 +66,7 @@ class MissionGenerator(Node):
         self.mismatch = {}               # (robot, task) -> wall time the heartbeat first disagreed with the WMS
         self.stations = {}               # bay node name -> (StationState, receive wall time)
         self.station_timeout = dp('station_timeout_s', 3.0).value
+        self.stale_stations = set()      # bays whose station heartbeat timed out (logged once each way)
         self.dock = {}                   # bay name -> dict(state time shares, dwell list)
         self.bay_since = {}              # robot -> (bay name, time it started standing there)
         # bin registry: each aisle bay node serves a west and an east bin
@@ -257,6 +258,20 @@ class MissionGenerator(Node):
         m = self.stations.get(bay)
         return m[0] if m and wallclock.monotonic() - m[1] < self.station_timeout else None
 
+    def watch_stations(self):
+        """Say when a station's heartbeat stops reaching the WMS and when it is back: while stale, arm_room() is 0 and no
+        work for that arm is offered, and nothing used to say so (while diagnosing chain 45, 2026-10-24, its idle %
+        could not tell a stale station from a live one: it only counts the heartbeats that do arrive)."""
+        for bay, (_, rx) in self.stations.items():
+            age = wallclock.monotonic() - rx
+            if age >= self.station_timeout and bay not in self.stale_stations:
+                self.stale_stations.add(bay)
+                self.get_logger().warn(f'no heartbeat from the station at {bay} for {age:.0f} s: offering no work '
+                                       f'for it until it is heard again')
+            elif age < self.station_timeout and bay in self.stale_stations:
+                self.stale_stations.discard(bay)
+                self.get_logger().info(f'station at {bay} heard again')
+
     def arm_room(self, bay, kind):
         """How many more tasks of `kind` the arm at `bay` can take: its stock / free slots minus the open tasks that
         haven't been served there yet. Unlimited while no station was ever heard (runs without station agents)."""
@@ -291,6 +306,7 @@ class MissionGenerator(Node):
         if self.run_s and now - self.t0 > self.run_s:
             self.report(final=True)
             raise SystemExit
+        self.watch_stations()
         self.withdraw_blocked()
         self.retarget_blocked()
         self.check_stranded()
