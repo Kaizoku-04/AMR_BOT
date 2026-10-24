@@ -105,16 +105,19 @@ class MissionGenerator(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     # ------------------------------------------------------------------ offering
-    def new_task(self):
+    def new_task(self, inbound=None):
+        """A new task: alternating inbound / outbound, the other kind when one has no work; `inbound` forces the kind
+        (None when that kind has no work)."""
         self.seq += 1
         t = Task(task_id=f't{self.seq:04d}', mission_id=f'm{self.seq:04d}', priority=1, round=0)
         if self.mode == 'goto_random':
             t.type, t.origin_id = Task.GOTO, self.rng.choice(self.bays)
             kind, binid = 'goto', None
         else:
-            inbound = self.seq % 2 == 1
+            forced = inbound is not None
+            inbound = self.seq % 2 == 1 if not forced else inbound
             pool = self.pool(inbound)
-            if not pool:
+            if not pool and not forced:
                 inbound = not inbound
                 pool = self.pool(inbound)
             if not pool:
@@ -316,6 +319,18 @@ class MissionGenerator(Node):
             if t is None:
                 break
             self.offer(t); open_.append(t.task_id)
+        if self.mode == 'mission':
+            # a kind left out while its arm couldn't take work (chain 45, 2026-10-24: the first 8 tasks were created in
+            # the outbound arm's 2 s start-up fault, all became inbound, and no outbound work came for ~470 s) gets its
+            # share back as soon as the arm can, instead of waiting for the other kind's tasks to finish
+            share = (self.open_target + 1) // 2
+            for inbound in (True, False):
+                kind = 'inbound' if inbound else 'outbound'
+                while sum(1 for k in open_ if self.meta[k]['kind'] == kind) < share:
+                    t = self.new_task(inbound)
+                    if t is None:
+                        break
+                    self.offer(t); open_.append(t.task_id)
         for tid, t in self.tasks.items():
             m = self.meta[tid]
             if m['claimed'] is None and m['done'] is None and not m['stranded'] and \
