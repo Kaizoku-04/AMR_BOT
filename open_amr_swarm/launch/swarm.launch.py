@@ -40,7 +40,7 @@ def spawn(context):
                     parameters=[{'robot_id': f'amr_{i}', 'graph': graph, 'drain_prior_per_h': 0.15 * scale,
                                  'dock_bays': lc('dock_bays') == 'true', 'deck_sensor': lc('deck_sensor') == 'true',
                                  'chargers': chargers, 'fleet': [f'amr_{k}' for k in range(n)],
-                                 'use_sim_time': True}],
+                                 'backout_speed_mps': float(lc('backout_speed')), 'use_sim_time': True}],
                     remappings=tf)
                for i in range(n)]
     if lc('battery') == 'true':
@@ -90,6 +90,8 @@ def generate_launch_description():
         DeclareLaunchArgument('arm_cycle_s', default_value='8.0'),
         DeclareLaunchArgument('dock_bays', default_value='false',
                               description='dock at arm bays on the lidar marker (Nav2 docking server)'),
+        DeclareLaunchArgument('backout_speed', default_value='0.15',
+                              description='m/s of the agent\'s straight back-ups (bay exit, re-dock); v2: 0.10 (ADR-031 2)'),
         DeclareLaunchArgument('deck_sensor', default_value='false',
                               description='robots check their deck load sensors (physical cartons)'),
         DeclareLaunchArgument('odom_topic', default_value='odom',
