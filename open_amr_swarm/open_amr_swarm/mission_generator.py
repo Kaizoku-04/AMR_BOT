@@ -66,6 +66,7 @@ class MissionGenerator(Node):
         self.mismatch = {}               # (robot, task) -> wall time the heartbeat first disagreed with the WMS
         self.stations = {}               # bay node name -> (StationState, receive wall time)
         self.station_timeout = dp('station_timeout_s', 3.0).value
+        self.stale_stations = set()      # bays whose station heartbeat timed out (logged once each way)
         self.dock = {}                   # bay name -> dict(state time shares, dwell list)
         self.bay_since = {}              # robot -> (bay name, time it started standing there)
         # bin registry: each aisle bay node serves a west and an east bin
@@ -104,16 +105,19 @@ class MissionGenerator(Node):
         return self.get_clock().now().nanoseconds * 1e-9
 
     # ------------------------------------------------------------------ offering
-    def new_task(self):
+    def new_task(self, inbound=None):
+        """A new task: alternating inbound / outbound, the other kind when one has no work; `inbound` forces the kind
+        (None when that kind has no work)."""
         self.seq += 1
         t = Task(task_id=f't{self.seq:04d}', mission_id=f'm{self.seq:04d}', priority=1, round=0)
         if self.mode == 'goto_random':
             t.type, t.origin_id = Task.GOTO, self.rng.choice(self.bays)
             kind, binid = 'goto', None
         else:
-            inbound = self.seq % 2 == 1
+            forced = inbound is not None
+            inbound = self.seq % 2 == 1 if not forced else inbound
             pool = self.pool(inbound)
-            if not pool:
+            if not pool and not forced:
                 inbound = not inbound
                 pool = self.pool(inbound)
             if not pool:
@@ -257,6 +261,20 @@ class MissionGenerator(Node):
         m = self.stations.get(bay)
         return m[0] if m and wallclock.monotonic() - m[1] < self.station_timeout else None
 
+    def watch_stations(self):
+        """Say when a station's heartbeat stops reaching the WMS and when it is back: while stale, arm_room() is 0 and no
+        work for that arm is offered, and nothing used to say so (while diagnosing chain 45, 2026-10-24, its idle %
+        could not tell a stale station from a live one: it only counts the heartbeats that do arrive)."""
+        for bay, (_, rx) in self.stations.items():
+            age = wallclock.monotonic() - rx
+            if age >= self.station_timeout and bay not in self.stale_stations:
+                self.stale_stations.add(bay)
+                self.get_logger().warn(f'no heartbeat from the station at {bay} for {age:.0f} s: offering no work '
+                                       f'for it until it is heard again')
+            elif age < self.station_timeout and bay in self.stale_stations:
+                self.stale_stations.discard(bay)
+                self.get_logger().info(f'station at {bay} heard again')
+
     def arm_room(self, bay, kind):
         """How many more tasks of `kind` the arm at `bay` can take: its stock / free slots minus the open tasks that
         haven't been served there yet. Unlimited while no station was ever heard (runs without station agents)."""
@@ -291,6 +309,7 @@ class MissionGenerator(Node):
         if self.run_s and now - self.t0 > self.run_s:
             self.report(final=True)
             raise SystemExit
+        self.watch_stations()
         self.withdraw_blocked()
         self.retarget_blocked()
         self.check_stranded()
@@ -300,6 +319,18 @@ class MissionGenerator(Node):
             if t is None:
                 break
             self.offer(t); open_.append(t.task_id)
+        if self.mode == 'mission':
+            # a kind left out while its arm couldn't take work (chain 45, 2026-10-24: the first 8 tasks were created in
+            # the outbound arm's 2 s start-up fault, all became inbound, and no outbound work came for ~470 s) gets its
+            # share back as soon as the arm can, instead of waiting for the other kind's tasks to finish
+            share = (self.open_target + 1) // 2
+            for inbound in (True, False):
+                kind = 'inbound' if inbound else 'outbound'
+                while sum(1 for k in open_ if self.meta[k]['kind'] == kind) < share:
+                    t = self.new_task(inbound)
+                    if t is None:
+                        break
+                    self.offer(t); open_.append(t.task_id)
         for tid, t in self.tasks.items():
             m = self.meta[tid]
             if m['claimed'] is None and m['done'] is None and not m['stranded'] and \
