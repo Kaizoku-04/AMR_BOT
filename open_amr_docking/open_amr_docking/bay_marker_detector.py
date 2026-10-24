@@ -95,8 +95,16 @@ class BayMarkerDetector(Node):
 
     def on_odom(self, m):
         p = m.pose.pose
-        self.odom.append((m.header.stamp.sec + m.header.stamp.nanosec * 1e-9, p.position.x, p.position.y,
-                          yaw_of(p.orientation)))
+        s = (m.header.stamp.sec + m.header.stamp.nanosec * 1e-9, p.position.x, p.position.y, yaw_of(p.orientation))
+        # an odometry step no robot can drive: tracking predicts the marker from these poses, and a jump moves the
+        # prediction off the marker (chain 47 c47_load0, 2026-10-25: the EKF's odom was ~65 m off at start-up)
+        if self.odom:
+            t0, x0, y0, _ = self.odom[-1]
+            step = math.hypot(s[1] - x0, s[2] - y0)
+            if s[0] < t0 or (step > 0.02 and step > 2.0 * max(s[0] - t0, 1e-3)):
+                self.get_logger().warn(f'odometry jump: {step:.3f} m in {1e3 * (s[0] - t0):+.0f} ms (stamps), at '
+                                       f'({s[1]:.2f}, {s[2]:.2f})', throttle_duration_sec=1.0)
+        self.odom.append(s)
 
     def odom_at(self, t):
         """Odometry pose (x, y, yaw) at time t: interpolated, or extrapolated up to 0.1 s past the last sample."""
@@ -131,7 +139,9 @@ class BayMarkerDetector(Node):
         self.last_cb = now
         best = self.track(ts)
         if best is not None:
+            self.pred_src = 'tracking'
             return self.fit(scan, ts, best)
+        self.pred_src = 'map'
         last = getattr(self, 'last_det', None)
         if last is not None and 0.0 <= ts - last[0] < 1.0:
             self.skip['track_no_odom'] += 1                 # tracking, but no odometry at the scan time
@@ -186,6 +196,26 @@ class BayMarkerDetector(Node):
         px, py = c * (X - lp[0]) - s * (Y - lp[1]), s * (X - lp[0]) + c * (Y - lp[1])
         return (math.hypot(px, py), name, (px, py, Yaw - lp[2]), self.markers[name])
 
+    def miss_diag(self, pts, pred, ts, name, frame):
+        """Why the region of interest held no marker (chain 45 fleet, chain 47; 2026-10-25): the prediction in the
+        lidar frame, the nearest scan point to it, the newest odometry's stamp against the scan's, and, while
+        tracking, where the map-based prediction would have put the marker."""
+        d = float(np.min(np.hypot(pts[:, 0] - pred[0], pts[:, 1] - pred[1]))) if len(pts) else float('nan')
+        age = 1e3 * (self.odom[-1][0] - ts) if self.odom else float('nan')
+        alt = ''
+        if getattr(self, 'pred_src', '') == 'tracking':
+            try:
+                t = self.tf.lookup_transform(frame, self.map_frame, rclpy.time.Time())
+                tx, ty, tyaw = t.transform.translation.x, t.transform.translation.y, yaw_of(t.transform.rotation)
+                mx, my, _ = self.markers[name]['pose']
+                ax, ay = tx + math.cos(tyaw) * mx - math.sin(tyaw) * my, ty + math.sin(tyaw) * mx + math.cos(tyaw) * my
+                alt = f'; map-based ({ax:+.2f}, {ay:+.2f}), {math.hypot(ax - pred[0], ay - pred[1]):.2f} m from it'
+            except Exception:
+                alt = '; no map transform'
+        self.get_logger().warn(f'{name}: no marker near the {getattr(self, "pred_src", "?")} prediction '
+                               f'({pred[0]:+.2f}, {pred[1]:+.2f}) m in the lidar frame; nearest scan point {d:.2f} m '
+                               f'from it; newest odometry {age:+.0f} ms from the scan{alt}', throttle_duration_sec=1.0)
+
     def fit(self, scan, ts, best):
         _, name, pred, m = best
         r = np.asarray(scan.ranges, float)
@@ -196,6 +226,8 @@ class BayMarkerDetector(Node):
         if pose is None:
             self.missed += 1
             self.last_why = f'{name}: {info}'
+            if info.endswith('points near the predicted marker'):
+                self.miss_diag(pts, pred, ts, name, scan.header.frame_id)
             return
         lp = self.lidar_in_odom(ts)                        # base in odom, then the lidar mount, then the marker
         if lp is None:
