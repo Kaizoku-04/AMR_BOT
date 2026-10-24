@@ -104,6 +104,11 @@ class BayMarkerDetector(Node):
             if s[0] < t0 or (step > 0.02 and step > 2.0 * max(s[0] - t0, 1e-3)):
                 self.get_logger().warn(f'odometry jump: {step:.3f} m in {1e3 * (s[0] - t0):+.0f} ms (stamps), at '
                                        f'({s[1]:.2f}, {s[2]:.2f})', throttle_duration_sec=1.0)
+            # the EKF publishes twice on one sim-clock tick now and then (13 % of its messages in chain 49's fleet
+            # shift, stamps < 1 us apart): keep the newer pose for that time, so no pair below spans ~0 s
+            if 0.0 <= s[0] - t0 < 1e-3:
+                self.odom[-1] = s
+                return
         self.odom.append(s)
 
     def odom_at(self, t):
@@ -113,7 +118,9 @@ class BayMarkerDetector(Node):
             return None
         if t > o[-1][0] and len(o) >= 2:                  # the scan came in before its odometry: extrapolate
             a, b = o[-2], o[-1]
-            f = (t - a[0]) / max(b[0] - a[0], 1e-9)
+            if b[0] - a[0] < 1e-3:                         # no rate from a pair ~0 s apart (chain 49: dividing by
+                return b[1:]                               # ~1e-9 put a 0.002 mm step at 80 m)
+            f = (t - a[0]) / (b[0] - a[0])
             return (a[1] + f * (b[1] - a[1]), a[2] + f * (b[2] - a[2]),
                     a[3] + f * math.remainder(b[3] - a[3], math.tau))
         for a, b in zip(o, o[1:]):
