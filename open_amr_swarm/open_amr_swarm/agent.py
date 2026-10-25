@@ -202,6 +202,11 @@ class SwarmAgent(Node):
         self.reloc_at, self.reloc_tries = -1e9, 0
         self.pub_initialpose = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
         self.dock_state, self.dock_fails, self.docked, self.docking = None, 0, False, False
+        # a 905 (FAILED_TO_CONTROL) is the docking controller missing its odom -> base_footprint sample, not a dock gone
+        # wrong: every one in the real-input shifts of 2026-10-25 (c51-c55, 49) came with 'Could not get transform' and
+        # no collision, and three of them in a row left a robot STUCK at the bay (1-2 robots a shift). They get their
+        # own budget per bay visit and do not count towards the 3 attempts; the recovery is the same.
+        self.control_fails, self.control_fail_budget = 0, dp('control_fail_budget', 5).value
         # backing out of a bay (to dock again): the docking server's undock reverses to the staging pose; when that is
         # blocked (a person, a robot that isn't an agent) retry every 5 s for up to backout_patience_s, then STUCK
         self.backout_patience = dp('backout_patience_s', 60.0).value
@@ -375,7 +380,7 @@ class SwarmAgent(Node):
             if self.dock_state == 'gave_up':
                 self.get_logger().warn(f'{self.rid}: operator {m.issued_by or "?"} acknowledged the docking fault: '
                                        f'back to staging, fresh attempts')
-                self.dock_fails = 0
+                self.dock_fails = self.control_fails = 0
                 self.status = self.leg.drive_status if self.leg is not None else RobotState.IDLE
                 if self.in_bay():          # nose-in at the pedestal: a forward-only path can't leave (deadlock, 2026-10-03)
                     self.back_out(self.graph.name[self.route[-1]], 'operator acknowledged')
@@ -869,6 +874,7 @@ class SwarmAgent(Node):
         self.leg = self.legs.pop(0)
         self.status = self.leg.drive_status
         self.dock_state, self.dock_fails, self.docked = None, 0, False
+        self.control_fails = 0
         start = self.start_node()
         if self.backed_off_bay(start):
             start = self.graph.succ[start][0]   # plan from the bay's exit: on_route's lead-in runs from where I stopped
@@ -1240,7 +1246,7 @@ class SwarmAgent(Node):
             # descending arm (fleet run 2026-10-02). final_reached() finishes it (settled() then check_dock()).
             self.dock_state, self.settle_since, self.dock_name, self.dock_retries = 'settling', None, name, res.num_retries
         else:
-            self.dock_failed(name, f'error {res.error_code} {res.error_msg}'.strip())
+            self.dock_failed(name, f'error {res.error_code} {res.error_msg}'.strip(), res.error_code)
 
     def settled(self):
         """Docking: the robot has stood still (no mm of motion per 0.2 s tick) for 0.5 s."""
@@ -1442,14 +1448,19 @@ class SwarmAgent(Node):
         b = self.graph.pos[self.route[-1]] if self.route else None
         return b is not None and self.pose is not None and math.hypot(self.pose[0] - b[0], self.pose[1] - b[1]) < 0.5
 
-    def dock_failed(self, name, why):
+    def dock_failed(self, name, why, code=None):
         """The docking server gave up (after its own retries). Its recovery can leave the robot anywhere near the bay
         (fleet run 2026-10-03: 1.8 m off, facing away, the marker out of view) and docking from there fails at once —
         it was retried 79 times. So: drive back to the staging node along the lanes (or, from inside the bay, back out
         to it) and dock again from there; after 3 attempts stop and report STUCK until an operator acknowledges
         (OperatorCommand.ACK_FAULT) — as an AMR pauses its mission and calls for a person."""
-        self.dock_fails += 1
-        self.get_logger().warn(f'{self.rid}: docking at {name} failed ({why}), attempt {self.dock_fails}')
+        if code == DockRobot.Result.FAILED_TO_CONTROL and self.control_fails < self.control_fail_budget:
+            self.control_fails += 1
+            self.get_logger().warn(f'{self.rid}: docking at {name} failed ({why}): control failure '
+                                   f'{self.control_fails}/{self.control_fail_budget}, not counted as an attempt')
+        else:
+            self.dock_fails += 1
+            self.get_logger().warn(f'{self.rid}: docking at {name} failed ({why}), attempt {self.dock_fails}')
         if self.dock_fails >= 3:
             return self.give_up_dock(name)
         if self.in_bay():
