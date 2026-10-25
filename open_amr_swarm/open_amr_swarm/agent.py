@@ -179,6 +179,17 @@ class SwarmAgent(Node):
         self.staging_tol = dp('staging_tol_m', 0.12).value
         self.dock_pose_msg = None
         self.create_subscription(PoseStamped, 'dock_pose', lambda m: setattr(self, 'dock_pose_msg', m), 10)
+        # The docking server's dock_pose is its filtered estimate from the approach, made while moving; the robot stops
+        # within 5 mm of it, so judging the dock against it can't see that estimate's own error. With real inputs that
+        # error reached 10-14 mm (truth vs reported, chains 50-54, 2026-10-25), and two docks reported at 6 mm stood
+        # 16 and 20 mm off: the cell's dock sensor (15 mm) then stopped the arm. Marker detections at standstill agree
+        # with the truth to 0.5 mm (spread 0.6 mm, chain 58), so the dock is judged from their mean once settled.
+        self.marker_to_dock = dp('marker_to_dock_m', 0.6).value       # the dock database's `to_dock`
+        self.det_window = dp('dock_check_window_s', 1.0).value
+        self.dets = []                   # (receive time, x, y, yaw) of detected_dock_pose: the marker apex in odom
+        self.settle_since = None         # docking: when the robot was first seen still after the server's success
+        if self.dock_bays:
+            self.create_subscription(PoseStamped, 'detected_dock_pose', self.on_detection, 10)
         # docked at a bay, the bay's surveyed pose + the marker-measured dock error is the robot's pose to millimetres;
         # AMCL can be 0.3-0.4 m off there (it stops updating at standstill): the cells' interlock then never saw the
         # robot at its bay and both arms waited all shift (fleet run c41_base, 2026-10-21). AMCL is reset BEFORE the
@@ -1237,11 +1248,16 @@ class SwarmAgent(Node):
             self.settle_since = None
             return False
         self.settle_since = self.settle_since or self.now()
-        return self.now() - self.settle_since >= 0.5
+        # long enough for the standstill mean of the marker detections (standstill_dock: >= 10 at ~25 Hz)
+        return self.now() - self.settle_since >= (max(0.5, self.det_window) if self.dock_bays else 0.5)
 
     def check_dock(self, name):
         """Settled: accurate enough -> docked; else back out to staging and dock again."""
-        err = self.dock_error()
+        err, srv, sd = self.dock_error(), self.server_dock_error(), self.standstill_dock()
+        if err is not None and srv is not None:
+            self.get_logger().info(f'{self.rid}: dock check at {name}: standstill mean of {sd[4] if sd else 0} detections '
+                                   f'{1000 * math.hypot(err[0], err[1]):.1f} mm {"" if sd else "(too few: server pose) "}'
+                                   f'/ server pose {1000 * math.hypot(srv[0], srv[1]):.1f} mm')
         if err is not None and (math.hypot(err[0], err[1]) > self.dock_tol or abs(err[2]) > self.dock_tol_yaw):
             self.get_logger().warn(f'{self.rid}: docked at {name} but {1000 * err[0]:+.0f} / {1000 * err[1]:+.0f} mm, '
                                    f'{math.degrees(err[2]):+.1f} deg off: backing out to dock again')
@@ -1261,8 +1277,47 @@ class SwarmAgent(Node):
                                + (f', {1000 * math.hypot(err[0], err[1]):.0f} mm / {math.degrees(err[2]):+.1f} deg'
                                   if err is not None else ''))
 
+    def on_detection(self, m):
+        q = m.pose.orientation
+        t = self.now()
+        self.dets.append((t, m.pose.position.x, m.pose.position.y, 2 * math.atan2(q.z, q.w), m.header.frame_id))
+        while self.dets and t - self.dets[0][0] > 5.0:
+            self.dets.pop(0)
+
+    def standstill_dock(self):
+        """The dock pose from the mean of the last det_window s of marker detections (>= 10, all since the robot
+        settled), shifted from the marker apex to the dock by marker_to_dock; None if there are too few."""
+        t0 = max(self.now() - self.det_window, self.settle_since or 0.0)
+        d = [x for x in self.dets if x[0] >= t0]
+        if len(d) < 10 or len({x[4] for x in d}) != 1:
+            return None
+        mx, my = sum(x[1] for x in d) / len(d), sum(x[2] for x in d) / len(d)
+        myaw = math.atan2(sum(math.sin(x[3]) for x in d), sum(math.cos(x[3]) for x in d))
+        return (mx - self.marker_to_dock * math.cos(myaw), my - self.marker_to_dock * math.sin(myaw), myaw, d[0][4],
+                len(d))
+
     def dock_error(self):
-        """(along, across, yaw) of base_footprint relative to the refined dock pose, or None if unknown."""
+        """(along, across, yaw) of base_footprint relative to the dock: from the standstill mean of the marker
+        detections while settling or localizing at a bay, else the docking server's refined dock pose. None if unknown."""
+        sd = self.standstill_dock() if self.dock_state in ('settling', 'localizing') else None
+        return self.dock_error_from(sd)
+
+    def server_dock_error(self):
+        """dock_error() against the docking server's refined dock pose only (for the comparison in the log)."""
+        return self.dock_error_from(None)
+
+    def dock_error_from(self, sd):
+        if sd is not None:
+            dxp, dyp, dyaw, frame, _ = sd
+            try:
+                t = self.tf.lookup_transform(frame, 'base_footprint', Time())
+            except Exception:
+                return None
+            r = t.transform.rotation
+            ryaw = math.atan2(2 * (r.w * r.z + r.x * r.y), 1 - 2 * (r.y * r.y + r.z * r.z))
+            dx, dy = t.transform.translation.x - dxp, t.transform.translation.y - dyp
+            c, s = math.cos(dyaw), math.sin(dyaw)
+            return c * dx + s * dy, -s * dx + c * dy, math.remainder(ryaw - dyaw, math.tau)
         m = self.dock_pose_msg
         if m is None:
             return None
