@@ -135,7 +135,13 @@ class BayMarkerDetector(Node):
             try:
                 m = self.tf.lookup_transform(self.base_frame, scan.header.frame_id, rclpy.time.Time())
                 self.mount = (m.transform.translation.x, m.transform.translation.y, yaw_of(m.transform.rotation))
-            except Exception:
+                self.get_logger().info(f'lidar mount {self.base_frame} -> {scan.header.frame_id}: '
+                                       f'({self.mount[0]:.3f}, {self.mount[1]:.3f}, {math.degrees(self.mount[2]):.1f} deg)')
+            except Exception as e:
+                # without the static mount nothing is fitted and nothing is reported: c52_real amr_5 (2026-10-25)
+                # docked 0 times with a detector that never printed a line after start-up
+                self.get_logger().warn(f'no lidar mount ({self.base_frame} -> {scan.header.frame_id}) yet, scans '
+                                       f'ignored: {e}', throttle_duration_sec=10.0)
                 return
         ts = scan.header.stamp.sec + scan.header.stamp.nanosec * 1e-9
         now = self.get_clock().now().nanoseconds * 1e-9
