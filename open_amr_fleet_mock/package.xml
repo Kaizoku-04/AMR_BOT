@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>open_amr_fleet_mock</name>
+  <version>0.1.0</version>
+  <description>Message-level mock of the OpenAMR fleet and its two arm stations, for developing and stress-testing the
+    WMS without Isaac Sim: N robots publish RobotState at 5 Hz, bid travel times over the real lane graph and pick
+    winners with the swarm agent's own rule (open_amr_swarm.auction), claim / release / finish tasks, transfer boxes,
+    drain and charge batteries (open_amr_swarm.energy); stations use open_amr_swarm.station. Failures from a scenario
+    file or a parameter service. Runs faster than real time on /clock, seeded and deterministic.</description>
+  <maintainer email="dodorapapah@gmail.com">Mohannad Rababah</maintainer>
+  <license>MIT</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
+  <exec_depend>open_amr_msgs</exec_depend>
+  <exec_depend>open_amr_swarm</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
