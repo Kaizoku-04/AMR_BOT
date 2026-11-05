@@ -1,0 +1,4 @@
+# The Isaac truth baseline's configuration (vault Results, chain 50 c50_truth: 76/h over 900 s): no failures.
+robots: 6
+seed: 1
+events: []

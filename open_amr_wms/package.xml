@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>open_amr_wms</name>
+  <version>0.1.0</version>
+  <description>Warehouse management for the OpenAMR Swarm: offers tasks to the decentralized fleet (never assigns
+    robots), keeps the bin inventory (SKU and box per bin) and the task history in SQLite, resumes from the robots'
+    heartbeats after a restart; orders, customers and inbound receipts (ASN) in by CSV / JSON / REST; operator
+    commands, an event log, a LAN dashboard and shift reports.</description>
+  <maintainer email="dodorapapah@gmail.com">Laith</maintainer>
+  <license>MIT</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>open_amr_msgs</exec_depend>
+  <exec_depend>open_amr_swarm</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>open_amr_fleet_mock</test_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

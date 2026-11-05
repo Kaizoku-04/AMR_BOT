@@ -1,0 +1,10 @@
+# Every failure the mock can play, once each, in a 1 h shift (open_amr_fleet_mock fleet.py "Commands").
+robots: 6
+seed: 3
+events:
+  - {at: 300, do: silent, target: amr_2, for_s: 90}      # Wi-Fi drop: peers release its task after 20 s
+  - {at: 600, do: stuck, target: amr_4, for_s: 180}      # STUCK: gives its task back after 120 s (if empty)
+  - {at: 900, do: give_back, target: amr_1}              # hands its task back
+  - {at: 1200, do: arm_fault, target: arm_outbound, for_s: 240}
+  - {at: 1800, do: starve, target: arm_receiving, for_s: 300}
+  - {at: 2400, do: drop_rate, target: all, value: 0.05}  # 5 % of messages lost per recipient from here on

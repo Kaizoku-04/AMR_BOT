@@ -47,6 +47,7 @@ from std_msgs.msg import UInt8
 from std_srvs.srv import Trigger
 from open_amr_msgs.msg import Bid, Claim, OperatorCommand, RobotState, StationState, Task, Transfer
 
+from . import auction as rules
 from .energy import (ChargeParams, ChargerPeer, DrainEstimator, bid_penalty_s, can_take, evictions, pick_charger,
                      task_need, waiting_for_charger)
 from .lane_graph import LaneGraph
@@ -784,7 +785,7 @@ class SwarmAgent(Node):
     # ------------------------------------------------------------------ auction
     def pending_tasks(self):
         return sorted((t for t in self.tasks.values() if t.task_id not in self.claims and t.task_id not in self.done),
-                      key=lambda t: (-t.priority, stamp_s(t.stamp), t.task_id))
+                      key=lambda t: rules.task_order(t.priority, stamp_s(t.stamp), t.task_id))
 
     def available(self):
         return (self.task is None and self.phase in ('idle', 'driving') and not self.bid_pending
@@ -802,13 +803,13 @@ class SwarmAgent(Node):
         # 1) decide every closed round (all agents run this with the same bids -> same winner)
         for t in list(self.tasks.values()):
             key = (t.task_id, t.round)
-            if key in self.decided or now < stamp_s(t.stamp) + self.bid_window or t.task_id in self.claims:
+            if key in self.decided or not rules.closed(now, stamp_s(t.stamp), self.bid_window) or t.task_id in self.claims:
                 continue
             self.decided.add(key)
             bids = self.bids.get(key, {})
             if not bids:
                 continue
-            winner = min(bids.items(), key=lambda kv: (kv[1], kv[0]))[0]
+            winner = rules.winner(bids)
             if winner == self.rid and self.task is None and not self.paused() and not self.out_of_service:
                 self.claim_and_start(t)
         # 2) bid on the most urgent open task we haven't bid on yet
@@ -816,7 +817,7 @@ class SwarmAgent(Node):
             return
         for t in self.pending_tasks():
             key = (t.task_id, t.round)
-            if key in self.my_bids or now >= stamp_s(t.stamp) + self.bid_window:
+            if key in self.my_bids or rules.closed(now, stamp_s(t.stamp), self.bid_window):
                 continue
             if self.bms and not can_take(self.battery, self.task_need(t), self.cp):
                 continue                                  # can't finish it and still reach a charger
