@@ -113,10 +113,13 @@ class Wms:
                     self.store.put_bin(b, full, sku, box)
         self.seq = self.store.counter('seq')
         self.meta = {}
+        self.open = set()                         # ids of tasks not done / withdrawn (kept by save(); stress 2026-11-05)
         self.resuming = set()
         for tid, (m, state) in self.store.tasks().items():
             m['last_offer'] = -math.inf          # re-offer unclaimed ones at once (round + 1)
             self.meta[tid] = m
+            if m['done'] is None:
+                self.open.add(tid)
             if state in (OPEN, CLAIMED) or (state == STRANDED and m['done'] is None):
                 if state == CLAIMED:
                     self.resuming.add(tid)
@@ -137,6 +140,10 @@ class Wms:
         return CLAIMED if m['claimed'] is not None else OPEN
 
     def save(self, tid):
+        if self.meta[tid]['done'] is None:
+            self.open.add(tid)
+        else:
+            self.open.discard(tid)
         self.store.put_task(tid, {k: v for k, v in self.meta[tid].items() if k != 'last_offer' or math.isfinite(v)},
                             self.state_of(self.meta[tid]))
 
@@ -149,7 +156,11 @@ class Wms:
         self.say(level, f'{who}: {what}' + (f' — {why}' if why else ''))
 
     def open_ids(self):
-        return [k for k, m in self.meta.items() if m['done'] is None and not m['stranded']]
+        return [k for k in sorted(self.open) if not self.meta[k]['stranded']]
+
+    def live(self):
+        """(task_id, record) of every task not done or withdrawn, in id order."""
+        return [(k, self.meta[k]) for k in sorted(self.open)]
 
     def task_msg(self, m):
         return Task(stamp=to_time(m['last_offer'] if math.isfinite(m['last_offer']) else self.now()),
@@ -231,7 +242,7 @@ class Wms:
         return out | self.graph.cut_off(out) if out and self.graph is not None else out
 
     def withdraw_blocked(self, blocked):
-        for tid, m in self.meta.items():
+        for tid, m in self.live():
             if m['claimed'] is not None or m['done'] is not None or m['stranded']:
                 continue
             hit = [n for n in (m['origin'], m['dest']) if n and self.node_id.get(n) in blocked]
@@ -248,7 +259,7 @@ class Wms:
             self.event('wms', f'withdrew {tid}', f'{hit[0]} is blocked by a silent robot', tid, 'warn')
 
     def retarget_blocked(self, blocked):
-        for tid, m in self.meta.items():
+        for tid, m in self.live():
             if m['kind'] != 'inbound' or m['done'] is not None or not m['on_robot'] or not m['robot'] or \
                     self.node_id.get(m['dest']) not in blocked or self.silent(m['robot']):
                 continue
@@ -268,7 +279,7 @@ class Wms:
     def check_stranded(self):
         silent_s = LivenessParams().reclaim_silent_s
         t = self.now()
-        for tid, m in self.meta.items():
+        for tid, m in self.live():
             if m['done'] is not None or m['stranded'] or not m['robot'] or not m['on_robot']:
                 continue
             rx = self.robot_rx.get(m['robot'])
@@ -307,8 +318,7 @@ class Wms:
         st = self.station(bay)
         if st is None or st.state == StationState.FAULT:
             return 0
-        pending = sum(1 for m in self.meta.values() if m['kind'] == kind and m['done'] is None and not m['at_arm']
-                      and not m['stranded'])
+        pending = sum(1 for _, m in self.live() if m['kind'] == kind and not m['at_arm'] and not m['stranded'])
         return st.boxes_available - pending
 
     def offerable(self, m):
@@ -352,7 +362,7 @@ class Wms:
                     if tid is None:
                         break
                     self.offer(tid); open_.append(tid)
-        for tid, m in self.meta.items():
+        for tid, m in self.live():
             if m['claimed'] is None and m['done'] is None and not m['stranded'] and \
                     now - m['last_offer'] > self.reoffer_s and self.offerable(m):
                 m['round'] += 1

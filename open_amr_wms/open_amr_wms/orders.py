@@ -43,6 +43,7 @@ class Orders:
         self.asns = {r[0]: json.loads(r[1]) for r in self.db.execute('SELECT id, data FROM asns')}
         self.customers = dict(self.db.execute('SELECT id, name FROM customers').fetchall())
         self.unannounced = store.counter('unannounced')
+        self.live = {k for k, o in self.orders.items() if o['state'] not in FINAL}   # orders not shipped / cancelled
 
     # ------------------------------------------------------------------ intake (CSV / JSON / REST all end here)
     def add_customer(self, cid, name=''):
@@ -116,6 +117,7 @@ class Orders:
 
     def save_order(self, oid):
         o = self.orders[oid]
+        (self.live.discard if o['state'] in FINAL else self.live.add)(oid)
         self.db.execute('INSERT OR REPLACE INTO orders VALUES (?,?,?)', (oid, json.dumps(o), o['state']))
 
     def save_asn(self, aid):
@@ -133,7 +135,7 @@ class Orders:
         return min(4, 1 + self.effective_priority(o, now))
 
     def queue(self, now):
-        live = [o for o in self.orders.values() if o['state'] not in FINAL]
+        live = [self.orders[k] for k in self.live]
         return sorted(live, key=lambda o: (-self.effective_priority(o, now), o['cutoff_s'], o['id']))
 
     # ------------------------------------------------------------------ the WMS's work source interface
@@ -179,21 +181,25 @@ class Orders:
 
     def tick(self, wms):
         now = wms.now()
-        for o in list(self.orders.values()):
-            if o['state'] in FINAL:
-                continue
+        by_order = {}
+        for tid, m in wms.live():                         # open tasks only (stress 2026-11-05: scanning every task of
+            if m.get('order'):                            # the shift for every order was 84 % of the WMS's time)
+                by_order.setdefault(m['order'], []).append((tid, m))
+        for oid in sorted(self.live):
+            o = self.orders[oid]
             if now >= o['cutoff_s']:
-                self.short_ship(wms, o, now)
+                self.short_ship(wms, o, now, by_order.get(oid, []))
                 continue
             p = self.task_priority(o, now)
-            for tid, m in wms.meta.items():
-                if m.get('order') == o['id'] and m['done'] is None and m['claimed'] is None and m['priority'] != p:
+            for tid, m in by_order.get(oid, []):
+                if m['claimed'] is None and m['priority'] != p:
                     m['priority'] = p                     # takes effect at the next re-offer
                     wms.save(tid)
 
-    def short_ship(self, wms, o, now):
-        for tid, m in list(wms.meta.items()):
-            if m.get('order') == o['id'] and m['done'] is None and m['claimed'] is None:
+    def short_ship(self, wms, o, now, tasks=None):
+        tasks = tasks if tasks is not None else [(t, m) for t, m in wms.live() if m.get('order') == o['id']]
+        for tid, m in tasks:
+            if m['done'] is None and m['claimed'] is None:
                 wms.withdraw(tid, f'order {o["id"]} reached its cut-off')     # withdrawn() returns the line
         short = sum(l['qty'] - l['picked'] for l in o['lines'])
         o['state'] = 'SHIPPED' if short <= 0 else 'SHORT_SHIPPED'

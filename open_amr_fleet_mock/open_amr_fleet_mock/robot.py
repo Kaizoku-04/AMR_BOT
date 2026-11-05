@@ -186,8 +186,8 @@ class MockRobot:
 
     # ------------------------------------------------------------------ inputs (only while the link is up)
     def on_task(self, m):
-        if self.link_down():
-            return
+        if self.link_down() or m.task_id in self.done:
+            return                          # finished: kept out of the view (the agent keeps it, filtered as done)
         cur = self.tasks.get(m.task_id)
         if cur is None or m.round >= cur.round:
             self.tasks[m.task_id] = m
@@ -220,6 +220,9 @@ class MockRobot:
                 self.abort_task()
         elif m.action in (Claim.DONE, Claim.CANCEL):
             self.done.add(tid)
+            if not (self.task is not None and self.task.task_id == tid):
+                self.tasks.pop(tid, None)   # the agent keeps finished tasks and filters them every tick; dropping them
+                                            # here changes no decision and keeps a long run linear (stress 2026-11-05)
             if m.action == Claim.CANCEL and self.task is not None and self.task.task_id == tid and not self.loaded:
                 self.say(f'the WMS withdrew {tid}; dropping it')
                 self.claims.pop(tid, None)
@@ -355,6 +358,7 @@ class MockRobot:
         self.send('/swarm/claims', Claim(stamp=to_time(self.now), resource_type=Claim.TASK, resource_id=t.task_id,
                                          robot_id=self.rid, action=Claim.DONE, round=t.round))
         self.done.add(t.task_id)
+        self.tasks.pop(t.task_id, None)
         self.say(f'done {t.task_id} at {self.graph.name[self.last_node]}')
         self.task, self.leg, self.loaded = None, None, False
         self.phase, self.status, self.idle_since = 'idle', RobotState.IDLE, self.now
