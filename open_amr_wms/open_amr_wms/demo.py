@@ -35,6 +35,7 @@ def main():
     ap.add_argument('--graph', default=os.path.join(root, 'sim', 'worlds', 'warehouse_mission_graph.geojson'))
     ap.add_argument('--rtf', type=float, default=20.0)
     ap.add_argument('--port', type=int, default=8080)
+    ap.add_argument('--host', default='127.0.0.1', help='0.0.0.0 = the LAN (writes then need WMS_API_KEY)')
     ap.add_argument('--scenario', default='')
     ap.add_argument('--until', type=float, default=8 * 3600)
     ap.add_argument('--robots', type=int, default=6)
@@ -48,7 +49,7 @@ def main():
     sample_orders(w, skus)
     w.attach(fleet.bus)
     lock = threading.RLock()
-    srv = serve(Api(w.node, w.orders, lock), '0.0.0.0', a.port)
+    srv = serve(Api(w.node, w.orders, lock), a.host, a.port)
     print(f'dashboard: http://localhost:{srv.server_address[1]}/', flush=True)
     now, dt, w0 = 1.0, 0.1, time.monotonic()
     while now < a.until:

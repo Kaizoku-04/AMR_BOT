@@ -4,12 +4,13 @@ Takes over every duty of notes/WMS Interface.md §4 from open_amr_swarm/mission_
 mission_generator code it replaces is cited per method), and adds:
   persistence   bins (SKU, box id), tasks and the event log in SQLite (store.py), written through on every change.
   restart       a WMS that restarts resumes from the store and the heartbeats (state, not events; ADR-042):
-                  - unclaimed open tasks are re-offered at once with round + 1 (rounds robots decided before stay
-                    decided; the new round is a fresh auction);
-                  - a claimed task: once heartbeats have been heard for `resume_grace_s`, the robot whose heartbeat
-                    shows it keeps it (adopted, any round); if no heartbeat shows it and its box is not on a robot, it
-                    is given back (re-offered); if its box was on a robot that no longer shows it, it is STRANDED
-                    (a person checks: delivered while the WMS was down, or lost) — never guessed.
+                  - nothing is offered or re-offered until heartbeats have been heard for `resume_grace_s` (a CLAIM
+                    sent while the WMS was down shows up there; re-offering first took work away, review 2026-11-05);
+                  - any open task a heartbeat shows is adopted by that robot, whatever round it shows;
+                  - a claimed task no heartbeat shows: its DONE or RELEASE may have been lost, and the WMS can't tell
+                    which (a pickup transfer can be lost too) — it is flagged VERIFY (stranded, alarm) and a person
+                    resolves it (`resolve()`: done -> the bin is booked, or re-offer); never re-offered blind;
+                  - then unclaimed open tasks are re-offered with round + 1.
                   - promised bins are rebuilt from the open tasks.
   start-up      no work for a station's arm until that station has been heard, or `station_wait_s` passed without
                 any station heartbeat at all (runs without station agents). mission_generator offered at once
@@ -124,6 +125,8 @@ class Wms:
                 if state == CLAIMED:
                     self.resuming.add(tid)
         self.restarted = bool(self.meta)
+        self.restored = {t for t in self.open}            # open at restart: adopt from any heartbeat, any round
+        self.settled = not self.restarted
         self.promised = {m['bin'] for m in self.meta.values() if m['done'] is None and m['bin']}
         self.first_hb = None
         if self.restarted:
@@ -318,7 +321,7 @@ class Wms:
         st = self.station(bay)
         if st is None or st.state == StationState.FAULT:
             return 0
-        pending = sum(1 for _, m in self.live() if m['kind'] == kind and not m['at_arm'] and not m['stranded'])
+        pending = sum(1 for _, m in self.live() if m['kind'] == kind and not m['at_arm'])
         return st.boxes_available - pending
 
     def offerable(self, m):
@@ -346,6 +349,8 @@ class Wms:
             self.retarget_blocked(blocked)
         self.check_stranded()
         self.resume_check()
+        if not self.settled:
+            return                                    # restarted: wait for the heartbeats first (module doc)
         self.source.tick(self)
         open_ = self.open_ids()
         while len(open_) < self.open_target:
@@ -371,8 +376,10 @@ class Wms:
 
     def resume_check(self):
         """After a restart: settle the claimed tasks from the heartbeats (module doc)."""
-        if not self.resuming or self.first_hb is None or self.now() - self.first_hb < self.resume_grace:
+        if self.settled or self.first_hb is None or self.now() - self.first_hb < self.resume_grace:
             return
+        self.settled = True
+        self.restored.clear()
         shown = {s.task_id: s.robot_id for s in self.robots.values() if s.task_id and not self.silent(s.robot_id)}
         for tid in sorted(self.resuming):
             m = self.meta[tid]
@@ -383,14 +390,11 @@ class Wms:
                 self.event('wms', f'{tid}: {shown[tid]} is on it', 'restart: learned from its heartbeat', tid)
             elif m['robot'] and self.silent(m['robot']) and m['robot'] in self.robots:
                 pass                                  # its robot is silent: the silent-robot rules decide
-            elif m['on_robot']:
-                self.strand(tid, f'restart: its box was on {m["robot"]}, whose heartbeat no longer shows the task '
-                                 f'(delivered while the WMS was down, or lost)')
             else:
-                m['claimed'], m['robot'] = None, ''
-                m['releases'] += 1
-                m['last_offer'] = -math.inf
-                self.event('wms', f'{tid} re-offered', 'restart: no heartbeat shows it', tid)
+                m['verify'] = True
+                self.strand(tid, f'VERIFY after a restart: {m["robot"]} no longer shows the task; it was delivered or '
+                                 f'given back while the WMS was down (check {m["bin"] or m["dest"]}; resolve as done '
+                                 f'or re-offer)')
             self.save(tid)
         self.resuming.clear()
 
@@ -439,6 +443,29 @@ class Wms:
 
     def on_done(self, tid, m):
         self.source.done(self, m)
+
+    def resolve(self, tid, outcome, who, why):
+        """A person resolved a STRANDED / VERIFY task: outcome 'done' (book it as delivered: the bin is updated) or
+        'reoffer' (the box is still where it started: offer it again). Logged with who and why."""
+        m = self.meta.get(tid)
+        if m is None or m['done'] is not None or not m['stranded']:
+            raise ValueError(f'{tid} is not a stranded task')
+        if not who or not why:
+            raise ValueError('who and why are required (event log)')
+        m['stranded'] = False
+        m.pop('verify', None)
+        if outcome == 'done':
+            from open_amr_msgs.msg import Claim as _C
+            self.event(who, f'{tid} resolved as delivered', why, tid, 'warn')
+            self.on_claim(_C(resource_type=_C.TASK, resource_id=tid, robot_id=m['robot'], action=_C.DONE))
+        elif outcome == 'reoffer':
+            m['claimed'], m['robot'], m['on_robot'], m['at_arm'] = None, '', False, False
+            m['releases'] += 1
+            m['last_offer'] = -math.inf
+            self.save(tid)
+            self.event(who, f'{tid} resolved: offered again', why, tid, 'warn')
+        else:
+            raise ValueError("outcome must be 'done' or 'reoffer'")
 
     def withdraw(self, tid, why, who='wms'):
         """Withdraw an unclaimed open task (Claim.CANCEL, by='wms'): its bin is free again."""
@@ -489,6 +516,7 @@ class Wms:
         self.reconcile(s)
         sh = self.shares.setdefault(s.robot_id, dict(driving=0.0, yielding=0.0, station=0.0, charging=0.0, idle=0.0))
         key = {RobotState.YIELDING: 'yielding', RobotState.ISOLATED: 'yielding', RobotState.AT_STATION: 'station',
+               getattr(RobotState, 'PAUSED', -1): 'yielding',
                RobotState.IDLE: 'idle', RobotState.CHARGING: 'charging', RobotState.TO_CHARGE: 'charging'}.get(
             s.status, 'driving')
         if s.status == RobotState.IDLE and s.speed > 0.05:
@@ -500,7 +528,7 @@ class Wms:
         m = self.meta.get(s.task_id)
         key = (s.robot_id, s.task_id)
         if m is not None and m['claimed'] is None and m['done'] is None and not m['cancelled'] and \
-                (s.task_round == m['round'] or s.task_id in self.resuming):
+                (s.task_round == m['round'] or s.task_id in self.resuming or s.task_id in self.restored):
             m['claimed'], m['robot'] = self.now(), s.robot_id
             self.resuming.discard(s.task_id)
             self.save(s.task_id)

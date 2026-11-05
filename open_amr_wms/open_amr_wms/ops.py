@@ -164,7 +164,7 @@ class Ops:
             raise ValueError(f'unknown command {name!r}; known: {sorted(COMMANDS)}')
         if not issued_by or not reason:
             raise ValueError('issued_by and reason are required (event log)')
-        if name in ('RELEASE_ROBOT', 'ACK_FAULT') and not target:
+        if name in ('RELEASE_ROBOT', 'ACK_FAULT', 'OUT_OF_SERVICE', 'IN_SERVICE') and not target:
             raise ValueError(f'{name} needs a target robot')
         msg = OperatorCommand(stamp=to_time(self.w.now()), command=COMMANDS[name], target=target, issued_by=issued_by,
                               reason=reason)

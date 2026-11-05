@@ -15,7 +15,10 @@ WMS lock, the same one the ROS callbacks take.
   GET    /api/v1/live | layout | alarms | kpis   the dashboard's data (ops.py)
   GET    /api/v1/report[?format=md]  the end-of-shift report (markdown; ?format=md downloads it)
   POST   /api/v1/operator          {command, target, issued_by, reason}: OperatorCommand on /swarm/operator, logged
+  POST   /api/v1/tasks/<id>/resolve {outcome: done | reoffer, issued_by, reason}: a person settles a stranded / VERIFY task
 Auth: if the environment has WMS_API_KEY, every /api call needs header X-Api-Key with that value (no key in the repo).
+Without a key, a server reachable from the LAN (not bound to localhost) refuses every write (POST / DELETE: orders,
+operator commands) with 401: anyone on the LAN could otherwise pause the fleet (interface review 2026-11-05).
 """
 import json
 import mimetypes
@@ -31,8 +34,9 @@ WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')
 
 
 class Api:
-    def __init__(self, wms, orders, lock=None, extra=None, ops=None):
+    def __init__(self, wms, orders, lock=None, extra=None, ops=None, open_writes=True):
         from .ops import Ops
+        self.open_writes = open_writes            # False: writes need WMS_API_KEY (serve() on a LAN address)
         self.wms, self.orders = wms, orders
         self.ops = ops or Ops(wms, orders, wms.graph)
         if self.ops.on_state not in wms.state_observers:
@@ -47,6 +51,8 @@ class Api:
         key = os.environ.get('WMS_API_KEY')
         if parts[:1] == ['api'] and key and (headers or {}).get('X-Api-Key') != key:
             return 401, {'error': 'missing or wrong X-Api-Key'}
+        if parts[:1] == ['api'] and method in ('POST', 'DELETE') and not key and not self.open_writes:
+            return 401, {'error': 'writes are refused: set WMS_API_KEY on the WMS (it listens on the LAN)'}
         try:
             data = json.loads(body) if body else {}
         except json.JSONDecodeError as e:
@@ -107,6 +113,12 @@ class Api:
         if res == ['report']:
             md = self.ops.report()
             return (200, md) if q.get('format') == 'md' else (200, {'markdown': md})
+        if len(res) == 3 and res[0] == 'tasks' and res[2] == 'resolve' and method == 'POST':
+            try:
+                self.wms.resolve(res[1], data.get('outcome', ''), data.get('issued_by', ''), data.get('reason', ''))
+            except ValueError as e:
+                return 400, {'error': str(e)}
+            return 200, {'task': res[1], 'outcome': data.get('outcome')}
         if res == ['operator'] and method == 'POST':
             try:
                 return 200, self.ops.command(data.get('command', ''), data.get('target', ''),
@@ -117,7 +129,10 @@ class Api:
 
 
 def serve(api, host='0.0.0.0', port=8080):
-    """Start the HTTP server in a daemon thread; returns the server (server.shutdown() to stop)."""
+    """Start the HTTP server in a daemon thread; returns the server (server.shutdown() to stop). On anything but
+    localhost, writes need WMS_API_KEY."""
+    if host not in ('127.0.0.1', 'localhost', '::1'):
+        api.open_writes = False
 
     class H(BaseHTTPRequestHandler):
         def _go(self, method):

@@ -7,6 +7,7 @@ from open_amr_msgs.msg import Claim, StationState, Task
 
 from open_amr_fleet_mock.fleet import Fleet
 from open_amr_fleet_mock.harness import run
+from open_amr_wms.api import Api
 from open_amr_wms.store import Store
 
 from conftest import GEOJSON, NODES, Tap
@@ -130,8 +131,16 @@ def test_restart_mid_shift_resumes_from_store_and_heartbeats(graph, tmp_path, wm
     assert len(ids) == len(set(ids))                  # the restarted WMS never reused a task id
     m2 = w2.node.meta
     for tid, rid in held.items():
-        m = m2[tid]
-        assert m['done'] is not None or m['robot'] == rid or m['stranded'] or m['releases']
+        m = m2[tid]                                   # finished, still with its robot, or flagged for a person
+        assert m['done'] is not None or m['robot'] == rid or m['stranded'], (tid, rid, m)
+    # the two tasks finished in the gap were never offered again (their DONE was lost): a person verifies them
+    reoffered = {m.task_id for _, s, m in tap.get('/swarm/tasks') if s == 'wms' and m.task_id in held}
+    assert {t for t in reoffered if any(x.task_id == t and x.round > 0 for _, s, x in tap.get('/swarm/tasks')
+                                        if s == 'wms' and _ > 720)} == set()
+    flagged = [t for t, m in m2.items() if m.get('verify')]
+    assert flagged
+    w2.node.resolve(flagged[0], 'done', 'laith', 'box found in its bin')
+    assert m2[flagged[0]]['done'] is not None
     after = [m for m in w2.done() if m['done'] > 900]
     assert len(after) >= 12                           # ~76/h for 900 s: the shift goes on
     bins = [m['bin'] for m in m2.values() if m['done'] is None and m['bin'] and not m['stranded']]
@@ -185,3 +194,43 @@ def test_ros_node_constructs_and_ticks(tmp_path):
         n.destroy_node()
     finally:
         rclpy.shutdown()
+
+
+def test_restart_adopts_a_claim_sent_while_the_wms_was_down(graph, tmp_path, wms):
+    """Interface review 2026-11-05: the restarted WMS re-offered (round + 1) tasks whose CLAIM fell into the outage
+    before any heartbeat could show them, and then told their robots to RELEASE them."""
+    db = str(tmp_path / 'wms.db')
+    f = Fleet(graph, seed=5)
+    tap = Tap(f)
+    w1 = wms(store=Store(db), seed=21)
+    run(f, w1, 12)                                    # stations heard at ~1 s, tasks offered by ~6 s
+    offered = {m.task_id for _, s, m in tap.get('/swarm/tasks') if s == 'wms'}
+    claimed_before = {c.resource_id for _, s, c in tap.get('/swarm/claims') if c.action == Claim.CLAIM}
+    f.bus.unsubscribe('wms'); w1.node.store.close()
+
+    class Dead:
+        def attach(self, bus): pass
+        def step(self, now): pass
+    run(f, Dead(), 30, start_s=12.1)
+    in_gap = {c.resource_id: c.robot_id for t, s, c in tap.get('/swarm/claims')
+              if c.action == Claim.CLAIM and t > 12 and c.resource_id in offered}
+    assert in_gap                                     # robots claimed while the WMS was down
+    n = len(tap.get('/swarm/tasks'))
+    w2 = wms(store=Store(db), seed=22)
+    hear = w2.node.on_state                           # its first 2 s of robot heartbeats are lost (best effort);
+    w2.node.on_state = lambda m: hear(m) if w2.t > 32.0 else None    # the stations' arrive: the race in the review
+    run(f, w2, 60, start_s=30.1)
+    for tid, rid in in_gap.items():
+        assert w2.node.meta[tid]['robot'] == rid or w2.node.meta[tid]['done'] is not None
+        assert not [m for _, s, m in tap.get('/swarm/tasks')[n:] if m.task_id == tid]       # never re-offered
+    assert not [c for _, s, c in tap.get('/swarm/claims') if s == 'wms' and c.resource_id in in_gap]
+
+
+def test_writes_need_a_key_when_the_api_is_on_the_lan(wms, monkeypatch):
+    w = wms(orders=True)
+    api = Api(w.node, w.orders, open_writes=False)    # what serve() sets for a LAN address
+    order = '{"id": "L1", "customer": "c", "cutoff_s": 100, "lines": [{"sku": "A", "qty": 1}]}'
+    assert api.handle('POST', '/api/v1/orders', order)[0] == 401
+    assert api.handle('GET', '/api/v1/status')[0] == 200
+    monkeypatch.setenv('WMS_API_KEY', 'k')
+    assert api.handle('POST', '/api/v1/orders', order, {'X-Api-Key': 'k'})[0] == 201

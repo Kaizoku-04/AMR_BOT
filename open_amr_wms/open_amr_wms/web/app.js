@@ -103,7 +103,9 @@ async function tick() {
 $('#cmd').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const body = Object.fromEntries(new FormData(ev.target).entries());
-  const r = await fetch('/api/v1/operator', { method: 'POST', body: JSON.stringify(body) });
+  const key = body.key; delete body.key;
+  const r = await fetch('/api/v1/operator', { method: 'POST', body: JSON.stringify(body),
+    headers: key ? { 'X-Api-Key': key } : {} });
   const j = await r.json(); $('#cmdres').textContent = r.ok ? `sent ${j.command} ${j.target || 'fleet'}` : j.error;
 });
 tick(); setInterval(tick, 1000);

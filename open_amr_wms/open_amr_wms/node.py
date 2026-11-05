@@ -54,6 +54,7 @@ class WmsNode(Node):
                        peer_timeout_s=dp('peer_timeout_s', 3.0).value,
                        station_timeout_s=dp('station_timeout_s', 3.0).value, reconcile_s=dp('reconcile_s', 3.0).value,
                        station_wait_s=dp('station_wait_s', 5.0).value, seed=dp('seed', 7).value,
+                       resume_grace_s=dp('resume_grace_s', 3.0).value,
                        initial_fill=dp('initial_fill', 0.5).value)
         w = self.wms
         self.lock = threading.RLock()            # the REST API's threads and the executor share the core
