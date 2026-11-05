@@ -14,15 +14,15 @@ from open_amr_fleet_mock.harness import run
 
 from conftest import Tap
 
-WMS_KINDS = ['mission_generator']
+WMS_KINDS = ['mission_generator', 'open_amr_wms']
 
 
 @pytest.fixture(params=WMS_KINDS)
-def make_wms(request, mg, tmp_path):
+def make_wms(request, mg, wms):
     def make(**kw):
         if request.param == 'mission_generator':
             return mg(**kw)
-        raise NotImplementedError(request.param)
+        return wms(**kw)
     make.kind = request.param
     return make
 

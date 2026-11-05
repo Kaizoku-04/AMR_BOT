@@ -11,3 +11,5 @@
 
 # Laith: warehouse management & operations (the WMS stand-in today; his own packages as they appear)
 /open_amr_swarm/open_amr_swarm/mission_generator.py   @xlaithx
+/open_amr_wms/                                  @xlaithx
+/open_amr_fleet_mock/                           @Kaizoku-04 @xlaithx

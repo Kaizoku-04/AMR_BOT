@@ -31,6 +31,11 @@ class Bus:
     def subscribe(self, topic, name, cb):
         self.subs.setdefault(topic, []).append((name, cb))
 
+    def unsubscribe(self, name):
+        """Remove every subscription of endpoint `name` (a process that died)."""
+        for topic in self.subs:
+            self.subs[topic] = [(n, cb) for n, cb in self.subs[topic] if n != name]
+
     def publish(self, topic, sender, msg):
         if topic in COPY_TOPICS or topic.startswith('/wms/'):
             msg = copy.deepcopy(msg)
