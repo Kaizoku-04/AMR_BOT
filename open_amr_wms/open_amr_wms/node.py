@@ -41,7 +41,8 @@ class WmsNode(Node):
             nodes = yaml.safe_load(f)
         self.pubs = {'/swarm/tasks': self.create_publisher(Task, '/swarm/tasks', EVENT_QOS),
                      '/swarm/claims': self.create_publisher(Claim, '/swarm/claims', EVENT_QOS),
-                     '/wms/inventory': self.create_publisher(Inventory, '/wms/inventory', INV_QOS)}
+                     '/wms/inventory': self.create_publisher(Inventory, '/wms/inventory', INV_QOS),
+                     '/swarm/operator': self.create_publisher(OperatorCommand, '/swarm/operator', OPERATOR_QOS)}
         log = self.get_logger()
         say = {'info': log.info, 'warn': log.warn, 'error': log.error}
         store = Store(db)

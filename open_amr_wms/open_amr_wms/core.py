@@ -97,6 +97,7 @@ class Wms:
         self.stations, self.stale_stations = {}, set()
         self.t0, self.cancelled = None, 0
         self.shares, self.dock = {}, {}
+        self.state_observers = []                # ops.Ops.on_state (alarm durations)
         # ---- state from the store
         stored = self.store.bins()
         if stored:
@@ -473,6 +474,8 @@ class Wms:
         self.robot_rx[s.robot_id] = self.now()
         if self.first_hb is None:
             self.first_hb = self.now()
+        for f in self.state_observers:
+            f(s)
         self.reconcile(s)
         sh = self.shares.setdefault(s.robot_id, dict(driving=0.0, yielding=0.0, station=0.0, charging=0.0, idle=0.0))
         key = {RobotState.YIELDING: 'yielding', RobotState.ISOLATED: 'yielding', RobotState.AT_STATION: 'station',

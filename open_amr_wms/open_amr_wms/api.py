@@ -12,6 +12,9 @@ WMS lock, the same one the ROS callbacks take.
   GET    /api/v1/inventory         every bin: full, SKU, box id
   GET    /api/v1/status            KPIs (fleet, orders, stations, robots)
   GET    /api/v1/events?since=<id> the event log
+  GET    /api/v1/live | layout | alarms | kpis   the dashboard's data (ops.py)
+  GET    /api/v1/report[?format=md]  the end-of-shift report (markdown; ?format=md downloads it)
+  POST   /api/v1/operator          {command, target, issued_by, reason}: OperatorCommand on /swarm/operator, logged
 Auth: if the environment has WMS_API_KEY, every /api call needs header X-Api-Key with that value (no key in the repo).
 """
 import json
@@ -28,8 +31,12 @@ WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')
 
 
 class Api:
-    def __init__(self, wms, orders, lock=None, extra=None):
+    def __init__(self, wms, orders, lock=None, extra=None, ops=None):
+        from .ops import Ops
         self.wms, self.orders = wms, orders
+        self.ops = ops or Ops(wms, orders, wms.graph)
+        if self.ops.on_state not in wms.state_observers:
+            wms.state_observers.append(self.ops.on_state)
         self.lock = lock or threading.RLock()
         self.extra = extra or {}          # path -> callable(method, query, body) for more endpoints (dashboard)
 
@@ -89,6 +96,23 @@ class Api:
             return 200, {'events': w.store.events(int(q.get('since', 0)), int(q.get('limit', 500)))}
         if res == ['status']:
             return 200, dict(wms=w.metrics(), orders=o.summary(now), now=now)
+        if res == ['live']:
+            return 200, self.ops.snapshot()
+        if res == ['layout']:
+            return 200, self.ops.layout()
+        if res == ['alarms']:
+            return 200, {'alarms': self.ops.alarms()}
+        if res == ['kpis']:
+            return 200, self.ops.kpis()
+        if res == ['report']:
+            md = self.ops.report()
+            return (200, md) if q.get('format') == 'md' else (200, {'markdown': md})
+        if res == ['operator'] and method == 'POST':
+            try:
+                return 200, self.ops.command(data.get('command', ''), data.get('target', ''),
+                                             data.get('issued_by', ''), data.get('reason', ''))
+            except ValueError as e:
+                return 400, {'error': str(e)}
         return 404, {'error': 'not found'}
 
 
@@ -103,9 +127,12 @@ def serve(api, host='0.0.0.0', port=8080):
             if method == 'GET' and not path.startswith('/api/') and path not in api.extra:
                 return self._static(path)
             code, out = api.handle(method, self.path, body, dict(self.headers))
-            raw = json.dumps(out, default=str).encode()
+            text = isinstance(out, str)
+            raw = out.encode() if text else json.dumps(out, default=str).encode()
             self.send_response(code)
-            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Type', 'text/markdown; charset=utf-8' if text else 'application/json')
+            if text:
+                self.send_header('Content-Disposition', 'attachment; filename="shift-report.md"')
             self.send_header('Content-Length', str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)

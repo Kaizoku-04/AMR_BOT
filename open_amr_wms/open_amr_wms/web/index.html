@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenAMR Warehouse</title>
+<!-- Served by the WMS on the warehouse LAN (open_amr_wms/api.py). No CDN, no external files: ADR-046. -->
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>OpenAMR Warehouse</h1>
+  <span id="clock" class="muted">connecting…</span>
+  <a id="report" href="/api/v1/report?format=md" download="shift-report.md">End-of-shift report</a>
+</header>
+<section id="kpis" class="tiles"></section>
+<main>
+  <div class="mapwrap card">
+    <div class="cardhead"><h2>Live map</h2><span class="legend" id="legend"></span></div>
+    <svg id="map" role="img" aria-label="Lane graph with robots, stations and bins"></svg>
+  </div>
+  <aside>
+    <div class="card"><h2>Alarms</h2><ul id="alarms" class="list"></ul></div>
+    <div class="card"><h2>Robots</h2><table id="robots"><thead><tr><th>Robot</th><th>Status</th><th>Battery</th>
+      <th>Task</th><th>Boxes/h</th></tr></thead><tbody></tbody></table></div>
+    <div class="card"><h2>Arm cells</h2><table id="arms"><thead><tr><th>Cell</th><th>State</th><th>Busy</th>
+      <th>Starved</th><th>Fault</th><th>Stock</th></tr></thead><tbody></tbody></table></div>
+    <div class="card"><h2>Operator command</h2>
+      <form id="cmd">
+        <select name="command" aria-label="Command"></select>
+        <input name="target" placeholder="robot (empty = fleet)" aria-label="Target">
+        <input name="issued_by" placeholder="your name" required aria-label="Issued by">
+        <input name="reason" placeholder="reason" required aria-label="Reason">
+        <button type="submit">Send</button>
+        <span id="cmdres" class="muted"></span>
+      </form>
+    </div>
+  </aside>
+</main>
+<section class="bottom">
+  <div class="card"><h2>Open tasks</h2><table id="tasks"><thead><tr><th>Task</th><th>Kind</th><th>From</th><th>To</th>
+    <th>Order</th><th>Prio</th><th>State</th><th>Robot</th></tr></thead><tbody></tbody></table></div>
+  <div class="card"><h2>Event log</h2><ul id="events" class="list mono"></ul></div>
+</section>
+<script src="app.js"></script>
+</body>
+</html>
