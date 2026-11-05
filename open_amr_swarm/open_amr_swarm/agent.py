@@ -809,7 +809,7 @@ class SwarmAgent(Node):
             if not bids:
                 continue
             winner = min(bids.items(), key=lambda kv: (kv[1], kv[0]))[0]
-            if winner == self.rid and self.task is None:
+            if winner == self.rid and self.task is None and not self.paused() and not self.out_of_service:
                 self.claim_and_start(t)
         # 2) bid on the most urgent open task we haven't bid on yet
         if not self.available():
@@ -1039,7 +1039,7 @@ class SwarmAgent(Node):
         me = Peer(self.rid, x, y, self.reserved, self.wait_s)
         held = self.reserved
         self.reserved, self.blocked = plan_reservations(self.graph, self.route, self.next_idx, me, self.live_peers(), held,
-                                                        self.tp, extend=self.has_quorum)
+                                                        self.tp, extend=self.has_quorum and not self.paused())
         if self.docking and not self.docked and self.next_idx >= len(self.route) - 1 and \
                 self.route[-2] not in self.reserved:
             # the bay zone = bay + its staging node, held until the dock is accurate: a re-dock backs out to the

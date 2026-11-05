@@ -102,3 +102,44 @@ def test_commands_replayed_in_order_leave_the_last_state(agent):
     for c in (OC.PAUSE, OC.RESUME, OC.PAUSE, OC.RESUME):
         cmd(agent, c)
     assert not agent.paused()
+
+
+def test_a_paused_robot_plans_no_new_reservations(agent, monkeypatch):
+    """The stop at the next held node needs extend=False in plan_reservations (an isolated robot gets it from its lost
+    quorum; a paused one has quorum). Found by the interface review 2026-11-05: with extend=True a paused robot
+    re-reserved the next node every tick and drove on, node by node."""
+    from open_amr_swarm import agent as agent_mod
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def spy(*a, **kw):
+        seen.append(kw.get('extend'))
+        raise Stop
+    monkeypatch.setattr(agent_mod, 'plan_reservations', spy)
+    from geometry_msgs.msg import PoseStamped
+    from nav_msgs.msg import Path
+    agent.route, agent.next_idx, agent.phase = list(range(8)), 1, 'driving'
+    agent.path = Path(poses=[PoseStamped() for _ in range(8)])
+    for i, p in enumerate(agent.path.poses):
+        p.pose.position.x = float(i)
+    agent.node_idx = list(range(8))
+    agent.pose = (0.2, 0.0, 0.0)                # just past node 0, heading for node 1
+    for paused in (False, True):
+        if paused:
+            cmd(agent, OC.PAUSE)
+        try:
+            agent.drive()
+        except Stop:
+            pass
+    assert seen == [True, False]
+
+
+def test_a_paused_robot_does_not_start_a_round_it_had_won(agent):
+    t = Task(task_id='t9', round=0, type=Task.GOTO, origin_id='n5')
+    agent.tasks['t9'] = t
+    agent.bids[('t9', 0)] = {'amr_0': 1.0}
+    cmd(agent, OC.PAUSE)
+    agent.auction()
+    assert agent.task is None and not [m for m in agent.sent if isinstance(m, Claim)]
