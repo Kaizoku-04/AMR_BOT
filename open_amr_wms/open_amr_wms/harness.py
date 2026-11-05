@@ -2,18 +2,22 @@
 import yaml
 
 from .core import Wms
+from .orders import Orders
 from .store import Store
 
 
 class WmsOnBus:
     name = 'wms'
 
-    def __init__(self, nodes_yaml, graph=None, store=None, **params):
+    def __init__(self, nodes_yaml, graph=None, store=None, orders=False, escalate_s=1800.0, **params):
         with open(nodes_yaml) as f:
             nodes = yaml.safe_load(f)
         self.t, self.bus, self.logged, self.queue = 0.0, None, [], []
+        store = store or Store()
+        self.orders = Orders(store, escalate_s=escalate_s) if orders else None
         self.node = Wms(nodes, graph, publish=self._pub, now=lambda: self.t,
-                        log=lambda lvl, text: self.logged.append((lvl, text)), store=store or Store(), **params)
+                        log=lambda lvl, text: self.logged.append((lvl, text)), store=store, source=self.orders,
+                        **params)
         self.next_tick = 0.0
 
     def _pub(self, topic, msg):

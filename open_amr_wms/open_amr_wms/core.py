@@ -56,12 +56,23 @@ class Generated:
         self.box += 1
         return self.rng.choice(self.skus), f'BX{self.box:06d}'
 
-    def inbound(self, seq):
-        sku, box = self.next_box()
-        return dict(mission_id=f'm{seq:04d}', priority=1, sku=sku, box_id=box)
+    def choose(self, wms, inbound, pool, seq):
+        """(bin, record fields) for a new task of this kind from the candidate bins `pool`, or None for no work."""
+        b = self.rng.choice(pool)
+        if inbound:
+            sku, box = self.next_box()
+        else:
+            sku, box = wms.bins[b].get('sku', ''), wms.bins[b].get('box_id', '')
+        return b, dict(mission_id=f'm{seq:04d}', priority=1, sku=sku, box_id=box)
 
-    def outbound(self, seq, bin_rec):
-        return dict(mission_id=f'm{seq:04d}', priority=1, sku=bin_rec.get('sku', ''), box_id=bin_rec.get('box_id', ''))
+    def tick(self, wms):
+        """Called every WMS tick (orders: priorities, cut-offs)."""
+
+    def done(self, wms, m):
+        """A task finished (orders: line picked, ASN box received)."""
+
+    def withdrawn(self, wms, m):
+        """A task was withdrawn unclaimed (orders: the line / ASN box is open again)."""
 
 
 class Wms:
@@ -77,7 +88,8 @@ class Wms:
         self.peer_timeout, self.station_timeout = peer_timeout_s, station_timeout_s
         self.reconcile_s, self.station_wait, self.resume_grace = reconcile_s, station_wait_s, resume_grace_s
         self.rng = random.Random(seed)
-        self.source = source or Generated(self.rng)
+        self.stock = Generated(self.rng)          # ids for the stock found at start (an empty store)
+        self.source = source or self.stock
         self.bays = sorted(n for n, v in nodes.items() if v['kind'] == 'aisle_bay')
         self.dock_bays = {v['id']: n for n, v in nodes.items() if v['kind'] == 'bay'}
         self.node_id = {n: v['id'] for n, v in nodes.items()}
@@ -95,7 +107,7 @@ class Wms:
                 for side in ('W', 'E'):
                     b = f'{bay}:{side}'
                     full = self.rng.random() < initial_fill
-                    sku, box = self.source.next_box() if full else ('', '')
+                    sku, box = self.stock.next_box() if full else ('', '')
                     self.bins[b] = dict(full=full, sku=sku, box_id=box)
                     self.store.put_bin(b, full, sku, box)
         self.seq = self.store.counter('seq')
@@ -161,17 +173,20 @@ class Wms:
             if not pool:
                 self.seq -= 1
                 return None
-            binid = self.rng.choice(pool)
+            got = self.source.choose(self, inbound, sorted(pool), self.seq)
+            if got is None and not forced:
+                inbound = not inbound
+                pool = self.pool(inbound)
+                got = self.source.choose(self, inbound, sorted(pool), self.seq) if pool else None
+            if got is None:
+                self.seq -= 1
+                return None
+            binid, info = got
             bay = binid.split(':')[0]
             if inbound:
                 kind, typ, origin, dest = 'inbound', Task.FETCH_FROM_STATION, 'receiving_bay', bay
-                info = self.source.inbound(self.seq)
             else:
                 kind, typ, origin, dest = 'outbound', Task.FETCH_FROM_BIN, bay, 'outbound_bay'
-                info = self.source.outbound(self.seq, self.bins[binid])
-            if info is None:
-                self.seq -= 1
-                return None
             self.promised.add(binid)
         self.store.set_counter('seq', self.seq)
         self.meta[tid] = dict(task_id=tid, kind=kind, bin=binid, type=typ, origin=origin, dest=dest, round=0,
@@ -226,6 +241,7 @@ class Wms:
             if m['bin']:
                 self.promised.discard(m['bin'])
             self.save(tid)
+            self.source.withdrawn(self, m)
             self.publish('/swarm/claims', Claim(stamp=to_time(self.now()), resource_type=Claim.TASK, resource_id=tid,
                                                 robot_id='', action=Claim.CANCEL, round=m['round'], by='wms'))
             self.event('wms', f'withdrew {tid}', f'{hit[0]} is blocked by a silent robot', tid, 'warn')
@@ -319,6 +335,7 @@ class Wms:
             self.retarget_blocked(blocked)
         self.check_stranded()
         self.resume_check()
+        self.source.tick(self)
         open_ = self.open_ids()
         while len(open_) < self.open_target:
             tid = self.new_task()
@@ -410,7 +427,23 @@ class Wms:
             self.on_done(tid, m)
 
     def on_done(self, tid, m):
-        """Hook for orders (milestone 3)."""
+        self.source.done(self, m)
+
+    def withdraw(self, tid, why, who='wms'):
+        """Withdraw an unclaimed open task (Claim.CANCEL, by='wms'): its bin is free again."""
+        m = self.meta[tid]
+        if m['claimed'] is not None or m['done'] is not None or m['stranded']:
+            return False
+        m['done'], m['cancelled'] = self.now(), True
+        self.cancelled += 1
+        if m['bin']:
+            self.promised.discard(m['bin'])
+        self.save(tid)
+        self.source.withdrawn(self, m)
+        self.publish('/swarm/claims', Claim(stamp=to_time(self.now()), resource_type=Claim.TASK, resource_id=tid,
+                                            robot_id='', action=Claim.CANCEL, round=m['round'], by='wms'))
+        self.event(who, f'withdrew {tid}', why, tid, 'warn')
+        return True
 
     def on_transfer(self, x):
         m = self.meta.get(x.task_id)

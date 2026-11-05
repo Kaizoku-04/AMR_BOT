@@ -6,6 +6,7 @@ State persists in `db` (SQLite); after a restart it resumes from it and from the
 Timeouts run on the node clock (sim time under use_sim_time).
 """
 import os
+import threading
 
 import rclpy
 import rclpy.executors
@@ -17,7 +18,10 @@ from open_amr_msgs.msg import Claim, Inventory, OperatorCommand, RobotState, Sta
 from open_amr_swarm.agent import EVENT_QOS, OPERATOR_QOS, STATE_QOS
 from open_amr_swarm.lane_graph import LaneGraph
 
+from . import importer
+from .api import Api, serve
 from .core import Wms
+from .orders import Orders
 from .store import Store
 
 INV_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -40,24 +44,44 @@ class WmsNode(Node):
                      '/wms/inventory': self.create_publisher(Inventory, '/wms/inventory', INV_QOS)}
         log = self.get_logger()
         say = {'info': log.info, 'warn': log.warn, 'error': log.error}
+        store = Store(db)
+        self.orders = Orders(store, escalate_s=dp('escalate_s', 1800.0).value,
+                             require_asn=dp('require_asn', False).value) if dp('orders', False).value else None
         self.wms = Wms(nodes, LaneGraph(gpath), publish=lambda t, m: self.pubs[t].publish(m), now=self.now,
-                       log=lambda lvl, text: say[lvl](text), store=Store(db), mode=dp('mode', 'mission').value,
+                       log=lambda lvl, text: say[lvl](text), store=store, source=self.orders, mode=dp('mode', 'mission').value,
                        open_tasks=dp('open_tasks', 8).value, reoffer_s=dp('reoffer_s', 4.0).value,
                        peer_timeout_s=dp('peer_timeout_s', 3.0).value,
                        station_timeout_s=dp('station_timeout_s', 3.0).value, reconcile_s=dp('reconcile_s', 3.0).value,
                        station_wait_s=dp('station_wait_s', 5.0).value, seed=dp('seed', 7).value,
                        initial_fill=dp('initial_fill', 0.5).value)
         w = self.wms
-        self.create_subscription(StationState, '/swarm/stations', w.on_station, STATE_QOS)
-        self.create_subscription(Transfer, '/swarm/transfers', w.on_transfer, EVENT_QOS)
-        self.create_subscription(Claim, '/swarm/claims', w.on_claim, EVENT_QOS)
-        self.create_subscription(RobotState, '/swarm/state', w.on_state, STATE_QOS)
-        self.create_subscription(OperatorCommand, '/swarm/operator', w.on_operator, OPERATOR_QOS)
-        self.create_timer(0.5, w.tick)
+        self.lock = threading.RLock()            # the REST API's threads and the executor share the core
+        if self.orders is not None:
+            path = dp('import_file', '').value
+            if path:
+                out = importer.apply(self.orders, importer.read(path), w.now(), w)
+                log.info(f'imported {path}: {len(out["created"])} new, {len(out["unchanged"])} unchanged, '
+                         f'errors {out["errors"]}')
+        port = dp('api_port', 8080).value
+        self.api = Api(w, self.orders or Orders(w.store), self.lock)
+        if port:
+            self.http = serve(self.api, dp('api_host', '0.0.0.0').value, port)
+            log.info(f'wms: REST API and dashboard on port {port}')
+        locked = lambda fn: (lambda *a: self._locked(fn, *a))
+        self.create_subscription(StationState, '/swarm/stations', locked(w.on_station), STATE_QOS)
+        self.create_subscription(Transfer, '/swarm/transfers', locked(w.on_transfer), EVENT_QOS)
+        self.create_subscription(Claim, '/swarm/claims', locked(w.on_claim), EVENT_QOS)
+        self.create_subscription(RobotState, '/swarm/state', locked(w.on_state), STATE_QOS)
+        self.create_subscription(OperatorCommand, '/swarm/operator', locked(w.on_operator), OPERATOR_QOS)
+        self.create_timer(0.5, locked(w.tick))
         self.create_timer(dp('report_s', 30.0).value, lambda: log.info(w.report_line()))
         w.publish_inventory()
         log.info(f'wms: db {db}, {len(w.bins)} bins ({sum(b["full"] for b in w.bins.values())} full), '
                  f'{len(w.open_ids())} open tasks{" (restarted)" if w.restarted else ""}')
+
+    def _locked(self, fn, *a):
+        with self.lock:
+            return fn(*a)
 
     def now(self):
         return self.get_clock().now().nanoseconds * 1e-9

@@ -25,6 +25,7 @@ setup(
     tests_require=['pytest'],
     entry_points={'console_scripts': [
         'wms = open_amr_wms.node:main',
+        'wms_import = open_amr_wms.importer:main',
         
     ]},
 )

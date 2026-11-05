@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS counters (key TEXT PRIMARY KEY, value INTEGER);
 
 class Store:
     def __init__(self, path=':memory:'):
-        self.db = sqlite3.connect(path, isolation_level=None)
+        # one connection, shared by the ROS executor and the REST threads; every access holds the WMS lock (api.py)
+        self.db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         if path != ':memory:':
             self.db.execute('PRAGMA journal_mode=WAL')
             self.db.execute('PRAGMA synchronous=NORMAL')
