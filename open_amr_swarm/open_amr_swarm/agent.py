@@ -231,6 +231,9 @@ class SwarmAgent(Node):
         self.peers = {}                  # robot_id -> (RobotState, receive wall time); kept when silent (a ghost)
         self.released = {}               # robot_id -> sim stamp of the operator's release (silence before it forgiven)
         self.has_quorum, self.isolated_since, self.ack_waits = True, None, 0
+        # operator holds (OperatorCommand PAUSE / OUT_OF_SERVICE, Phase 6): paused = stop at the next held node and take
+        # no new work; out of service = take no new work. Fleet-wide pause separate from this robot's own.
+        self.paused_fleet, self.paused_me, self.out_of_service = False, False, False
         self.seq, self.first_seq, self.confirmed = 0, {}, set()   # acknowledged reservations (liveness rule 3)
         self.ghost_closed = {}           # edge id -> ghost robot: lanes into a silent robot's nodes, closed for routing
         self.reclaimed = set()           # (task_id, round) given back on a silent claimant's behalf (announce once)
@@ -390,11 +393,44 @@ class SwarmAgent(Node):
             else:
                 self.get_logger().info(f'{self.rid}: operator acknowledged a fault; nothing to retry')
             return
+        if m.command in (OperatorCommand.PAUSE, OperatorCommand.RESUME, OperatorCommand.OUT_OF_SERVICE,
+                         OperatorCommand.IN_SERVICE):
+            self.operator_hold(m)
+            return
         if m.command == OperatorCommand.RELEASE_ROBOT and m.target != self.rid:
             self.released[m.target] = stamp_s(m.stamp)
             self.get_logger().warn(f'{self.rid}: operator {m.issued_by or "?"} released {m.target}'
                                    f'{": " + m.reason if m.reason else ""} — its lanes and charger are free, '
                                    f'it no longer counts for quorum')
+
+    def operator_hold(self, m):
+        """PAUSE / RESUME (target '' = whole fleet) and OUT_OF_SERVICE / IN_SERVICE (this robot only)."""
+        mine, fleet = m.target == self.rid, m.target in ('', '*')
+        if not (mine or fleet):
+            return
+        before = (self.paused(), self.out_of_service)
+        if m.command == OperatorCommand.PAUSE:
+            if fleet:
+                self.paused_fleet = True
+            else:
+                self.paused_me = True
+        elif m.command == OperatorCommand.RESUME:
+            if fleet:
+                self.paused_fleet = self.paused_me = False
+            else:
+                self.paused_me = False
+        elif mine and m.command == OperatorCommand.OUT_OF_SERVICE:
+            self.out_of_service = True
+        elif mine and m.command == OperatorCommand.IN_SERVICE:
+            self.out_of_service = False
+        if (self.paused(), self.out_of_service) != before:
+            self.get_logger().warn(f'{self.rid}: operator {m.issued_by or "?"}: '
+                                   f'{"paused" if self.paused() else "running"}, '
+                                   f'{"out of service" if self.out_of_service else "in service"}'
+                                   f'{": " + m.reason if m.reason else ""}')
+
+    def paused(self):
+        return self.paused_fleet or self.paused_me
 
     def on_station(self, m):
         if self.link_down:
@@ -540,7 +576,7 @@ class SwarmAgent(Node):
             self.next_leg(first=True)
         elif self.phase == 'idle':
             self.reserved = [self.last_node]
-            if self.has_quorum:
+            if self.has_quorum and not self.paused():
                 self.idle_energy()
         self.energy_status()
         self.publish_state()
@@ -721,7 +757,7 @@ class SwarmAgent(Node):
     def check_stuck(self):
         """Liveness rule 4: an empty robot that can't make progress for reclaim_stuck_s (controller failing, battery
         empty, blocked, or no route) gives its task back so another robot can do it."""
-        stuck = self.status == RobotState.STUCK or self.wait_s > 0.0 or self.phase == 'retry'
+        stuck = self.status == RobotState.STUCK or self.wait_s > 0.0 or self.phase == 'retry' or self.paused()
         if self.task is None or self.loaded or not stuck:
             self.stuck_since = None
             return
@@ -753,7 +789,7 @@ class SwarmAgent(Node):
 
     def available(self):
         return (self.task is None and self.phase in ('idle', 'driving') and not self.bid_pending
-                and not (self.bms and self.must_charge))
+                and not (self.bms and self.must_charge) and not self.paused() and not self.out_of_service)
 
     def task_need(self, t):
         """State of charge this task would cost, up to reaching a charger afterwards (energy.task_need)."""
@@ -774,7 +810,7 @@ class SwarmAgent(Node):
             if not bids:
                 continue
             winner = rules.winner(bids)
-            if winner == self.rid and self.task is None:
+            if winner == self.rid and self.task is None and not self.paused() and not self.out_of_service:
                 self.claim_and_start(t)
         # 2) bid on the most urgent open task we haven't bid on yet
         if not self.available():
@@ -1004,7 +1040,7 @@ class SwarmAgent(Node):
         me = Peer(self.rid, x, y, self.reserved, self.wait_s)
         held = self.reserved
         self.reserved, self.blocked = plan_reservations(self.graph, self.route, self.next_idx, me, self.live_peers(), held,
-                                                        self.tp, extend=self.has_quorum)
+                                                        self.tp, extend=self.has_quorum and not self.paused())
         if self.docking and not self.docked and self.next_idx >= len(self.route) - 1 and \
                 self.route[-2] not in self.reserved:
             # the bay zone = bay + its staging node, held until the dock is accurate: a re-dock backs out to the
@@ -1014,8 +1050,9 @@ class SwarmAgent(Node):
             # next robot still can't pre-stage there while the bay is held (traffic rule 6: the staging node is inside
             # the bay's turning room, fleet run 2026-10-19), so it waits one queue node further back.
             self.reserved.insert(0, self.route[-2])
-        if not self.has_quorum:
-            # isolated: stop at the next node I hold (peers, which can't hear me, keep seeing my last reservation)
+        if not self.has_quorum or self.paused():
+            # isolated: stop at the next node I hold (peers, which can't hear me, keep seeing my last reservation);
+            # paused by an operator: the same stop
             nxt = self.route[self.next_idx]
             if nxt in self.reserved:
                 self.reserved = self.reserved[:self.reserved.index(nxt) + 1]
@@ -1853,7 +1890,8 @@ class SwarmAgent(Node):
         m = RobotState()
         m.stamp = self.get_clock().now().to_msg()
         m.robot_id = self.rid
-        m.status = RobotState.ISOLATED if not self.has_quorum else self.status
+        m.status = RobotState.ISOLATED if not self.has_quorum else RobotState.PAUSED if self.paused() else self.status
+        m.out_of_service = bool(self.out_of_service)
         self.seq += 1
         m.seq = self.seq
         for n in self.reserved:

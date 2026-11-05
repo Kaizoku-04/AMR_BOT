@@ -9,6 +9,7 @@ uint8 YIELDING=6       # holding before a node reserved by a peer
 uint8 STUCK=7
 uint8 TO_CHARGE=8
 uint8 ISOLATED=9       # hears less than a quorum of the fleet: stopped at its next held node until it does again
+uint8 PAUSED=10        # paused by an operator (OperatorCommand.PAUSE): stopped at its next held node, takes no new work
 
 builtin_interfaces/Time stamp
 string robot_id
@@ -31,3 +32,4 @@ bool docked                        # docked to the bay's marker by the docking s
                                    # cell's interlock trusts this, not the localization estimate in `pose`
 uint32 goal_node                   # node the current leg ends at (or where it stands when idle): chargers are
                                    # claimed through it, so two robots never head for the same one
+bool out_of_service                # taken out of service by an operator (OperatorCommand.OUT_OF_SERVICE): takes no new work
