@@ -48,3 +48,18 @@ def test_detection_failures_still_give_up_after_three(agent):
 def test_a_failure_without_a_code_counts(agent):
     agent.dock_failed('n4', 'goal rejected')
     assert agent.dock_fails == 1 and agent.control_fails == 0
+
+
+def test_a_control_failure_with_another_cause_counts(agent):
+    """Review 2026-11-05 finding 4: only a late transform uses the budget; a 905 naming another cause is an attempt."""
+    from action_msgs.msg import GoalStatus
+    res = type('R', (), {'success': False, 'error_code': 905, 'error_msg': 'Collision ahead, aborting',
+                         'num_retries': 0})()
+    done = type('F', (), {'result': lambda s: type('W', (), {'result': res, 'status': GoalStatus.STATUS_ABORTED})()})()
+    agent.on_dock_done(done, 'n4')                      # the docking server's result, as it arrives
+    assert agent.dock_fails == 1 and agent.control_fails == 0
+
+
+def test_a_late_transform_named_in_the_result_uses_the_budget(agent):
+    agent.dock_failed('n4', 'error 905', 905, 'Could not get transform from base_footprint to odom')
+    assert agent.dock_fails == 0 and agent.control_fails == 1

@@ -1319,7 +1319,7 @@ class SwarmAgent(Node):
             # descending arm (fleet run 2026-10-02). final_reached() finishes it (settled() then check_dock()).
             self.dock_state, self.settle_since, self.dock_name, self.dock_retries = 'settling', None, name, res.num_retries
         else:
-            self.dock_failed(name, f'error {res.error_code} {res.error_msg}'.strip(), res.error_code)
+            self.dock_failed(name, f'error {res.error_code} {res.error_msg}'.strip(), res.error_code, res.error_msg)
 
     def settled(self):
         """Docking: the robot has stood still (no mm of motion per 0.2 s tick) for 0.5 s."""
@@ -1526,13 +1526,21 @@ class SwarmAgent(Node):
         b = self.graph.pos[self.route[-1]] if self.route else None
         return b is not None and self.pose is not None and math.hypot(self.pose[0] - b[0], self.pose[1] - b[1]) < 0.5
 
-    def dock_failed(self, name, why, code=None):
+    def dock_failed(self, name, why, code=None, msg=''):
         """The docking server gave up (after its own retries). Its recovery can leave the robot anywhere near the bay
         (fleet run 2026-10-03: 1.8 m off, facing away, the marker out of view) and docking from there fails at once —
         it was retried 79 times. So: drive back to the staging node along the lanes (or, from inside the bay, back out
         to it) and dock again from there; after 3 attempts stop and report STUCK until an operator acknowledges
-        (OperatorCommand.ACK_FAULT) — as an AMR pauses its mission and calls for a person."""
-        if code == DockRobot.Result.FAILED_TO_CONTROL and self.control_fails < self.control_fail_budget:
+        (OperatorCommand.ACK_FAULT) — as an AMR pauses its mission and calls for a person.
+        A 905 (FAILED_TO_CONTROL) uses the control budget, not an attempt, only when it is a late transform: every 905
+        seen (63 in c51-c58) came with the server's 'Could not get transform'. A 905 whose error_msg names something
+        else (an obstacle, a stuck caster) counts as an attempt (review 2026-11-05 finding 4). Nav2 Jazzy 1.3.13 sends
+        an empty error_msg, which is read as a late transform, the only cause seen."""
+        late_tf = code == DockRobot.Result.FAILED_TO_CONTROL and (not msg or 'transform' in msg.lower())
+        if code == DockRobot.Result.FAILED_TO_CONTROL and not late_tf:
+            self.get_logger().warn(f'{self.rid}: docking at {name}: control failure not caused by a late transform '
+                                   f'({msg}): counted as an attempt')
+        if late_tf and self.control_fails < self.control_fail_budget:
             self.control_fails += 1
             self.get_logger().warn(f'{self.rid}: docking at {name} failed ({why}): control failure '
                                    f'{self.control_fails}/{self.control_fail_budget}, not counted as an attempt')
