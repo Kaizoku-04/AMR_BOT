@@ -574,6 +574,9 @@ class SwarmAgent(Node):
             self.dwell()
         elif self.phase == 'retry' and self.now() >= self.retry_at:
             self.next_leg(first=True)
+        elif self.phase == 'bay_leave':                  # backing out of a bay after its task was dropped
+            if self.dock_state == 'backout_wait' and self.now() >= self.dock_retry_at:
+                self.back_out(self.graph.name[self.route[-1]], self.backout_why)
         elif self.phase == 'idle':
             self.reserved = [self.last_node]
             if self.has_quorum and not self.paused():
@@ -887,10 +890,42 @@ class SwarmAgent(Node):
         self.start_legs(legs, task=t)
 
     def abort_task(self):
+        """Drop the task (CANCEL, an outranking peer, a release on my behalf, give_back) and go idle. Any task can be
+        dropped during its pickup dock (the deck is still empty there), so every bay goal is cancelled too; standing
+        in the bay, the robot first backs out to the staging pose (review 2026-11-05 finding 1: the DockRobot goal kept
+        driving while the idle agent could send a FollowPath, or the dock finished for a task that no longer existed
+        and the robot stood nose-in at the pedestal, where a forward-only path can't leave)."""
+        gave_up = self.dock_state == 'gave_up'
+        bay_goal = self.cancel_bay_goals()
         self.task, self.legs, self.loaded, self.stuck_since = None, [], False, None
         self.noroute_since, self.noroute_parked = None, False
         self.stop_following()
         self.phase = 'idle'; self.status = RobotState.IDLE; self.idle_since = self.now()
+        if bay_goal and self.in_bay():
+            self.phase = 'bay_leave'                     # no new work until out (available() needs idle / driving)
+            name = self.graph.name[self.route[-1]]
+            if gave_up:                                  # it couldn't dock or back out: an operator acknowledges first
+                self.status, self.dock_state = RobotState.STUCK, 'gave_up'
+                self.get_logger().warn(f'{self.rid}: task dropped in {name} after giving up docking: staying until '
+                                       f'an operator acknowledges')
+            else:
+                self.get_logger().warn(f'{self.rid}: task dropped while in {name}: backing out to its staging pose')
+                self.back_out(name, 'task dropped')
+
+    def cancel_bay_goals(self):
+        """Cancel every DockRobot / back-out / bay-exit goal, running or still waiting for its acceptance (a late
+        acceptance is cancelled on arrival: its token is stale). True if any docking state was active."""
+        reqs = (self.dock_req, self.backout_req, self.exitbk_req)
+        handles = [h for h in (self.dock_handle, self.backout_handle, self.exitbk_handle) if h is not None]
+        active = bool(handles) or any(r.sent_at is not None for r in reqs) or self.dock_state is not None or \
+            self.phase == 'bay_exit'
+        for h in handles:
+            h.cancel_goal_async()
+        for r in reqs:
+            r.clear()
+        self.dock_handle = self.backout_handle = self.exitbk_handle = None
+        self.dock_state, self.docked, self.backout_t0 = None, False, None
+        return active
 
     # ------------------------------------------------------------------ legs
     def start_legs(self, legs, task):
@@ -1464,6 +1499,11 @@ class SwarmAgent(Node):
 
     def backed_out(self, name):
         self.backout_t0 = None
+        if self.phase == 'bay_leave':                    # out of a bay whose task was dropped: idle at the staging pose
+            self.get_logger().info(f'{self.rid}: backed out of {name} ({self.backout_why}): idle')
+            self.dock_state, self.status, self.idle_since = None, RobotState.IDLE, self.now()
+            self.phase = 'idle'
+            return
         self.get_logger().info(f'{self.rid}: backed out of {name} ({self.backout_why}): docking again')
         self.dock_state, self.dock_retry_at = 'retry', self.now() + 1.0
 
