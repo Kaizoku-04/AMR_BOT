@@ -200,6 +200,9 @@ class SwarmAgent(Node):
         self.reloc_tol = dp('relocalize_tol_m', 0.10).value
         self.reloc_max = dp('relocalize_max_m', 1.0).value
         self.reloc_every = dp('relocalize_every_s', 2.0).value
+        # AMCL's heading too (review 2026-11-05 finding 3): the cell's interlock checks it (bay_tol_deg 10); c45_truth
+        # had a 37.9 deg AMCL outlier. Reset when AMCL is more than this off the marker-measured heading
+        self.reloc_tol_yaw = math.radians(dp('relocalize_tol_deg', 3.0).value)
         self.reloc_at, self.reloc_tries = -1e9, 0
         self.pub_initialpose = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
         self.dock_state, self.dock_fails, self.docked, self.docking = None, 0, False, False
@@ -1431,17 +1434,25 @@ class SwarmAgent(Node):
         c, s = math.cos(dyaw), math.sin(dyaw)
         return c * dx + s * dy, -s * dx + c * dy, math.remainder(ryaw - dyaw, math.tau)
 
+    def bay_yaw(self, nid):
+        """A bay's docked heading: along its one entry lane (the robot drives straight in, nose to the pedestal; the
+        lane graph's surveyed yaws agree: receiving_bay 180, outbound_bay 0). None if the bay has no single entry."""
+        preds = [a for a, succ in self.graph.succ.items() if nid in succ]
+        return self.graph.heading(preds[0], nid) if len(preds) == 1 else None
+
     def bay_pose_from_dock(self):
-        """Docked at a bay: (x, y, yaw) in map from the bay's lane-graph pose and the marker-measured dock error (the
-        error is in the dock's frame; its heading is taken from the current yaw, enough for an error of millimetres)."""
+        """Docked at a bay: (x, y, yaw) in map from the bay's lane-graph pose and the marker-measured dock error (in
+        the dock's frame). The heading is the bay's plus the marker-measured yaw error, never AMCL's own (review
+        2026-11-05 finding 3); without a bay heading, AMCL's yaw as before."""
         nid = self.graph.by_name.get(self.dock_name)
         err = self.dock_error()
         if nid is None or self.graph.kind.get(nid) != 'bay' or err is None or self.pose is None:
             return None
-        (bx, by), yaw = self.graph.pos[nid][:2], self.pose[2]
-        dyaw = yaw - err[2]
-        c, s = math.cos(dyaw), math.sin(dyaw)
-        return bx + c * err[0] - s * err[1], by + s * err[0] + c * err[1], yaw
+        (bx, by), byaw = self.graph.pos[nid][:2], self.bay_yaw(nid)
+        if byaw is None:
+            byaw = self.pose[2] - err[2]
+        c, s = math.cos(byaw), math.sin(byaw)
+        return bx + c * err[0] - s * err[1], by + s * err[0] + c * err[1], math.remainder(byaw + err[2], math.tau)
 
     def localize_at_bay(self, name):
         """Accurately docked, before reporting it: AMCL within reloc_tol of the bay's pose and the robot still -> docked.
@@ -1449,16 +1460,19 @@ class SwarmAgent(Node):
         interlock then shows what is wrong). Not at a bay (a charger), or a suspect dock: docked at once."""
         p = self.bay_pose_from_dock()
         off = None if p is None else math.hypot(p[0] - self.pose[0], p[1] - self.pose[1])
+        yaw_off = 0.0 if p is None else abs(math.remainder(p[2] - self.pose[2], math.tau))
         if off is not None and off > self.reloc_max:
             self.get_logger().error(f'{self.rid}: docked at {name} but AMCL is {off:.2f} m from the bay: not '
                                     f're-localizing (check the dock and the map)')
             off = None
-        if off is None or (off <= self.reloc_tol and self.speed_est == 0.0):
+        close = off is not None and off <= self.reloc_tol and yaw_off <= self.reloc_tol_yaw
+        if off is None or (close and self.speed_est == 0.0):
             return self.mark_docked(name)
-        if off <= self.reloc_tol or self.now() - self.reloc_at < self.reloc_every:
+        if close or self.now() - self.reloc_at < self.reloc_every:
             return                                       # reset applied, the speed estimate settling; or reset in flight
         if self.reloc_tries >= 3:
-            self.get_logger().warn(f'{self.rid}: AMCL still {off:.2f} m off {name} after 3 resets: reporting docked')
+            self.get_logger().warn(f'{self.rid}: AMCL still {off:.2f} m / {math.degrees(yaw_off):.1f} deg off {name} '
+                                   f'after 3 resets: reporting docked')
             return self.mark_docked(name)
         self.reloc_tries, self.reloc_at = self.reloc_tries + 1, self.now()
         m = PoseWithCovarianceStamped()
@@ -1468,8 +1482,8 @@ class SwarmAgent(Node):
         m.pose.covariance[0] = m.pose.covariance[7] = 0.02 ** 2
         m.pose.covariance[35] = math.radians(2.0) ** 2
         self.pub_initialpose.publish(m)
-        self.get_logger().info(f'{self.rid}: re-localizing at {name} before reporting docked: AMCL {off:.2f} m off the '
-                               f'bay (marker-measured pose)')
+        self.get_logger().info(f'{self.rid}: re-localizing at {name} before reporting docked: AMCL {off:.2f} m / '
+                               f'{math.degrees(yaw_off):.1f} deg off the bay (marker-measured pose)')
 
     def back_out(self, name, why):
         """Reverse out of the bay to its staging pose (the docking server's undock, ≤ 0.15 m/s inside the bay's marked
