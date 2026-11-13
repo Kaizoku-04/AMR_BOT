@@ -271,6 +271,7 @@ class SwarmAgent(Node):
         # the dock and back-out goals: the same lost-ack resend and lost-result re-poll as FollowPath
         self.dock_req, self.backout_req, self.dock_handle, self.backout_handle = Pending(), Pending(), None, None
         self.exitbk_req, self.exitbk_handle = Pending(), None      # the BackUp out of a bay before leaving it
+        self.check_unknown_since, self.check_unknown_s = None, 2.0  # dock check without an accuracy figure since
         self.exitbk_from = None          # (map, odom) pose when that BackUp was first sent (cleared on the next arrival)
         self.act_still_since, self.act_polled_at = None, 0.0
         # lanes closed in my route server: what I want (ghosts' lanes + a deadlock re-route's lane) vs what it confirmed;
@@ -1318,6 +1319,7 @@ class SwarmAgent(Node):
             # creeps a few mm (~5 mm/s, ~1 s) — the cell's dock sensor and its interlock then disagreed under a
             # descending arm (fleet run 2026-10-02). final_reached() finishes it (settled() then check_dock()).
             self.dock_state, self.settle_since, self.dock_name, self.dock_retries = 'settling', None, name, res.num_retries
+            self.check_unknown_since = None
         else:
             self.dock_failed(name, f'error {res.error_code} {res.error_msg}'.strip(), res.error_code, res.error_msg)
 
@@ -1333,6 +1335,23 @@ class SwarmAgent(Node):
     def check_dock(self, name):
         """Settled: accurate enough -> docked; else back out to staging and dock again."""
         err, srv, sd = self.dock_error(), self.server_dock_error(), self.standstill_dock()
+        if err is None:
+            # no accuracy figure (a TF lookup failed, e.g. the buffer not yet filled after a restart): judge it on the
+            # next ticks, then from the server pose; never accept a dock nobody could judge (review 2026-11-05 finding 5)
+            self.check_unknown_since = self.check_unknown_since or self.now()
+            if self.now() - self.check_unknown_since < self.check_unknown_s:
+                return                                   # the standstill figure first: the server pose was 16 mm off
+            if srv is None:
+                self.check_unknown_since = None
+                self.get_logger().warn(f'{self.rid}: docked at {name} but no accuracy figure for '
+                                       f'{self.check_unknown_s:.0f} s: backing out to dock again')
+                self.dock_fails += 1
+                if self.dock_fails >= 3:
+                    return self.give_up_dock(name)
+                self.back_out(name, 'dock accuracy unknown')
+                return
+            err = srv
+        self.check_unknown_since = None
         if err is not None and srv is not None:
             self.get_logger().info(f'{self.rid}: dock check at {name}: standstill mean of {sd[4] if sd else 0} detections '
                                    f'{1000 * math.hypot(err[0], err[1]):.1f} mm {"" if sd else "(too few: server pose) "}'
