@@ -271,7 +271,7 @@ class SwarmAgent(Node):
         # the dock and back-out goals: the same lost-ack resend and lost-result re-poll as FollowPath
         self.dock_req, self.backout_req, self.dock_handle, self.backout_handle = Pending(), Pending(), None, None
         self.exitbk_req, self.exitbk_handle = Pending(), None      # the BackUp out of a bay before leaving it
-        self.exitbk_from = None          # my pose when that BackUp was first sent (cleared on the next arrival)
+        self.exitbk_from = None          # (map, odom) pose when that BackUp was first sent (cleared on the next arrival)
         self.act_still_since, self.act_polled_at = None, 0.0
         # lanes closed in my route server: what I want (ghosts' lanes + a deadlock re-route's lane) vs what it confirmed;
         # sync_edges() sends the difference, again after ack_timeout if no answer came (a lost request used to leave a
@@ -1645,7 +1645,7 @@ class SwarmAgent(Node):
         if self.bay_exit_backup <= 0.0 or self.graph.kind.get(n) != 'bay' or self.pose is None:
             return self.next_leg()
         if not retry or self.exitbk_from is None:
-            self.exitbk_from = self.pose
+            self.exitbk_from = (self.pose, self.odom_pose())
         left = self.bay_exit_backup - self.moved_since(self.exitbk_from)
         if left < 0.03:
             return self.next_leg()
@@ -1692,7 +1692,21 @@ class SwarmAgent(Node):
         self.next_leg()
 
     def moved_since(self, p):
-        return math.hypot(self.pose[0] - p[0], self.pose[1] - p[1])
+        """Distance driven since p = (map pose, odom pose): in the odom frame, which is continuous, when both ends are
+        known (AMCL resumes updating once the robot moves and can jump by centimetres: review 2026-11-05 finding 6),
+        else in AMCL's map pose."""
+        start_map, start_odom = p
+        now_odom = self.odom_pose() if start_odom is not None else None
+        a, b = (start_odom, now_odom) if now_odom is not None else (start_map, self.pose)
+        return math.hypot(b[0] - a[0], b[1] - a[1])
+
+    def odom_pose(self):
+        """(x, y) of base_footprint in odom, None if the transform is unavailable."""
+        try:
+            t = self.tf.lookup_transform('odom', 'base_footprint', Time())
+        except Exception:
+            return None
+        return t.transform.translation.x, t.transform.translation.y
 
     def backed_off_bay(self, n):
         """Last at bay node n and leave_bay backed out more than 0.05 m: a route from n starts at its one exit instead,
