@@ -15,6 +15,7 @@ boxes, outbound 16 and 0, so a pallet runs empty / fills up early in a run), pal
 time, arm_cycle_s = one transfer; fault:=arm_receiving:300:120 takes that arm out of service at 300 s for 120 s.
 cells:=true runs the stations against real arm cells (open_amr_arm_cell cell_controller per arm, Phase 4b) instead of
 a fixed arm_cycle_s.
+wms:=open_amr_wms runs the WMS package instead of mission_generator (store in out_dir/wms.db, REST API off).
 """
 import os
 
@@ -63,7 +64,15 @@ def spawn(context):
                                              'fault_at_s': float(fault[1]) if f else 0.0,
                                              'fault_for_s': float(fault[2]) if f else 0.0,
                                              'cell': lc('cells') == 'true', 'use_sim_time': True}]))
-    if lc('mode') != 'none':
+    if lc('mode') != 'none' and lc('wms') == 'open_amr_wms':
+        # the WMS package (ADR-042) in place of mission_generator: same topics, same rules; a fresh store per run (out_dir)
+        os.makedirs(lc('out_dir'), exist_ok=True)
+        actions.append(Node(package='open_amr_wms', executable='wms', name='wms', output='screen',
+                            parameters=[{'mode': lc('mode'), 'graph_nodes': nodes, 'graph': graph,
+                                         'open_tasks': int(lc('open_tasks') or n + 2),
+                                         'db': os.path.join(lc('out_dir'), 'wms.db'), 'report_s': 10.0,
+                                         'api_port': 0, 'use_sim_time': True}]))
+    elif lc('mode') != 'none':
         actions.append(Node(package='open_amr_swarm', executable='mission_generator', name='mission_generator',
                             output='screen',
                             parameters=[{'mode': lc('mode'), 'graph_nodes': nodes, 'graph': graph,
@@ -80,6 +89,8 @@ def generate_launch_description():
         DeclareLaunchArgument('duration_s', default_value='0', description='sim seconds, 0 = run forever'),
         DeclareLaunchArgument('open_tasks', default_value='', description='default robots + 2: nobody idles for lack of work'),
         DeclareLaunchArgument('out_dir', default_value='/tmp/swarm_metrics'),
+        DeclareLaunchArgument('wms', default_value='mission_generator',
+                              description='mission_generator | open_amr_wms (ADR-042; metrics in its [wms] lines every 10 s)'),
         DeclareLaunchArgument('battery', default_value='true', description='simulated BMS per robot'),
         DeclareLaunchArgument('battery_time_scale', default_value='1.0'),
         DeclareLaunchArgument('battery_start', default_value='', description='e.g. 0.9,0.5,...; default spread 90..40 %'),
