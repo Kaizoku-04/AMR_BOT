@@ -9,11 +9,18 @@ be the one expected (a collapsed stack, a carton pushed across the deck), so a p
                      simulator the true carton poses (open_amr_sim.py publishes them), on a real cell the output of a
                      3D camera's carton detection (depalletizing mixed truck pallets needs one, Isaac Sim Setup
                      "Making the arms really move"). Only detections newer than the request count.
+                     The timeout runs on the node's clock: sim time in the simulator (use_sim_time), wall time on a
+                     real cell. In wall time, 1.0 s at real-time factor 0.22 was 0.22 s of sim time, about two of the
+                     sim's 10 Hz detection periods: a fleet shift lost the receiving cell for 120 s to "no carton
+                     detections for 1.0 s" (c60_real4, 2026-11-13).
 Offsets are (dx, dy, dyaw_deg) in the cell frame; a square carton's yaw is taken modulo 90 deg.
 """
 import math
 import threading
 import time
+
+
+WALL_LIMIT_S = 60.0
 
 
 class LocateFault(Exception):
@@ -53,9 +60,12 @@ class DetectionLocator:
 
     def __init__(self, node, topic, cell, limits):
         from geometry_msgs.msg import PoseArray
-        self.cell, self.limits = cell, limits
+        self.cell, self.limits, self.clock = cell, limits, node.get_clock()
         self.lock, self.cartons, self.stamp = threading.Lock(), [], 0.0
         node.create_subscription(PoseArray, topic, self.on_detections, 1)
+
+    def now(self):
+        return self.clock.now().nanoseconds * 1e-9
 
     def on_detections(self, m):
         ax, ay, ayaw = self.cell.arm_pose
@@ -66,7 +76,7 @@ class DetectionLocator:
             yaw = 2 * math.degrees(math.atan2(p.orientation.z, p.orientation.w))   # cartons stand upright
             out.append((c * dx + s * dy, -s * dx + c * dy, p.position.z, yaw - ayaw))
         with self.lock:
-            self.cartons, self.stamp = out, time.monotonic()
+            self.cartons, self.stamp = out, self.now()
 
     def detected(self):
         """The latest carton detections (x, y, z, yaw_deg), cell frame."""
@@ -75,14 +85,16 @@ class DetectionLocator:
 
     def locate(self, target, nominal, timeout=1.0):
         """target = ('pallet', i, k) | ('deck',); nominal = carton centre (x, y, z, yaw_deg), cell frame."""
-        t0 = time.monotonic()
+        t0, w0 = self.now(), time.monotonic()
         while True:
             with self.lock:
                 if self.stamp > t0:
                     cartons = list(self.cartons)
                     break
-            if time.monotonic() - t0 > timeout:
+            if self.now() - t0 > timeout:
                 raise LocateFault(f'no carton detections for {timeout:.1f} s')
+            if time.monotonic() - w0 > WALL_LIMIT_S:    # the clock itself stopped (no /clock): don't wait forever
+                raise LocateFault(f'no carton detections and no clock for {WALL_LIMIT_S:.0f} s')
             time.sleep(0.01)
         max_dist, max_dyaw = self.limits[target[0]]
         return match(cartons, nominal, max_dist, max_dyaw)
