@@ -579,7 +579,7 @@ class SwarmAgent(Node):
         elif self.phase == 'retry' and self.now() >= self.retry_at:
             self.next_leg(first=True)
         elif self.phase == 'bay_leave':                  # backing out of a bay after its task was dropped
-            if self.dock_state == 'backout_wait' and self.now() >= self.dock_retry_at:
+            if self.dock_state == 'backout_wait' and self.now() >= self.dock_retry_at and not self.paused():
                 self.back_out(self.graph.name[self.route[-1]], self.backout_why)
         elif self.phase == 'idle':
             self.reserved = [self.last_node]
@@ -912,6 +912,10 @@ class SwarmAgent(Node):
                 self.status, self.dock_state = RobotState.STUCK, 'gave_up'
                 self.get_logger().warn(f'{self.rid}: task dropped in {name} after giving up docking: staying until '
                                        f'an operator acknowledges')
+            elif self.paused():                          # an operator PAUSE: nothing drives until RESUME (ADR-047;
+                # an empty robot paused 120 s gives its task back and backed out of the bay mid-pause, c61_ops)
+                self.dock_state, self.dock_retry_at, self.backout_why = 'backout_wait', self.now(), 'task dropped'
+                self.get_logger().warn(f'{self.rid}: task dropped while in {name}, paused: backing out after the RESUME')
             else:
                 self.get_logger().warn(f'{self.rid}: task dropped while in {name}: backing out to its staging pose')
                 self.back_out(name, 'task dropped')

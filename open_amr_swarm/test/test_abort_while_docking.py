@@ -123,3 +123,20 @@ def test_drop_after_giving_up_in_the_bay_waits_for_the_operator(agent):
     assert len(agent.undock_sent) + len(agent.backup_sent) == 1
     agent.on_undock_done(type('F', (), {'result': lambda s: _Res(True)})(), 'n7')
     assert agent.phase == 'idle' and agent.status == RobotState.IDLE
+
+
+def test_drop_in_the_bay_while_paused_backs_out_only_after_the_resume(agent):
+    """c61_ops (2026-11-14): paused by the operator, an empty robot gives its task back after 120 s (ADR-047) and
+    backed out of the bay at once, 1.0 m while the fleet was paused. It waits for the RESUME now."""
+    agent.pose = (7.0, 0.0, 0.0)
+    agent.dock_state, agent.docked = 'docked', True
+    agent.on_operator(OperatorCommand(command=OperatorCommand.PAUSE, target='', stamp=TimeMsg(sec=1)))
+    agent.give_back('no progress for 121 s')
+    assert agent.task is None and agent.phase == 'bay_leave' and not agent.available()
+    agent.update_pose = lambda: True
+    agent.check_peers = lambda: True
+    agent.tick()
+    assert agent.undock_sent == [] and agent.backup_sent == [], 'backed out of the bay while paused'
+    agent.on_operator(OperatorCommand(command=OperatorCommand.RESUME, target='', stamp=TimeMsg(sec=2)))
+    agent.tick()
+    assert len(agent.undock_sent) + len(agent.backup_sent) == 1
