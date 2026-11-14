@@ -144,3 +144,16 @@ def test_a_failed_back_up_with_amcl_off_routes_from_the_bay(agent):
     a.leave_bay()
     _finish_backup(a, False, error_code=712)
     assert a.routes[0].start_id == 1
+
+
+def test_a_resent_goal_measures_the_distance_in_odom_not_amcl(agent):
+    """Review 2026-11-05 finding 6: AMCL resumes updating once the robot moves and can jump by centimetres; the
+    distance already backed is measured in odom (continuous), so an AMCL jump doesn't shorten the rest."""
+    a = agent
+    odom = [(0.0, 0.0)]
+    a.odom_pose = lambda: odom[0]
+    a.leave_bay()
+    odom[0] = (0.05, 0.0)                                   # backed 5 cm by odometry ...
+    a.pose = (BAY[0] + 0.15, BAY[1], 3.1416)                # ... while AMCL jumped 15 cm
+    a.leave_bay(retry=True)
+    assert abs(a.backup_sent[-1].target.x - 0.15) < 1e-6    # 0.20 - 0.05 left, not 0.20 - 0.15

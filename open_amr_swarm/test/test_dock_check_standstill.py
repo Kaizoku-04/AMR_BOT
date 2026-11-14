@@ -105,3 +105,34 @@ def test_detections_from_before_the_robot_settled_are_not_used(agent):
     detections(agent)
     agent.settle_since = agent.now() + 1.0            # all detections predate the standstill
     assert agent.standstill_dock() is None
+
+
+def _tf_fails(target, source, time):
+    raise RuntimeError('lookup would require extrapolation')
+
+
+def test_a_dock_nobody_could_judge_is_not_accepted(agent):
+    """Review 2026-11-05 finding 5: every lookup fails (TF buffer not filled after a restart). The check waits
+    check_unknown_s for a figure, then backs out to dock again; it never reports docked unjudged."""
+    detections(agent)
+    agent.tf.lookup_transform = _tf_fails
+    t = [agent.now()]
+    agent.now = lambda: t[0]
+    agent.check_dock('n4')
+    assert agent.localized == [] and agent.undock_sent == []          # waiting for a figure
+    t[0] += 2.5
+    agent.check_dock('n4')
+    assert agent.localized == [] and len(agent.undock_sent) == 1 and agent.dock_fails == 1
+
+
+def test_a_lookup_that_recovers_within_the_wait_judges_from_the_standstill_mean(agent):
+    detections(agent)
+    server_dock_pose(agent, 0.016, 0.003)
+    agent.tf.lookup_transform = _tf_fails
+    t = [agent.now()]
+    agent.now = lambda: t[0]
+    agent.check_dock('n4')
+    t[0] += 0.4
+    robot_at(agent, 0.016)                                             # TF back: 16 mm short by the detections
+    agent.check_dock('n4')
+    assert len(agent.undock_sent) == 1 and agent.localized == []
