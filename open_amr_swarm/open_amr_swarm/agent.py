@@ -801,7 +801,7 @@ class SwarmAgent(Node):
 
     def bid_block(self, t):
         """(kind, text) for why this robot can't bid on `t` now, None if it can. `kind` is stable (what changes the
-        verdict); `text` adds the numbers. The same checks as available() and auction(), in the same order."""
+        verdict); `text` adds the numbers. auction() bids only where this is None, so the [bid] lines can't drift from it."""
         if self.out_of_service:
             return 'out_of_service', 'out of service'
         if self.paused():
@@ -870,13 +870,8 @@ class SwarmAgent(Node):
             key = (t.task_id, t.round)
             if key in self.my_bids or rules.closed(now, stamp_s(t.stamp), self.bid_window):
                 continue
-            if self.bms and not can_take(self.battery, self.task_need(t), self.cp):
-                continue                                  # can't finish it and still reach a charger
-            if self.handshake and any(self.graph.kind.get(self.graph.id(n)) == 'bay' and self.station_down(self.graph.id(n))
-                                      for n in (t.origin_id, t.dest_id) if n):
-                continue                                  # its arm is out of service
-            if any(self.graph.id(n) in b for n in (t.origin_id, t.dest_id) if n for b in self.cut_off()):
-                continue                                  # a silent robot blocks it (the WMS withdraws it too)
+            if self.bid_block(t):                      # the one eligibility check (also what [bid] logs)
+                continue
             self.bid_pending = True
             self.estimate(self.start_node(), self.graph.id(t.origin_id), lambda cost, t=t: self.send_bid(t, cost))
             return

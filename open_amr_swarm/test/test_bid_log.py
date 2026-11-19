@@ -103,3 +103,42 @@ def test_verdict_flip_logs_both_ways_and_forgets_finished_tasks(agent):
     agent.claims['t0004'] = 'amr_1'
     agent.log_eligibility()
     assert 't0004' not in agent.bid_verdict
+
+
+def _state(a, kind):
+    a.bms, a.battery, a.must_charge = True, 1.0, False
+    a.drain.rate = 0.01
+    if kind == 'out_of_service':
+        a.out_of_service = True
+    elif kind == 'paused':
+        a.paused_me = True
+    elif kind == 'busy':
+        a.task = Task(task_id='t0009')
+    elif kind == 'phase':
+        a.phase = 'docking'
+    elif kind == 'charging':
+        a.battery, a.must_charge = 0.25, True
+    elif kind == 'battery':
+        a.battery = 0.13
+    elif kind == 'arm_down':
+        a.handshake = True
+        a.station_down = lambda bay: True
+        a.graph.kind[a.graph.id('n3')] = 'bay'
+    elif kind == 'blocked':
+        a.cut_off = lambda ghosts=None: [{a.graph.id('n3')}]
+
+
+@pytest.mark.parametrize('kind', ['eligible', 'out_of_service', 'paused', 'busy', 'phase', 'charging', 'battery',
+                                  'arm_down', 'blocked'])
+def test_bid_block_and_the_real_auction_agree(agent, kind):
+    """Guard: auction() starts a bid for a task exactly when bid_block() says None (they must never drift)."""
+    t = task(agent, 't0001')
+    t.stamp = agent.get_clock().now().to_msg()             # the round is still open
+    _state(agent, kind)
+    started = []
+    agent.estimate = lambda start, goal, cb: started.append(goal)
+    agent.auction()
+    assert bool(started) == (agent.bid_block(t) is None)
+    assert bool(started) == (kind == 'eligible')
+    if kind != 'eligible':
+        assert any('eligible=no' in m for m in bids(agent))
