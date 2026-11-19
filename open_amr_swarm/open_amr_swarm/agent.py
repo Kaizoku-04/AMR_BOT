@@ -251,6 +251,7 @@ class SwarmAgent(Node):
         self.tasks, self.claims, self.done = {}, {}, set()
         self.bids = {}                   # (task_id, round) -> {robot_id: cost}
         self.decided, self.my_bids = set(), {}
+        self.bid_verdict = {}                            # task_id -> 'eligible' | the kind of its ineligibility
         # own state
         self.pose, self.prev_pose, self.speed_est = None, None, 0.0
         self.status, self.battery = RobotState.IDLE, 1.0
@@ -798,6 +799,48 @@ class SwarmAgent(Node):
         return (self.task is None and self.phase in ('idle', 'driving') and not self.bid_pending
                 and not (self.bms and self.must_charge) and not self.paused() and not self.out_of_service)
 
+    def bid_block(self, t):
+        """(kind, text) for why this robot can't bid on `t` now, None if it can. `kind` is stable (what changes the
+        verdict); `text` adds the numbers. The same checks as available() and auction(), in the same order."""
+        if self.out_of_service:
+            return 'out_of_service', 'out of service'
+        if self.paused():
+            return 'paused', 'paused'
+        if self.task is not None:
+            return f'busy:{self.task.task_id}', f'busy with {self.task.task_id}'
+        if self.phase not in ('idle', 'driving'):
+            return f'phase:{self.phase}', f'busy: {self.phase}'
+        if self.bms and self.must_charge:
+            return 'charging', (f'charging: soc {100 * self.battery:.0f} % below {100 * self.cp.low:.0f} % '
+                                f'(works again from {100 * self.cp.resume:.0f} %)')
+        if self.bms:
+            need = self.task_need(t)
+            if not can_take(self.battery, need, self.cp):
+                return 'battery', (f'battery: soc {100 * self.battery:.0f} % - need {100 * need:.0f} % '
+                                   f'(incl. x{self.cp.safety} margin) < reserve {100 * self.cp.reserve:.0f} % after reaching a charger')
+        if self.handshake:
+            for n in (t.origin_id, t.dest_id):
+                if n and self.graph.kind.get(self.graph.id(n)) == 'bay' and self.station_down(self.graph.id(n)):
+                    return f'arm_down:{n}', f'arm out of service at {n}'
+        if any(self.graph.id(n) in b for n in (t.origin_id, t.dest_id) if n for b in self.cut_off()):
+            return 'blocked', 'a silent robot blocks its bin or bay'
+        return None
+
+    def log_eligibility(self):
+        """One INFO `[bid]` line per task each time this robot's verdict or reason for it changes (not every round).
+        The eligible line, with its cost, is written by send_bid."""
+        pending = self.pending_tasks()
+        live = {t.task_id for t in pending}
+        for tid in [k for k in self.bid_verdict if k not in live]:
+            del self.bid_verdict[tid]
+        for t in pending:
+            blocked = self.bid_block(t)
+            if blocked is None:
+                continue
+            if self.bid_verdict.get(t.task_id) != blocked[0]:
+                self.bid_verdict[t.task_id] = blocked[0]
+                self.get_logger().info(f'[bid] {self.rid} {t.task_id} round {t.round} cost=- eligible=no reason={blocked[1]}')
+
     def task_need(self, t):
         """State of charge this task would cost, up to reaching a charger afterwards (energy.task_need)."""
         stops, dwell = [self.graph.id(t.origin_id)], 0.0
@@ -820,6 +863,7 @@ class SwarmAgent(Node):
             if winner == self.rid and self.task is None and not self.paused() and not self.out_of_service:
                 self.claim_and_start(t)
         # 2) bid on the most urgent open task we haven't bid on yet
+        self.log_eligibility()
         if not self.available():
             return
         for t in self.pending_tasks():
@@ -873,6 +917,9 @@ class SwarmAgent(Node):
         b = Bid(stamp=self.get_clock().now().to_msg(), task_id=t.task_id, round=t.round, robot_id=self.rid,
                 cost=float(cost))
         self.my_bids[(t.task_id, t.round)] = cost
+        if self.bid_verdict.get(t.task_id) != 'eligible':
+            self.bid_verdict[t.task_id] = 'eligible'
+            self.get_logger().info(f'[bid] {self.rid} {t.task_id} round {t.round} cost={cost:.1f} eligible=yes')
         self.on_bid(b)
         self.send(self.pub_bid, b)
 
