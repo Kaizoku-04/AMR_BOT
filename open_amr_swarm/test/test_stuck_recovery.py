@@ -216,3 +216,23 @@ def test_initial_node_is_where_the_agent_says_it_came_from(agent):
     a.update_pose = lambda: True
     a.tick()
     assert a.last_node == 2
+
+
+def test_backup_distance_is_pure_and_clamped():
+    from open_amr_swarm.agent import backup_distance
+    h = math.pi / 2
+    # stuck_B4: pose (-6.40,-8.21) facing +y, came from south_w_0 (-6.0,-9.75): proj 1.54 -> 1.69
+    assert backup_distance((-6.40, -8.21, h), (-6.0, -9.75), 0.5, 2.0) == pytest.approx(1.69)
+    assert backup_distance((0.0, 0.3, h), (0.0, 0.0), 0.5, 2.0) == pytest.approx(0.5)     # proj 0.3 -> 0.45 -> base
+    assert backup_distance((0.0, 5.0, h), (0.0, 0.0), 0.5, 2.0) == pytest.approx(2.0)     # far node: clamped
+    assert backup_distance((0.0, -1.0, h), (0.0, 0.0), 0.5, 2.0) == pytest.approx(0.5)    # behind the node
+    assert backup_distance((0.0, 3.0, h), None, 0.5, 2.0) == pytest.approx(0.5)           # no node
+
+
+def test_recovery_backs_the_projected_distance(agent):
+    a = agent
+    drive_to_bay(a)
+    a.last_node = 1                      # node n1 at (1,0); pose of drive_to_bay is near n3/n4: far node -> clamped
+    a.drive()
+    assert a.backups[0].target.x == pytest.approx(
+        min(max(((a.pose[0] - 1.0) * math.cos(a.pose[2]) + a.pose[1] * math.sin(a.pose[2])) + 0.15, 0.5), 2.0))

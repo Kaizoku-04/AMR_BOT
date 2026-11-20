@@ -79,6 +79,20 @@ def backout_plan(pose, bay, staging, tol, at_bay):
     return ('undock' if out <= at_bay else 'backup'), length - out
 
 
+def backup_distance(pose, node_xy, base, max_m, margin=0.15):
+    """Distance start_recovery backs out. A robot that jammed `proj` m ahead of the node it last left needs more than a
+    fixed base to get back out of a sideways pocket (stuck_B4: 0.40 m off aisle_0's axis, 1.54 m past south_w_0: 0.5 m
+    re-planned into the same pocket twice): clamp(proj + margin, base, max_m), proj = the pose's distance past that node
+    along the robot's heading. proj <= 0 or no node: base."""
+    if node_xy is None:
+        return base
+    x, y, yaw = pose
+    proj = (x - node_xy[0]) * math.cos(yaw) + (y - node_xy[1]) * math.sin(yaw)
+    if proj <= 0.0:
+        return base
+    return min(max(proj + margin, base), max_m)
+
+
 class Leg:
     def __init__(self, target, dwell_s, drive_status, final_precise=True, station=False, transfer=None):
         self.target, self.dwell_s, self.drive_status, self.precise = target, dwell_s, drive_status, final_precise
@@ -282,11 +296,14 @@ class SwarmAgent(Node):
         # corner against the rack: 60 aborts, 2 give-backs, re-won within 2 s): after recover_after_fails aborts in a
         # row the robot backs recover_backup_m straight out (Nav2 BackUp: its costmap check includes the rear ultrasonics),
         # clears the local costmap and plans the leg again; recover_max such recoveries per leg target, then STUCK.
+        # The distance is clamp(projection of the pose on the robot's heading past the node it last left + 0.15 m,
+        # recover_backup_m, recover_backup_max_m): 0.5 m is too short to leave a 0.4 m sideways pocket (stuck_B4).
         # test hook: the node the robot counts as having come from at start-up ('' = the nearest one). The chain-64 reproducer
         # spawns on the stuck pose, whose nearest node is the pick node itself, so it would 'arrive' without driving
         self.initial_node = dp('initial_node', '').value
         self.recover_after = dp('recover_after_fails', 4).value
         self.recover_backup = dp('recover_backup_m', 0.5).value       # 0 = off
+        self.recover_backup_max = dp('recover_backup_max_m', 2.0).value
         self.recover_max = dp('recover_max', 2).value
         self.recover_clear = dp('recover_clear_m', 2.5).value         # no robot closer than this (map frame)
         self.recoveries, self.recov_t0 = {}, None                    # leg target node -> recoveries used
@@ -1770,16 +1787,17 @@ class SwarmAgent(Node):
                                    f'no back-up', throttle_duration_sec=30.0)
             return False
         self.recoveries[key] = self.recoveries.get(key, 0) + 1
+        back = backup_distance(self.pose, self.graph.pos.get(self.last_node), self.recover_backup, self.recover_backup_max)
         self.get_logger().warn(f'{self.rid}: controller failed {self.leg_fail} times near '
                                f'{self.graph.name[self.route[self.next_idx]]}: recovery {self.recoveries[key]}/'
-                               f'{self.recover_max}, backing {self.recover_backup:.2f} m')
+                               f'{self.recover_max}, backing {back:.2f} m')
         self.stop_following()
         if self.clear_local.service_is_ready():
             self.clear_local.call_async(ClearEntireCostmap.Request())
         self.phase, self.recov_t0, self.recov_from = 'recovering', self.now(), (self.pose, self.odom_pose())
         g = BackUp.Goal(speed=self.backout_speed,
-                        time_allowance=Duration(sec=int(self.recover_backup / self.backout_speed) + 10))
-        g.target.x = self.recover_backup
+                        time_allowance=Duration(sec=int(back / self.backout_speed) + 10))
+        g.target.x = back
         tok = self.recov_req.send(wallclock.monotonic())
         self.backup_client.send_goal_async(g).add_done_callback(lambda f, tok=tok: self.on_recov_handle(f, tok))
         return True
