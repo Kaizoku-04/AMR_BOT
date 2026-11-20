@@ -98,6 +98,12 @@ class SwarmAgent(Node):
         self.top_up_below = dp('top_up_below', 0.90).value   # a parked robot moves to a free charger below this
         self.speed = dp('nominal_speed', 0.5).value
         self.bid_window = dp('bid_window_s', 1.5).value
+        # strict order (2026-11-21): bid only on the first task in task_order this robot can do, waiting for that task's
+        # round result or re-offer instead of bidding on later ones (a freed robot bid on every open round and took the one
+        # that closed first, so old tasks starved: c65 t0013 open 682 s of 900 s while robots bid eligibly on it and won
+        # newer tasks). A task whose round closed more than strict_wait_s ago (the WMS stopped offering it) is skipped.
+        self.strict_order = dp('bid_strict_order', False).value
+        self.strict_wait = dp('strict_wait_s', 6.0).value
         self.station_dwell = dp('station_dwell_s', 8.0).value
         self.bin_dwell = dp('bin_dwell_s', 4.0).value
         # arm bays: wait for the station's handshake (False: a fixed station_dwell_s, for runs without station agents)
@@ -249,6 +255,7 @@ class SwarmAgent(Node):
         self.stations = {}               # bay node id -> (StationState, receive wall time)
         self.station_down_since = None
         self.tasks, self.claims, self.done = {}, {}, set()
+        self.first_seen = {}             # task_id -> stamp of the first offer heard (a re-offer renews Task.stamp)
         self.bids = {}                   # (task_id, round) -> {robot_id: cost}
         self.decided, self.my_bids = set(), {}
         self.bid_verdict = {}                            # task_id -> 'eligible' | the kind of its ineligibility
@@ -326,6 +333,7 @@ class SwarmAgent(Node):
         cur = self.tasks.get(m.task_id)
         if cur is None or m.round >= cur.round:
             self.tasks[m.task_id] = m
+        self.first_seen.setdefault(m.task_id, stamp_s(m.stamp))
         # the WMS re-targets my box to another bin (its bin was cut off): drive there instead
         if self.task is not None and m.task_id == self.task.task_id and m.dest_id and m.dest_id != self.task.dest_id \
                 and self.loaded:
@@ -793,7 +801,7 @@ class SwarmAgent(Node):
     # ------------------------------------------------------------------ auction
     def pending_tasks(self):
         return sorted((t for t in self.tasks.values() if t.task_id not in self.claims and t.task_id not in self.done),
-                      key=lambda t: rules.task_order(t.priority, stamp_s(t.stamp), t.task_id))
+                      key=lambda t: rules.task_order(t.priority, self.first_seen.get(t.task_id, stamp_s(t.stamp)), t.task_id))
 
     def available(self):
         return (self.task is None and self.phase in ('idle', 'driving') and not self.bid_pending
@@ -868,9 +876,11 @@ class SwarmAgent(Node):
             return
         for t in self.pending_tasks():
             key = (t.task_id, t.round)
-            if key in self.my_bids or rules.closed(now, stamp_s(t.stamp), self.bid_window):
-                continue
             if self.bid_block(t):                      # the one eligibility check (also what [bid] logs)
+                continue                               # one it can't do never holds it back
+            if key in self.my_bids or rules.closed(now, stamp_s(t.stamp), self.bid_window):
+                if self.strict_order and now - stamp_s(t.stamp) < self.bid_window + self.strict_wait:
+                    return                             # wait for this round's result or the task's re-offer
                 continue
             self.bid_pending = True
             self.estimate(self.start_node(), self.graph.id(t.origin_id), lambda cost, t=t: self.send_bid(t, cost))

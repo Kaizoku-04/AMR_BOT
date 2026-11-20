@@ -5,7 +5,8 @@ open_amr_fleet_mock) uses the very same rule instead of a copy; agent.py calls t
 before (the bodies are the expressions agent.py had inline at `auction()` and `pending_tasks()`).
   winner       lowest cost, then lowest robot id: every agent evaluates the same bids of a closed round with it, so all
                agree on the winner without an auctioneer (Swarm Design "Auction", ADR-007).
-  task_order   the order in which a robot considers open tasks: higher priority first, then older offer, then task id.
+  task_order   the order in which a robot considers open tasks: higher priority first, then older first offer (the
+               agent passes the stamp of the first offer it heard: a re-offer renews Task.stamp), then task id.
   closed       a round's bid window has passed (task stamp + window, sim time).
 """
 
@@ -18,7 +19,7 @@ def winner(bids):
 
 
 def task_order(priority, stamp_s, task_id):
-    """Sort key of an open task: higher priority, then older offer (stamp, s), then id."""
+    """Sort key of an open task: higher priority, then older first offer (s), then id."""
     return (-priority, stamp_s, task_id)
 
 
