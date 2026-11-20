@@ -79,6 +79,34 @@ def backout_plan(pose, bay, staging, tol, at_bay):
     return ('undock' if out <= at_bay else 'backup'), length - out
 
 
+def square_corner(pts, i_node, a, n, c, step=0.05):
+    """The sharp lane-graph corner a -> n -> c in place of route_server's smoothed arc around the path pose `i_node`
+    (the pose closest to n). pts: path positions [(x, y)]. Returns (i_s, i_e, seg, j): pts[i_s..i_e] (inclusive) are
+    replaced by seg [(x, y, yaw)], whose pose j is the corner itself with the incoming heading; the poses after it
+    carry the outgoing heading. The window is half of each adjacent link, at most 1 m: a smoothing arc never reaches
+    that far (its tangent length is radius / tan(turn / 2): 0.4 m for a 90 deg turn at the 0.4 m radius).
+    A turn stop exists so the robot stops on the lane, turns in place and drives straight on (stop_nodes); on the
+    smoothed path the pose closest to the node is the arc's middle, so the stop came 0.17 m inside the corner at half
+    the turn (135 deg into aisle 0), and the last leg began 45 deg off the aisle 1.4 m before the first bay: c64 amr_2
+    drove that diagonal into aisle 0's west rack and stalled (2026-11-20)."""
+    def d(p, q):
+        return math.hypot(q[0] - p[0], q[1] - p[1])
+    wa, wc = min(1.0, 0.5 * d(a, n)), min(1.0, 0.5 * d(n, c))
+    i_s = i_e = i_node
+    while i_s > 0 and d(pts[i_s - 1], n) < wa:
+        i_s -= 1
+    while i_e < len(pts) - 1 and d(pts[i_e + 1], n) < wc:
+        i_e += 1
+    hin, hout = math.atan2(n[1] - a[1], n[0] - a[0]), math.atan2(c[1] - n[1], c[0] - n[0])
+    seg = [(n[0] - (wa - s) * math.cos(hin), n[1] - (wa - s) * math.sin(hin), hin)
+           for s in (i * step for i in range(int(wa / step))) if wa - s > 1e-6]
+    j = len(seg)
+    seg.append((n[0], n[1], hin))
+    seg += [(n[0] + s * math.cos(hout), n[1] + s * math.sin(hout), hout)
+            for s in (i * step for i in range(1, int(wc / step) + 1)) if s < wc - 1e-6]
+    return i_s, i_e, seg, j
+
+
 class Leg:
     def __init__(self, target, dwell_s, drive_status, final_precise=True, station=False, transfer=None):
         self.target, self.dwell_s, self.drive_status, self.precise = target, dwell_s, drive_status, final_precise
@@ -1000,6 +1028,8 @@ class SwarmAgent(Node):
             self.prepend_lead_in(self.route[0])
         self.node_idx = self.index_nodes(self.route, self.path)
         self.stop_at = self.stop_nodes(self.route)
+        if self.stop_at:
+            self.square_stop_corners()
         self.next_idx = 1 if self.route[0] == self.last_node else 0
         self.phase, self.follow_end, self.wait_s = 'driving', None, 0.0
 
@@ -1043,6 +1073,27 @@ class SwarmAgent(Node):
                     self.graph.kind.get(c) in ('charger', 'parking') or self.graph.dist(b, c) < 2.5):
                 out.add(k)
         return out
+
+    def square_stop_corners(self):
+        """At every turn stop, the path's smoothed arc becomes the sharp corner (square_corner), so the stretch ends on
+        the node with the incoming heading (the robot stops on the lane) and the next starts there heading out (it turns
+        in place). Later corners first, so the earlier indices stay valid; node indices are recomputed after."""
+        poses = list(self.path.poses)
+        tmpl = poses[0] if poses else None
+        for k in sorted(self.stop_at, reverse=True):
+            a, n, c = (self.graph.pos[self.route[i]] for i in (k - 1, k, k + 1))
+            pts = [(p.pose.position.x, p.pose.position.y) for p in poses]
+            i_s, i_e, seg, _ = square_corner(pts, self.node_idx[k], a, n, c)
+            new = []
+            for x, y, yaw in seg:
+                p = PoseStamped()
+                p.header = tmpl.header if tmpl is not None else self.path.header
+                p.pose.position.x, p.pose.position.y = x, y
+                p.pose.orientation.z, p.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+                new.append(p)
+            poses[i_s:i_e + 1] = new
+        self.path.poses = poses
+        self.node_idx = self.index_nodes(self.route, self.path)
 
     def index_nodes(self, route, path):
         """Path-pose index closest to each route node, walking forward (corners are smoothed, so 'closest')."""
