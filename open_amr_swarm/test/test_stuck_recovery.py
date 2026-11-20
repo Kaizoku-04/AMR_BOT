@@ -35,11 +35,13 @@ def agent(tmp_path):
     a = SwarmAgent()
     a.t = 1000.0
     a.now = lambda: a.t
-    a.sent, a.backups, a.routes, a.lines = [], [], [], []
+    a.sent, a.backups, a.routes, a.lines, a.forwards = [], [], [], [], []
     a.send = lambda pub, msg: a.sent.append(msg)
     a.synced = True
     a.backup_client.server_is_ready = lambda: True
     a.backup_client.send_goal_async = lambda g: a.backups.append(g) or _future()
+    a.drive_client.server_is_ready = lambda: True
+    a.drive_client.send_goal_async = lambda g: a.forwards.append(g) or _future()
     a.route_client.wait_for_server = lambda timeout_sec=None: True
     a.route_client.send_goal_async = lambda g: a.routes.append(g) or _future()
     a.follow_client.send_goal_async = lambda g: _future()
@@ -112,20 +114,20 @@ def test_not_with_a_robot_within_2_5_m_and_stuck_as_before(agent):
 
 def test_bounded_then_stuck(agent):
     a = agent
-    for n in (1, 2):
+    for n in (1, 2, 3):
         drive_to_bay(a, fails=3)
         a.recoveries = {4: n - 1}
         a.drive()
         assert a.phase == 'recovering' and a.recoveries == {4: n}
         a.recovery_done('test')
     drive_to_bay(a, fails=3)
-    a.recoveries = {4: 2}
+    a.recoveries = {4: 3}
     a.drive()
     assert a.phase == 'driving' and a.status != RobotState.STUCK       # recover_max used up: back to the old behaviour
     for _ in range(5):
         a.follow_state = GoalStatus.STATUS_ABORTED
         a.drive()
-    assert a.status == RobotState.STUCK and len(a.backups) == 2
+    assert a.status == RobotState.STUCK and len(a.backups) + len(a.forwards) == 3 and len(a.forwards) == 2
 
 
 def test_switched_off(agent):
@@ -236,3 +238,78 @@ def test_recovery_backs_the_projected_distance(agent):
     a.drive()
     assert a.backups[0].target.x == pytest.approx(
         min(max(((a.pose[0] - 1.0) * math.cos(a.pose[2]) + a.pose[1] * math.sin(a.pose[2])) + 0.15, 0.5), 2.0))
+
+
+def _result(a, code):
+    a.recov_handle = h = object()
+    status = GoalStatus.STATUS_SUCCEEDED if code == 0 else GoalStatus.STATUS_ABORTED
+    res = type('R', (), {'result': type('Res', (), {'error_code': code})(), 'status': status})()
+    a.on_recov_result(type('F', (), {'result': lambda s: res})(), h)
+
+
+def test_blocked_back_up_makes_the_next_recovery_a_forward_drive(agent):
+    """stuck_B5r: recovery 1 turned the robot against the rack, recovery 2's BackUp failed at once (714); the open
+    floor was ahead and nothing tried it."""
+    a = agent
+    drive_to_bay(a)
+    a.drive()
+    assert len(a.backups) == 1 and not a.forwards
+    _result(a, 714)                                          # blocked: error code, nothing moved
+    assert a.recov_blocked == {4: True}
+    a.phase, a.leg, a.leg_fail = 'driving', Leg(4, 4.0, RobotState.TO_PICK, final_precise=True), 4
+    a.legs = []
+    assert a.start_recovery()
+    assert len(a.backups) == 1 and len(a.forwards) == 1
+    assert a.forwards[0].target.x == pytest.approx(0.4) and a.forwards[0].speed == pytest.approx(0.15)
+    assert a.recov_dist == pytest.approx(0.4) and a.recoveries == {4: 2}
+
+
+def test_a_short_back_up_is_blocked_a_full_one_is_not(agent):
+    a = agent
+    drive_to_bay(a)
+    a.drive()
+    a.moved_since = lambda p: 0.1                            # succeeded but moved 0.1 of 0.5 m
+    _result(a, 0)
+    assert a.recov_blocked == {4: True}
+    a.phase, a.leg = 'recovering', Leg(4, 4.0, RobotState.TO_PICK, final_precise=True)
+    a.recov_from, a.recov_dist = ((0, 0, 0), None), 0.5
+    a.moved_since = lambda p: 0.5
+    _result(a, 0)
+    assert a.recov_blocked == {4: False}
+
+
+def test_a_successful_back_up_is_followed_by_a_back_up(agent):
+    a = agent
+    drive_to_bay(a)
+    a.drive()
+    a.moved_since = lambda p: a.recov_dist
+    _result(a, 0)
+    assert a.recov_blocked == {4: False}
+    a.phase, a.leg, a.leg_fail = 'driving', Leg(4, 4.0, RobotState.TO_PICK, final_precise=True), 4
+    assert a.start_recovery()
+    assert len(a.backups) == 2 and not a.forwards
+
+
+def test_forward_falls_back_to_a_back_up_without_a_drive_server(agent):
+    a = agent
+    drive_to_bay(a)
+    a.recov_blocked = {4: True}
+    a.drive_client.server_is_ready = lambda: False
+    a.drive()
+    assert len(a.backups) == 1 and not a.forwards
+
+
+def test_the_watchdog_uses_the_distance_actually_sent(agent):
+    a = agent
+    drive_to_bay(a)
+    a.recov_blocked = {4: True}
+    a.drive()
+    assert a.forwards and a.recov_dist == pytest.approx(0.4) and a.phase == 'recovering'
+    a.recov_req.ack(a.recov_req.token)                       # goal accepted: only the time limit is left
+    a.recover_backup = 2.0                                   # the old formula would allow 2.0 / 0.15 + 25 = 38 s
+    a.t = a.recov_t0 + 0.4 / a.backout_speed + 24.0          # inside the 0.4 m limit (27.7 s)
+    a.check_requests()
+    assert a.phase == 'recovering'
+    a.t = a.recov_t0 + 0.4 / a.backout_speed + 26.0
+    a.check_requests()
+    assert a.phase == 'retry'
