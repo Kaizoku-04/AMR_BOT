@@ -8,3 +8,8 @@ __pycache__/
 # Personal Claude Code context (each developer's own machine)
 CLAUDE.local.md
 .claude/settings.local.json
+
+# colcon output (build in the workspace root, not in a package worktree)
+log/
+build/
+install/

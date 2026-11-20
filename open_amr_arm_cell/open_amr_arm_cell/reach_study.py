@@ -139,10 +139,13 @@ def box_object(name, size, xyz, yaw_deg=0.0, op=CollisionObject.ADD):
     return co
 
 
-def zone_objects(cell, docked, deck_box=False, deck_off=None):
+def zone_objects(cell, docked, deck_box=False, deck_off=None, deck_frame=None):
     """Planning-scene objects of the bay: the docked robot (+ the carton on its deck) or the keep-out volume.
     deck_off = where the carton on the deck was located (dx, dy, dyaw off the pattern), None = not located: the carton
-    goes there, the robot and its rails where that carton puts them (Cell.deck_shift)."""
+    goes there, the robot and its rails where that carton puts them (Cell.deck_shift).
+    deck_frame = where the cell's camera located the deck itself (dx, dy, dyaw off the nominal pose; ADR-048): the robot
+    and its rails are drawn exactly there (along the cell x axis; dy moves the robot body), and the carton on them
+    is centred on it."""
     p = cell.p
     rm = lambda n: box_object(n, (), (), op=CollisionObject.REMOVE)
     if not docked:
@@ -151,9 +154,12 @@ def zone_objects(cell, docked, deck_box=False, deck_off=None):
                 box_object('deck_zone', (sx, sy, top), (x, y, top / 2))]
     (dx, dy, dz), dyaw = cell.deck_cell()
     ox, oy, oyaw = deck_off or (0.0, 0.0, 0.0)
-    shift = cell.deck_shift(ox, dyaw_deg=oyaw)
+    shift, ay = cell.deck_shift(ox, dyaw_deg=oyaw), 0.0
+    if deck_frame is not None:
+        shift, ay = deck_frame[0], deck_frame[1]
+        ox, oy, oyaw = deck_frame
     rails = [box_object(f'deck_rail_{i}', r[3:], r[:3]) for i, r in enumerate(cell.rails_cell(shift))]
-    return [rm('deck_zone'), box_object('amr', AMR, (p.deck_distance + shift, 0.0, AMR[2] / 2))] + rails + [
+    return [rm('deck_zone'), box_object('amr', AMR, (p.deck_distance + shift, ay, AMR[2] / 2))] + rails + [
             box_object('deck_box', p.box, (dx + ox, dy + oy, dz - p.box[2] / 2), dyaw + oyaw) if deck_box
             else rm('deck_box')]
 
