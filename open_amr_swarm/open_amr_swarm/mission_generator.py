@@ -90,7 +90,10 @@ class MissionGenerator(Node):
         self.csv = open(os.path.join(self.out_dir, 'tasks.csv'), 'w', newline='')
         self.writer = csv.writer(self.csv)
         self.writer.writerow(['task_id', 'type', 'origin', 'dest', 'bin', 'offered_s', 'claimed_s', 'done_s', 'robot', 'rounds',
-                              'releases'])
+                              'releases', 'first_claimed_s', 'n_claims'])   # last two added 2026-11-19; claimed_s = the LAST claim
+        self.claims_csv = open(os.path.join(self.out_dir, 'claims.csv'), 'w', newline='')
+        self.claims_writer = csv.writer(self.claims_csv)     # one row per claim / give-back event (2026-11-19)
+        self.claims_writer.writerow(['t_s', 'task_id', 'event', 'robot', 'round', 'by', 'reason'])
         self.soc_csv = open(os.path.join(self.out_dir, 'battery.csv'), 'w', newline='')
         self.soc_writer = csv.writer(self.soc_csv)
         self.soc_writer.writerow(['t_s', 'robot', 'soc', 'status'])
@@ -132,7 +135,7 @@ class MissionGenerator(Node):
             else:
                 t.type, t.origin_id, t.dest_id, kind = Task.FETCH_FROM_BIN, bay, 'outbound_bay', 'outbound'
         self.meta[t.task_id] = dict(kind=kind, bin=binid, offered=self.now(), claimed=None, done=None, robot='',
-                                    at_arm=False, releases=0, on_robot=False, stranded=False, reclaims=0,
+                                    at_arm=False, releases=0, first_claimed=None, n_claims=0, on_robot=False, stranded=False, reclaims=0,
                                     cancelled=False)
         return t
 
@@ -178,6 +181,10 @@ class MissionGenerator(Node):
                 s.task_round == self.tasks[s.task_id].round:
             # won in the current offer round, but its CLAIM event never arrived: adopt it (don't take work away)
             m['claimed'], m['robot'] = self.now(), s.robot_id
+            m['first_claimed'] = m['claimed'] if m['first_claimed'] is None else m['first_claimed']
+            m['n_claims'] += 1
+            self.log_claim(Claim(resource_id=s.task_id, robot_id=s.robot_id, round=s.task_round), 'claimed',
+                           'learned from the robot heartbeat (claim event lost)')
             self.get_logger().info(f'{s.robot_id} holds {s.task_id} (claim event lost; learned from its heartbeat)')
         stale = m is not None and not m['stranded'] and (m['cancelled'] or m['robot'] != s.robot_id)
         if not stale:
@@ -233,6 +240,8 @@ class MissionGenerator(Node):
             rx = self.robot_rx.get(m['robot'])
             if rx is not None and t - rx >= silent_s:
                 m['stranded'] = True
+                self.log_claim(Claim(resource_id=tid, robot_id=m['robot']), 'released',
+                               'silent with the box on its deck (stranded by the WMS, not re-offered)')
                 self.get_logger().error(f'ALARM {tid}: {m["robot"]} silent for {t - rx:.0f} s with the box on its deck '
                                         f'— recover the robot and box by hand (task stays with it)')
 
@@ -338,22 +347,32 @@ class MissionGenerator(Node):
                 t.round += 1
                 self.offer(t)
 
+    def log_claim(self, c, event, reason=''):
+        """claims.csv: every claim and give-back of a task, so offered -> first claim -> re-claims can be told apart."""
+        self.claims_writer.writerow([f'{self.now() - self.t0:.1f}', c.resource_id, event, c.robot_id, c.round, c.by, reason])
+        self.claims_csv.flush()
+
     def on_claim(self, c):
         m = self.meta.get(c.resource_id)
         if c.resource_type != Claim.TASK or m is None:
             return
         if c.action == Claim.CLAIM and m['claimed'] is None:
             m['claimed'], m['robot'] = self.now(), c.robot_id
+            m['first_claimed'] = m['claimed'] if m['first_claimed'] is None else m['first_claimed']
+            m['n_claims'] += 1
+            self.log_claim(c, 'claimed', f"claim {m['n_claims']}")
         elif c.action == Claim.RELEASE and m['done'] is None and m['robot'] == c.robot_id:
             by_peer = bool(c.by) and c.by != c.robot_id
             if m['on_robot']:
                 m['stranded'] = True
+                self.log_claim(c, 'released', 'robot lost with the box on its deck (stranded, not re-offered)')
                 self.get_logger().error(f'ALARM {c.resource_id}: {c.robot_id} lost with the box on its deck '
                                         f'(released by {c.by or c.robot_id}); not re-offered — recover the box by hand')
                 return
             m['claimed'], m['robot'] = None, ''
             m['releases'] += 1
             m['reclaims'] += by_peer
+            self.log_claim(c, 'released', f'announced by {c.by}: silent robot' if by_peer else 'given back by the robot')
             self.get_logger().info(f'{c.robot_id} gave {c.resource_id} back'
                                    f'{f" (announced by {c.by}: silent robot)" if by_peer else ""}; re-offered')
         elif c.action == Claim.DONE and (m['done'] is None or m['cancelled']):
@@ -370,8 +389,10 @@ class MissionGenerator(Node):
             t = self.tasks[c.resource_id]
             self.writer.writerow([c.resource_id, m['kind'], t.origin_id, t.dest_id, m['bin'] or '', f"{m['offered'] - self.t0:.1f}",
                                   f"{(m['claimed'] or m['done']) - self.t0:.1f}", f"{m['done'] - self.t0:.1f}", c.robot_id, t.round,
-                                  m['releases']])
+                                  m['releases'], f"{(m['first_claimed'] or m['claimed'] or m['done']) - self.t0:.1f}",
+                                  m['n_claims']])
             self.csv.flush()
+            self.log_claim(c, 'done')
 
     def publish_inventory(self):
         self.pub_inv.publish(Inventory(stamp=self.get_clock().now().to_msg(),
@@ -484,4 +505,4 @@ def main():
     except (KeyboardInterrupt, SystemExit, rclpy.executors.ExternalShutdownException):
         pass
     finally:
-        node.csv.close(); node.soc_csv.close()
+        node.csv.close(); node.soc_csv.close(); node.claims_csv.close()
