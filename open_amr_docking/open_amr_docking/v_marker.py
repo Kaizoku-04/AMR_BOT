@@ -22,7 +22,10 @@ import numpy as np
 def _fit_line(pts):
     """Total least squares line: (centroid, unit direction)."""
     c = pts.mean(axis=0)
-    _, _, vt = np.linalg.svd(pts - c)
+    # full_matrices=False: only Vt (2x2) is used. The default forms the N x N matrix U: with ~450 points (the marker
+    # 0.25 m from the nose scanner) that is a multi-threaded OpenBLAS job whose idle threads spin between calls, 33
+    # times a second: the detector used 830-860 % CPU while docked (bayprobe1, 2026-11-20), 100 % cut to ~1 core.
+    _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
     return c, vt[0]
 
 
