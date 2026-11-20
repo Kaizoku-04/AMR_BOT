@@ -278,6 +278,22 @@ class SwarmAgent(Node):
         self.check_unknown_since, self.check_unknown_s = None, 2.0  # dock check without an accuracy figure since
         self.exitbk_from = None          # (map, odom) pose when that BackUp was first sent (cleared on the next arrival)
         self.act_still_since, self.act_polled_at = None, 0.0
+        # A controller that keeps failing with nobody near (chain 64, amr_2 jammed 0.44 m off aisle_0's axis with its nose
+        # corner against the rack: 60 aborts, 2 give-backs, re-won within 2 s): after recover_after_fails aborts in a
+        # row the robot backs recover_backup_m straight out (Nav2 BackUp: its costmap check includes the rear ultrasonics),
+        # clears the local costmap and plans the leg again; recover_max such recoveries per leg target, then STUCK.
+        self.recover_after = dp('recover_after_fails', 4).value
+        self.recover_backup = dp('recover_backup_m', 0.5).value       # 0 = off
+        self.recover_max = dp('recover_max', 2).value
+        self.recover_clear = dp('recover_clear_m', 2.5).value         # no robot closer than this (map frame)
+        self.recoveries, self.recov_t0 = {}, None                    # leg target node -> recoveries used
+        self.recov_req, self.recov_handle, self.recov_from = Pending(), None, None
+        # A task given back for no progress is not bid on again for giveback_cooldown_s (sim s), and no task at all until
+        # the robot has moved giveback_min_move_m (map/odom) or recovered: the cheapest bidder for a task is the robot
+        # standing next to it, which is the robot that cannot reach it (chain 64: t0004 re-won within 2 s, twice)
+        self.giveback_cooldown = dp('giveback_cooldown_s', 300.0).value
+        self.giveback_min_move = dp('giveback_min_move_m', 0.3).value
+        self.gave_back, self.moved_gate = {}, None                   # task_id -> sim s; (map, odom) pose at the give-back
         # lanes closed in my route server: what I want (ghosts' lanes + a deadlock re-route's lane) vs what it confirmed;
         # sync_edges() sends the difference, again after ack_timeout if no answer came (a lost request used to leave a
         # ghost's lanes open for good while the agent believed them closed)
@@ -395,6 +411,12 @@ class SwarmAgent(Node):
                     self.back_out(self.graph.name[self.route[-1]], 'operator acknowledged')
                 else:
                     self.restage()
+            elif self.status == RobotState.STUCK and self.phase == 'driving' and self.leg is not None:
+                self.get_logger().warn(f'{self.rid}: operator {m.issued_by or "?"} acknowledged the stuck controller: '
+                                       f'fresh recoveries')
+                self.recoveries.pop(self.leg.target, None)
+                self.leg_fail, self.status = 4, self.leg.drive_status
+                self.follow_state = GoalStatus.STATUS_ABORTED    # drive() starts the recovery at once
             else:
                 self.get_logger().info(f'{self.rid}: operator acknowledged a fault; nothing to retry')
             return
@@ -615,6 +637,9 @@ class SwarmAgent(Node):
                 h.get_result_async().add_done_callback(lambda r, h=h: self.on_follow_done(h, r))
         else:
             self.still_since = None
+        if self.phase == 'recovering' and (self.recov_req.overdue(t, self.ack_timeout) or (
+                self.recov_t0 is not None and self.now() - self.recov_t0 > self.recover_backup / self.backout_speed + 25.0)):
+            self.recovery_done('back-up goal or result lost')
         # DockRobot / UndockRobot / BackUp: the same two losses (chain 38: a lost answer would hold the bay for the shift)
         bay = self.graph.name[self.route[-1]] if self.route else ''
         if self.dock_req.overdue(t, self.ack_timeout):
@@ -765,14 +790,14 @@ class SwarmAgent(Node):
     def check_stuck(self):
         """Liveness rule 4: an empty robot that can't make progress for reclaim_stuck_s (controller failing, battery
         empty, blocked, or no route) gives its task back so another robot can do it."""
-        stuck = self.status == RobotState.STUCK or self.wait_s > 0.0 or self.phase == 'retry' or self.paused()
+        stuck = self.status == RobotState.STUCK or self.wait_s > 0.0 or self.phase in ('retry', 'recovering') or self.paused()
         if self.task is None or self.loaded or not stuck:
             self.stuck_since = None
             return
         now = self.now()
         self.stuck_since = self.stuck_since or now
         if now - self.stuck_since > self.lp.reclaim_stuck_s:
-            self.give_back(f'no progress for {now - self.stuck_since:.0f} s')
+            self.give_back(f'no progress for {now - self.stuck_since:.0f} s', stuck=True)
 
     def update_pose(self):
         try:
@@ -810,6 +835,12 @@ class SwarmAgent(Node):
             return f'busy:{self.task.task_id}', f'busy with {self.task.task_id}'
         if self.phase not in ('idle', 'driving'):
             return f'phase:{self.phase}', f'busy: {self.phase}'
+        if self.moved_gate is not None and self.moved_since(self.moved_gate) < self.giveback_min_move:
+            return 'unmoved', (f'gave a task back for no progress and has moved {self.moved_since(self.moved_gate):.2f} m '
+                               f'of {self.giveback_min_move:.1f} m since')
+        if t.task_id in self.gave_back and self.now() - self.gave_back[t.task_id] < self.giveback_cooldown:
+            return (f'cooldown:{t.task_id}', f'gave {t.task_id} back for no progress {self.now() - self.gave_back[t.task_id]:.0f} s '
+                    f'ago (cooldown {self.giveback_cooldown:.0f} s)')
         if self.bms and self.must_charge:
             return 'charging', (f'charging: soc {100 * self.battery:.0f} % below {100 * self.cp.low:.0f} % '
                                 f'(works again from {100 * self.cp.resume:.0f} %)')
@@ -945,6 +976,8 @@ class SwarmAgent(Node):
         bay_goal = self.cancel_bay_goals()
         self.task, self.legs, self.loaded, self.stuck_since = None, [], False, None
         self.noroute_since, self.noroute_parked = None, False
+        self.cancel_recovery()
+        self.recoveries.clear()
         self.stop_following()
         self.phase = 'idle'; self.status = RobotState.IDLE; self.idle_since = self.now()
         if bay_goal and self.in_bay():
@@ -1183,6 +1216,8 @@ class SwarmAgent(Node):
                 self.leg_fail += 1
                 if self.leg_fail % 3 == 0 and self.clear_local.service_is_ready():
                     self.clear_local.call_async(ClearEntireCostmap.Request())   # stale obstacles are the usual cause
+                if self.leg_fail >= self.recover_after and self.start_recovery():
+                    return
                 if self.leg_fail > 8:
                     self.status = RobotState.STUCK
                     self.get_logger().warn(f'{self.rid}: controller keeps failing near {self.graph.name[self.route[self.next_idx]]}')
@@ -1714,6 +1749,75 @@ class SwarmAgent(Node):
             self.status, self.load_fault = RobotState.STUCK, why
             self.get_logger().error(f'{self.rid}: {why}: staying here until a person clears it')
 
+    def start_recovery(self):
+        """The controller has failed recover_after_fails times at this node: back recover_backup_m straight out along the
+        reverse heading (Nav2 BackUp; its costmap check includes the rear ultrasonics, collision_monitor watches them
+        too), then plan the leg again from the new pose. Not with a robot within recover_clear_m (it may be the cause, and
+        the traffic rules, not this, resolve that), not past recover_max per leg target, not without a BackUp server.
+        False: nothing started, the caller carries on as before (more aborts -> STUCK)."""
+        if self.recover_backup <= 0.0 or self.pose is None or self.leg is None or self.phase != 'driving' or self.docking:
+            return False
+        key = self.leg.target
+        if self.recoveries.get(key, 0) >= self.recover_max or not self.backup_client.server_is_ready():
+            return False
+        x, y, _ = self.pose
+        near = [p.robot_id for p in self.live_peers() if math.hypot(p.x - x, p.y - y) < self.recover_clear]
+        if near:
+            self.get_logger().info(f'{self.rid}: controller failing but {near[0]} is within {self.recover_clear:.1f} m: '
+                                   f'no back-up', throttle_duration_sec=30.0)
+            return False
+        self.recoveries[key] = self.recoveries.get(key, 0) + 1
+        self.get_logger().warn(f'{self.rid}: controller failed {self.leg_fail} times near '
+                               f'{self.graph.name[self.route[self.next_idx]]}: recovery {self.recoveries[key]}/'
+                               f'{self.recover_max}, backing {self.recover_backup:.2f} m')
+        self.stop_following()
+        if self.clear_local.service_is_ready():
+            self.clear_local.call_async(ClearEntireCostmap.Request())
+        self.phase, self.recov_t0, self.recov_from = 'recovering', self.now(), (self.pose, self.odom_pose())
+        g = BackUp.Goal(speed=self.backout_speed,
+                        time_allowance=Duration(sec=int(self.recover_backup / self.backout_speed) + 10))
+        g.target.x = self.recover_backup
+        tok = self.recov_req.send(wallclock.monotonic())
+        self.backup_client.send_goal_async(g).add_done_callback(lambda f, tok=tok: self.on_recov_handle(f, tok))
+        return True
+
+    def on_recov_handle(self, f, tok):
+        h = f.result()
+        if not self.recov_req.ack(tok):
+            if h.accepted:
+                h.cancel_goal_async()            # abandoned (the task was dropped meanwhile): must not drive
+            return
+        if not h.accepted:
+            return self.recovery_done('BackUp rejected')
+        self.recov_handle = h
+        h.get_result_async().add_done_callback(lambda r, h=h: self.on_recov_result(r, h))
+
+    def on_recov_result(self, r, h):
+        if h is not self.recov_handle:
+            return
+        res, status = r.result().result, r.result().status
+        ok = status == GoalStatus.STATUS_SUCCEEDED and res.error_code == 0
+        self.recovery_done('backed out' if ok else f'BackUp ended with error {res.error_code} (blocked behind?)')
+
+    def recovery_done(self, why):
+        """The back-up is over, however it ended: plan the leg again from where the robot stands (a blocked back-up counts
+        as a used recovery, so the failures after it escalate to STUCK as before)."""
+        if self.phase != 'recovering':
+            return
+        d = self.moved_since(self.recov_from) if self.recov_from is not None else 0.0
+        self.recov_req.clear(); self.recov_handle, self.recov_t0, self.recov_from = None, None, None
+        self.get_logger().info(f'{self.rid}: recovery: {why}, moved {d:.2f} m; planning the leg again')
+        self.moved_gate = None
+        if self.leg is not None:
+            self.legs.insert(0, self.leg); self.leg = None
+        self.phase, self.retry_at = 'retry', self.now()
+
+    def cancel_recovery(self):
+        if self.recov_handle is not None:
+            self.recov_handle.cancel_goal_async()
+        self.recov_req.clear()
+        self.recov_handle, self.recov_t0, self.recov_from = None, None, None
+
     def leave_bay(self, retry=False):
         """Leave the transfer spot. From an arm bay, first back straight out bay_exit_backup_m, then next_leg() plans
         from the bay's exit. The distance counts from where the robot stood when the first BackUp was sent (docked, to
@@ -1865,9 +1969,13 @@ class SwarmAgent(Node):
             self.station_down_since = None
             self.give_back(f'{self.graph.name[leg.target]} out of service for {self.station_giveup:.0f} s')
 
-    def give_back(self, why):
-        """Hand my (empty-deck) task back to the WMS for re-auction and go idle."""
+    def give_back(self, why, stuck=False):
+        """Hand my (empty-deck) task back to the WMS for re-auction and go idle. `stuck`: for no progress, so the robot
+        may not take the task again for giveback_cooldown_s, nor any task before it has moved or recovered."""
         t = self.task
+        if stuck:
+            self.gave_back[t.task_id] = self.now()
+            self.moved_gate = (self.pose, self.odom_pose()) if self.pose is not None else None
         self.get_logger().warn(f'{self.rid}: {why}: giving {t.task_id} back')
         self.send(self.pub_claim, Claim(stamp=self.get_clock().now().to_msg(), resource_type=Claim.TASK,
                                         resource_id=t.task_id, robot_id=self.rid, action=Claim.RELEASE, round=t.round))
@@ -1881,6 +1989,7 @@ class SwarmAgent(Node):
                                      resource_id=t.task_id, robot_id=self.rid, action=Claim.DONE, round=t.round))
         self.done.add(t.task_id)
         self.get_logger().info(f'{self.rid}: done {t.task_id} at {self.graph.name[self.last_node]}')
+        self.recoveries.clear()
         self.task, self.leg, self.loaded, self.noroute_parked = None, None, False, False
         self.phase, self.status, self.idle_since = 'idle', RobotState.IDLE, self.now()
 

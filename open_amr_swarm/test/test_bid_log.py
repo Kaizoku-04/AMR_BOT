@@ -126,10 +126,14 @@ def _state(a, kind):
         a.graph.kind[a.graph.id('n3')] = 'bay'
     elif kind == 'blocked':
         a.cut_off = lambda ghosts=None: [{a.graph.id('n3')}]
+    elif kind == 'unmoved':                          # gave a task back for no progress and has not moved since
+        a.moved_gate = ((0.0, 0.0, 0.0), None)
+    elif kind == 'cooldown':                         # moved since, but this very task was the one given back
+        a.gave_back['t0001'] = a.now()
 
 
 @pytest.mark.parametrize('kind', ['eligible', 'out_of_service', 'paused', 'busy', 'phase', 'charging', 'battery',
-                                  'arm_down', 'blocked'])
+                                  'arm_down', 'blocked', 'unmoved', 'cooldown'])
 def test_bid_block_and_the_real_auction_agree(agent, kind):
     """Guard: auction() starts a bid for a task exactly when bid_block() says None (they must never drift)."""
     t = task(agent, 't0001')
