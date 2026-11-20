@@ -282,6 +282,9 @@ class SwarmAgent(Node):
         # corner against the rack: 60 aborts, 2 give-backs, re-won within 2 s): after recover_after_fails aborts in a
         # row the robot backs recover_backup_m straight out (Nav2 BackUp: its costmap check includes the rear ultrasonics),
         # clears the local costmap and plans the leg again; recover_max such recoveries per leg target, then STUCK.
+        # test hook: the node the robot counts as having come from at start-up ('' = the nearest one). The chain-64 reproducer
+        # spawns on the stuck pose, whose nearest node is the pick node itself, so it would 'arrive' without driving
+        self.initial_node = dp('initial_node', '').value
         self.recover_after = dp('recover_after_fails', 4).value
         self.recover_backup = dp('recover_backup_m', 0.5).value       # 0 = off
         self.recover_max = dp('recover_max', 2).value
@@ -579,7 +582,7 @@ class SwarmAgent(Node):
         if not self.update_pose():
             return
         if self.last_node is None:
-            self.last_node = self.graph.nearest(*self.pose[:2])
+            self.last_node = self.graph.id(self.initial_node) if self.initial_node else self.graph.nearest(*self.pose[:2])
             self.reserved = [self.last_node]
             self.idle_since = self.now()
         if not self.check_peers():

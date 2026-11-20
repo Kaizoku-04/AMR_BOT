@@ -205,3 +205,14 @@ def test_giving_the_task_back_during_a_recovery_cancels_it(agent):
     assert a.phase == 'recovering'
     a.give_back('no progress for 120 s', stuck=True)
     assert a.phase == 'idle' and a.recoveries == {} and a.recov_handle is None
+
+
+def test_initial_node_is_where_the_agent_says_it_came_from(agent):
+    """The reproducer's start: on the stuck pose the nearest node is the pick node, the node it was sent to."""
+    a = agent
+    assert a.graph.nearest(3.44, -0.2) == 3 and a.initial_node == ''
+    a.initial_node, a.last_node, a.pose = 'n2', None, (3.9, -0.2, 1.9)
+    a.check_peers = lambda: False
+    a.update_pose = lambda: True
+    a.tick()
+    assert a.last_node == 2
