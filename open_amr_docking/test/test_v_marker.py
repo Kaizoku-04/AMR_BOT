@@ -46,3 +46,19 @@ def test_a_flat_wall_is_not_a_marker():
     pts = np.array([[1.0, y] for y in np.arange(-0.4, 0.4, 0.008)])
     pose, why = detect(pts, (1.0, 0.0, 0.0), W, D)
     assert pose is None
+
+
+def test_fit_line_does_not_form_the_n_by_n_u_matrix(monkeypatch):
+    """_fit_line only needs Vt: np.linalg.svd(full_matrices=True) on 450 x 2 points is a threaded O(N^2) job that made
+    the detector burn 8 cores while docked (bayprobe1, 2026-11-20). Same line either way."""
+    from open_amr_docking import v_marker
+    rng = np.random.default_rng(5)
+    t = rng.uniform(-0.2, 0.2, 450)
+    pts = np.column_stack([t * math.cos(0.7), t * math.sin(0.7)]) + rng.normal(0, 0.002, (450, 2)) + [1.0, 2.0]
+    seen = []
+    real = np.linalg.svd
+    monkeypatch.setattr(np.linalg, 'svd', lambda a, *x, **k: (seen.append(k.get('full_matrices', True)), real(a, *x, **k))[1])
+    c, u = v_marker._fit_line(pts)
+    assert seen == [False]
+    assert abs(abs(u[0] * math.cos(0.7) + u[1] * math.sin(0.7)) - 1) < 1e-4
+    assert np.allclose(c, pts.mean(axis=0))
