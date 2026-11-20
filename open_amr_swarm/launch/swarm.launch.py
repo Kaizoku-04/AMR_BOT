@@ -25,6 +25,31 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
+def agent_params(text):
+    """'name:=value,name2:=value2' (launch arg agent_params) -> {name: value}: true/false -> bool, then int, float, str.
+    For A/B shifts of a behaviour parameter without a rebuild (isaac_fleet_test.sh --agent-param)."""
+    out = {}
+    for item in (t.strip() for t in text.split(',')):
+        if not item:
+            continue
+        k, sep, v = item.partition(':=')
+        if not sep or not k.strip():
+            raise ValueError(f"agent_params: '{item}' is not name:=value")
+        v = v.strip()
+        if v.lower() in ('true', 'false'):
+            out[k.strip()] = v.lower() == 'true'
+            continue
+        for cast in (int, float):
+            try:
+                out[k.strip()] = cast(v)
+                break
+            except ValueError:
+                pass
+        else:
+            out[k.strip()] = v
+    return out
+
+
 def spawn(context):
     lc = lambda k: LaunchConfiguration(k).perform(context)
     root = os.environ.get('OPENAMR_ROOT', os.path.expanduser('~/Robotics/OpenAMR'))
@@ -41,7 +66,8 @@ def spawn(context):
                     parameters=[{'robot_id': f'amr_{i}', 'graph': graph, 'drain_prior_per_h': 0.15 * scale,
                                  'dock_bays': lc('dock_bays') == 'true', 'deck_sensor': lc('deck_sensor') == 'true',
                                  'chargers': chargers, 'fleet': [f'amr_{k}' for k in range(n)],
-                                 'backout_speed_mps': float(lc('backout_speed')), 'use_sim_time': True}],
+                                 'backout_speed_mps': float(lc('backout_speed')), 'use_sim_time': True,
+                                 **agent_params(lc('agent_params'))}],
                     remappings=tf)
                for i in range(n)]
     if lc('battery') == 'true':
@@ -85,6 +111,8 @@ def spawn(context):
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('robots', default_value='6'),
+        DeclareLaunchArgument('agent_params', default_value='',
+                              description="extra swarm_agent parameters for every robot, 'name:=value,name2:=value2'"),
         DeclareLaunchArgument('mode', default_value='mission', description='mission | goto_random | none'),
         DeclareLaunchArgument('duration_s', default_value='0', description='sim seconds, 0 = run forever'),
         DeclareLaunchArgument('open_tasks', default_value='', description='default robots + 2: nobody idles for lack of work'),
