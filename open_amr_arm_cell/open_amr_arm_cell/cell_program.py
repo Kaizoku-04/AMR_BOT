@@ -32,7 +32,8 @@ class Step:
     q: list = None            # PTP goal (joint configuration)
     pose: tuple = None        # LIN goal (x, y, z, yaw_deg), cell frame
     place: bool = False       # LIN at the slow placing speed (the last centimetres onto a slot or the deck)
-    locate: tuple = None      # GRIP target located before the step that goes down to it: ('pallet', i, k) | ('deck',)
+    locate: tuple = None      # located before the step that goes down: ('pallet', i, k) | ('deck',) (the carton to grip),
+                              # ('deck_frame',) (depalletize: where the deck is, to place on it)
     where: str = ''           # GRIP / RELEASE: where the carton is taken from / put down
 
 
@@ -66,9 +67,11 @@ def shifted(pose, offset):
     return (x + offset[0], y + offset[1], z, yaw + offset[2])
 
 
-def depalletize(cell, pallet, slot, t, offset=None):
+def depalletize(cell, pallet, slot, t, offset=None, deck_offset=None):
     """Steps of one depalletizing cycle. t = taught entry (slot_above, deck_hold, grip_yaw, deck_yaw, via);
-    offset = where the located carton really is relative to its slot (dx, dy, dyaw), None = nominal."""
+    offset = where the located carton really is relative to its slot (dx, dy, dyaw), None = nominal;
+    deck_offset = where the docked robot's deck really is relative to the nominal deck pose (dx, dy, dyaw), None =
+    nominal: the carton is placed there (ADR-048)."""
     (sx, sy, sz), _ = cell.slot_cell(pallet, slot)
     (dx, dy, dz), _ = cell.deck_cell()
     _, _, z_slot, _ = heights(cell, pallet, slot, t['via'], t.get('hold_high', False))
@@ -80,10 +83,10 @@ def depalletize(cell, pallet, slot, t, offset=None):
         Step(LIN, 'lift', pose=shifted((sx, sy, z_slot, gy), offset)),
         Step(PTP, 'to deck hold', q=t['deck_hold']),
         Step(DOCK, 'dock'),
-        Step(LIN, 'down to deck', pose=(dx, dy, dz + a, dyaw)),
-        Step(LIN, 'place on deck', pose=(dx, dy, dz + CONTACT, dyaw), place=True),
+        Step(LIN, 'down to deck', pose=shifted((dx, dy, dz + a, dyaw), deck_offset), locate=('deck_frame',)),
+        Step(LIN, 'place on deck', pose=shifted((dx, dy, dz + CONTACT, dyaw), deck_offset), place=True),
         Step(RELEASE, 'release', where='deck'),
-        Step(LIN, 'clear deck', pose=(dx, dy, cell.deck_clear_height(), dyaw)),
+        Step(LIN, 'clear deck', pose=shifted((dx, dy, cell.deck_clear_height(), dyaw), deck_offset)),
         Step(UNDOCK, 'undock'),
         Step(PTP, 'home', q=HOME),
     ]
@@ -111,5 +114,8 @@ def palletize(cell, pallet, slot, t, offset=None):
     ]
 
 
-def program(cell, depal, pallet, slot, t, offset=None):
-    return (depalletize if depal else palletize)(cell, pallet, slot, t, offset)
+def program(cell, depal, pallet, slot, t, offset=None, deck_offset=None):
+    """deck_offset only applies to a depalletizing cycle (a palletizing one locates the carton on the deck instead)."""
+    if depal:
+        return depalletize(cell, pallet, slot, t, offset, deck_offset)
+    return palletize(cell, pallet, slot, t, offset)

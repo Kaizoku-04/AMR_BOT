@@ -1,4 +1,6 @@
 """Unit tests for the carton locator's matching (open_amr_arm_cell/carton_locator.py)."""
+import math
+
 import pytest
 
 from open_amr_arm_cell.carton_locator import LocateFault, match
@@ -98,3 +100,95 @@ def _try(loc):
         return loc.locate(('pallet', 0, 0), (1.0, 2.0, 0.5, 0.0))
     except LocateFault as e:
         return e
+
+
+# ---- the deck frame (ADR-048): where the docked robot's deck is, for DEPALLETIZE to place on
+
+def _deck(x, y, yaw_deg=0.0):
+    from geometry_msgs.msg import Pose, PoseArray
+    m = PoseArray()
+    p = Pose()
+    p.position.x, p.position.y = x, y
+    p.orientation.z, p.orientation.w = math.sin(math.radians(yaw_deg) / 2), math.cos(math.radians(yaw_deg) / 2)
+    m.poses.append(p)
+    return m
+
+
+def _deck_locator(limits=None):
+    from open_amr_arm_cell.carton_locator import DetectionLocator
+    cell = type('C', (), {'arm_pose': (0.0, 0.0, 0.0)})()
+    node = _Node()
+    lim = limits or {'pallet': (0.03, 5.0), 'deck_frame': (0.03, 5.0)}
+    return node, DetectionLocator(node, '/arm/cartons/detected', cell, lim, '/arm/deck/detected')
+
+
+def test_match_deck_gives_the_offset_and_takes_yaw_modulo_180():
+    from open_amr_arm_cell.carton_locator import match_deck
+    assert match_deck([(1.21, 0.0, 180.0)], (1.2, 0.0, 180.0), 0.03, 5.0) == pytest.approx((0.01, 0.0, 0.0))
+    dx, dy, dyaw = match_deck([(1.2, -0.011, 181.4)], (1.2, 0.0, 180.0), 0.03, 5.0)
+    assert (dx, dy, dyaw) == pytest.approx((0.0, -0.011, 1.4))
+    assert match_deck([(1.2, 0.0, 1.4)], (1.2, 0.0, 180.0), 0.03, 5.0)[2] == pytest.approx(1.4)   # robot's other end
+
+
+def test_match_deck_beyond_the_limits_or_missing_faults():
+    from open_amr_arm_cell.carton_locator import match_deck
+    with pytest.raises(LocateFault, match='deck out of place by 40 mm'):
+        match_deck([(1.24, 0.0, 180.0)], (1.2, 0.0, 180.0), 0.03, 5.0)
+    with pytest.raises(LocateFault, match='deck out of place'):
+        match_deck([(1.2, 0.0, 187.0)], (1.2, 0.0, 180.0), 0.03, 5.0)
+    with pytest.raises(LocateFault, match='no deck found'):
+        match_deck([(2.5, 0.0, 180.0)], (1.2, 0.0, 180.0), 0.03, 5.0)
+
+
+def test_locator_deck_frame_target_reads_the_deck_topic():
+    import threading
+    import time
+    node, loc = _deck_locator()
+    out = {}
+
+    def run():
+        try:
+            out['r'] = loc.locate(('deck_frame',), (1.2, 0.0, 180.0))
+        except LocateFault as e:
+            out['r'] = e
+    th = threading.Thread(target=run)
+    th.start()
+    time.sleep(0.1)
+    node.clock.t += 0.01
+    loc.on_decks(_deck(1.21, 0.005, 181.0))
+    th.join(timeout=5.0)
+    assert out['r'] == pytest.approx((0.01, 0.005, 1.0), abs=1e-6), out
+
+
+def test_locator_deck_frame_beyond_limit_and_no_detection_fault():
+    import threading
+    import time
+    node, loc = _deck_locator()
+    out = {}
+
+    def run():
+        try:
+            out['r'] = loc.locate(('deck_frame',), (1.2, 0.0, 180.0))
+        except LocateFault as e:
+            out['r'] = e
+    th = threading.Thread(target=run)
+    th.start()
+    time.sleep(0.1)
+    node.clock.t += 0.01
+    loc.on_decks(_deck(1.24, 0.0, 180.0))                 # 40 mm: beyond the 30 mm limit
+    th.join(timeout=5.0)
+    assert isinstance(out['r'], LocateFault) and 'deck out of place' in str(out['r'])
+    out.clear()
+    th = threading.Thread(target=run)                     # a carton detection is no deck detection
+    th.start()
+    for _ in range(6):
+        time.sleep(0.05)
+        loc.on_detections(_detections((1.2, 0.0, 0.5)))
+        node.clock.t += 0.25
+    th.join(timeout=5.0)
+    assert isinstance(out['r'], LocateFault) and 'no deck detections' in str(out['r'])
+
+
+def test_nominal_locator_has_no_deck_offset():
+    from open_amr_arm_cell.carton_locator import NominalLocator
+    assert NominalLocator().locate(('deck_frame',), (1.2, 0.0, 180.0)) == (0.0, 0.0, 0.0)

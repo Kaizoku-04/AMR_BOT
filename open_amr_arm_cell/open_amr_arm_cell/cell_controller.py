@@ -113,8 +113,11 @@ class CellController(Node):
         self.io = VacuumIO(self, self.arm_id, echo=dp('part_present_echo', False).value)
         topic = dp('detections_topic', '').value
         lim = {'pallet': (dp('locate_pallet_mm', 30.0).value / 1000, dp('locate_pallet_deg', 5.0).value),
-               'deck': (dp('locate_deck_mm', 100.0).value / 1000, dp('locate_deck_deg', 10.0).value)}
-        locator = DetectionLocator(self, topic, self.cell, lim) if topic else None
+               'deck': (dp('locate_deck_mm', 100.0).value / 1000, dp('locate_deck_deg', 10.0).value),
+               # where the docked robot's deck is vs the nominal bay pose (depalletize places there, ADR-048)
+               'deck_frame': (dp('locate_deck_frame_mm', 30.0).value / 1000, dp('locate_deck_frame_deg', 5.0).value)}
+        deck_topic = dp('deck_topic', f'/{self.arm_id}/deck/detected').value if topic else ''
+        locator = DetectionLocator(self, topic, self.cell, lim, deck_topic) if topic else None
         self.motion = CellMotion(self.moveit, self.io, self.local, load_pattern(dp('pattern', '').value or None),
                                  locator=locator, logger=lambda s: self.get_logger().info(f'{self.arm_id}: {s}'),
                                  gripper_mass=dp('gripper_mass', 2.0).value, carton_mass=dp('carton_mass', 8.0).value)

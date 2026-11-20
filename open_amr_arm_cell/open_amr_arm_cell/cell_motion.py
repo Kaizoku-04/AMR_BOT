@@ -143,6 +143,9 @@ class CellMotion:
         self.deck_seen = None                    # located offset (dx, dy, dyaw) of the carton on the docked robot's
                                                  # deck: the scene draws it, the deck and its rails there (cleared when
                                                  # the robot leaves)
+        self.deck_frame = None                   # located offset of the deck itself (depalletize, ADR-048): the scene
+                                                 # draws the robot and its rails there (cleared when it leaves)
+        self.pick_offset = None                  # the located pick offset (dx, dy, dyaw) of the loaded depalletize cycle
         self.cycle = None                        # (depal, pallet, slot, taught entry) of the program being run
         self.steps, self.pc = [], 0              # its steps and the next one to run
         self.before_release = None               # diagnostics hook: called with the place name just before vacuum off
@@ -161,7 +164,7 @@ class CellMotion:
         self.stock = list(stock) if stock is not None else self.stock
         self.docked = self.docked if docked is None else docked
         if fresh or not self.docked:
-            self.deck_seen = None
+            self.deck_seen = self.deck_frame = None
         self.deck_box = self.deck_box if deck_box is None else deck_box
         objs = [box_object('floor', (6.0, 6.0, 0.02), (0.0, 0.0, -0.011))]
         for i in (0, 1):
@@ -173,7 +176,8 @@ class CellMotion:
                 cx, cy, cz, cyaw = self.seen.get((i, k), (x, y, z - self.p.box[2] / 2, byaw))
                 objs.append(box_object(f'box_{i}_{k}', self.p.box, (cx, cy, cz), cyaw)
                             if k < self.stock[i] else box_object(f'box_{i}_{k}', (), (), op=CollisionObject.REMOVE))
-        self._apply(objs + zone_objects(self.cell, self.docked, self.deck_box, self.deck_seen))
+        self._apply(objs + zone_objects(self.cell, self.docked, self.deck_box, self.deck_seen,
+                                      self.deck_frame))
 
     def clear_bay(self):
         """Neither robot nor keep-out volume (fault recovery, after a person has checked the bay)."""
@@ -323,6 +327,7 @@ class CellMotion:
         """Load one cycle's program (the next run() starts it)."""
         self.cycle = (depal, pallet, slot, self.taught(depal, pallet, slot))
         self.steps, self.pc = prog.program(self.cell, depal, pallet, slot, self.cycle[3]), 0
+        self.pick_offset = None                  # the located pick offset of this cycle (kept when the deck is located)
         self.carton = C_PALLET if depal else C_DECK
 
     @property
@@ -336,6 +341,8 @@ class CellMotion:
     def _locate(self, step):
         """Correct the program by where the carton really is (the steps from here on are rebuilt with the offset)."""
         depal, pallet, slot, t = self.cycle
+        if step.locate[0] == 'deck_frame':
+            return self._locate_deck(step)
         if step.locate[0] == 'pallet':
             (x, y, z), yaw = self.cell.slot_cell(pallet, slot)
             where = f'pallet {pallet} slot {slot}'
@@ -354,7 +361,22 @@ class CellMotion:
         if any(abs(v) > 1e-4 for v in off):
             self.log(f'carton at {where} located {off[0] * 1000:+.0f} / {off[1] * 1000:+.0f} mm, {off[2]:+.1f} deg '
                      'off the pattern: grip corrected')
+        self.pick_offset = off if depal else None
         self.steps = prog.program(self.cell, depal, pallet, slot, t, offset=off)
+
+    def _locate_deck(self, step):
+        """Place where the cell's own camera sees the deck, not at the nominal bay pose (ADR-048): the program is rebuilt
+        with the deck's offset, keeping the pick offset already applied, and resumes at the same step."""
+        depal, pallet, slot, t = self.cycle
+        (x, y, _), yaw = self.cell.deck_cell()
+        try:
+            off = self.locator.locate(step.locate, (x, y, yaw))
+        except LocateFault as e:
+            raise CellFault(f'{e} at the deck')
+        self.deck_frame = off
+        self.set_scene()
+        self.log(f'deck located {off[0] * 1000:+.0f} / {off[1] * 1000:+.0f} mm, {off[2]:+.1f} deg: place corrected')
+        self.steps = prog.program(self.cell, depal, pallet, slot, t, offset=self.pick_offset, deck_offset=off)
 
     def _scene_from_detections(self, pallet):
         """Plan against what the camera sees: the cartons on `pallet` go into the scene at their detected poses (a
