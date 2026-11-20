@@ -200,6 +200,9 @@ class SwarmAgent(Node):
         self.reloc_tol = dp('relocalize_tol_m', 0.10).value
         self.reloc_max = dp('relocalize_max_m', 1.0).value
         self.reloc_every = dp('relocalize_every_s', 2.0).value
+        # AMCL's heading too (review 2026-11-05 finding 3): the cell's interlock checks it (bay_tol_deg 10); c45_truth
+        # had a 37.9 deg AMCL outlier. Reset when AMCL is more than this off the marker-measured heading
+        self.reloc_tol_yaw = math.radians(dp('relocalize_tol_deg', 3.0).value)
         self.reloc_at, self.reloc_tries = -1e9, 0
         self.pub_initialpose = self.create_publisher(PoseWithCovarianceStamped, 'initialpose', 10)
         self.dock_state, self.dock_fails, self.docked, self.docking = None, 0, False, False
@@ -271,7 +274,8 @@ class SwarmAgent(Node):
         # the dock and back-out goals: the same lost-ack resend and lost-result re-poll as FollowPath
         self.dock_req, self.backout_req, self.dock_handle, self.backout_handle = Pending(), Pending(), None, None
         self.exitbk_req, self.exitbk_handle = Pending(), None      # the BackUp out of a bay before leaving it
-        self.exitbk_from = None          # my pose when that BackUp was first sent (cleared on the next arrival)
+        self.check_unknown_since, self.check_unknown_s = None, 2.0  # dock check without an accuracy figure since
+        self.exitbk_from = None          # (map, odom) pose when that BackUp was first sent (cleared on the next arrival)
         self.act_still_since, self.act_polled_at = None, 0.0
         # lanes closed in my route server: what I want (ghosts' lanes + a deadlock re-route's lane) vs what it confirmed;
         # sync_edges() sends the difference, again after ack_timeout if no answer came (a lost request used to leave a
@@ -574,6 +578,9 @@ class SwarmAgent(Node):
             self.dwell()
         elif self.phase == 'retry' and self.now() >= self.retry_at:
             self.next_leg(first=True)
+        elif self.phase == 'bay_leave':                  # backing out of a bay after its task was dropped
+            if self.dock_state == 'backout_wait' and self.now() >= self.dock_retry_at and not self.paused():
+                self.back_out(self.graph.name[self.route[-1]], self.backout_why)
         elif self.phase == 'idle':
             self.reserved = [self.last_node]
             if self.has_quorum and not self.paused():
@@ -887,10 +894,46 @@ class SwarmAgent(Node):
         self.start_legs(legs, task=t)
 
     def abort_task(self):
+        """Drop the task (CANCEL, an outranking peer, a release on my behalf, give_back) and go idle. Any task can be
+        dropped during its pickup dock (the deck is still empty there), so every bay goal is cancelled too; standing
+        in the bay, the robot first backs out to the staging pose (review 2026-11-05 finding 1: the DockRobot goal kept
+        driving while the idle agent could send a FollowPath, or the dock finished for a task that no longer existed
+        and the robot stood nose-in at the pedestal, where a forward-only path can't leave)."""
+        gave_up = self.dock_state == 'gave_up'
+        bay_goal = self.cancel_bay_goals()
         self.task, self.legs, self.loaded, self.stuck_since = None, [], False, None
         self.noroute_since, self.noroute_parked = None, False
         self.stop_following()
         self.phase = 'idle'; self.status = RobotState.IDLE; self.idle_since = self.now()
+        if bay_goal and self.in_bay():
+            self.phase = 'bay_leave'                     # no new work until out (available() needs idle / driving)
+            name = self.graph.name[self.route[-1]]
+            if gave_up:                                  # it couldn't dock or back out: an operator acknowledges first
+                self.status, self.dock_state = RobotState.STUCK, 'gave_up'
+                self.get_logger().warn(f'{self.rid}: task dropped in {name} after giving up docking: staying until '
+                                       f'an operator acknowledges')
+            elif self.paused():                          # an operator PAUSE: nothing drives until RESUME (ADR-047;
+                # an empty robot paused 120 s gives its task back and backed out of the bay mid-pause, c61_ops)
+                self.dock_state, self.dock_retry_at, self.backout_why = 'backout_wait', self.now(), 'task dropped'
+                self.get_logger().warn(f'{self.rid}: task dropped while in {name}, paused: backing out after the RESUME')
+            else:
+                self.get_logger().warn(f'{self.rid}: task dropped while in {name}: backing out to its staging pose')
+                self.back_out(name, 'task dropped')
+
+    def cancel_bay_goals(self):
+        """Cancel every DockRobot / back-out / bay-exit goal, running or still waiting for its acceptance (a late
+        acceptance is cancelled on arrival: its token is stale). True if any docking state was active."""
+        reqs = (self.dock_req, self.backout_req, self.exitbk_req)
+        handles = [h for h in (self.dock_handle, self.backout_handle, self.exitbk_handle) if h is not None]
+        active = bool(handles) or any(r.sent_at is not None for r in reqs) or self.dock_state is not None or \
+            self.phase == 'bay_exit'
+        for h in handles:
+            h.cancel_goal_async()
+        for r in reqs:
+            r.clear()
+        self.dock_handle = self.backout_handle = self.exitbk_handle = None
+        self.dock_state, self.docked, self.backout_t0 = None, False, None
+        return active
 
     # ------------------------------------------------------------------ legs
     def start_legs(self, legs, task):
@@ -1283,8 +1326,9 @@ class SwarmAgent(Node):
             # creeps a few mm (~5 mm/s, ~1 s) — the cell's dock sensor and its interlock then disagreed under a
             # descending arm (fleet run 2026-10-02). final_reached() finishes it (settled() then check_dock()).
             self.dock_state, self.settle_since, self.dock_name, self.dock_retries = 'settling', None, name, res.num_retries
+            self.check_unknown_since = None
         else:
-            self.dock_failed(name, f'error {res.error_code} {res.error_msg}'.strip(), res.error_code)
+            self.dock_failed(name, f'error {res.error_code} {res.error_msg}'.strip(), res.error_code, res.error_msg)
 
     def settled(self):
         """Docking: the robot has stood still (no mm of motion per 0.2 s tick) for 0.5 s."""
@@ -1298,6 +1342,23 @@ class SwarmAgent(Node):
     def check_dock(self, name):
         """Settled: accurate enough -> docked; else back out to staging and dock again."""
         err, srv, sd = self.dock_error(), self.server_dock_error(), self.standstill_dock()
+        if err is None:
+            # no accuracy figure (a TF lookup failed, e.g. the buffer not yet filled after a restart): judge it on the
+            # next ticks, then from the server pose; never accept a dock nobody could judge (review 2026-11-05 finding 5)
+            self.check_unknown_since = self.check_unknown_since or self.now()
+            if self.now() - self.check_unknown_since < self.check_unknown_s:
+                return                                   # the standstill figure first: the server pose was 16 mm off
+            if srv is None:
+                self.check_unknown_since = None
+                self.get_logger().warn(f'{self.rid}: docked at {name} but no accuracy figure for '
+                                       f'{self.check_unknown_s:.0f} s: backing out to dock again')
+                self.dock_fails += 1
+                if self.dock_fails >= 3:
+                    return self.give_up_dock(name)
+                self.back_out(name, 'dock accuracy unknown')
+                return
+            err = srv
+        self.check_unknown_since = None
         if err is not None and srv is not None:
             self.get_logger().info(f'{self.rid}: dock check at {name}: standstill mean of {sd[4] if sd else 0} detections '
                                    f'{1000 * math.hypot(err[0], err[1]):.1f} mm {"" if sd else "(too few: server pose) "}'
@@ -1377,17 +1438,25 @@ class SwarmAgent(Node):
         c, s = math.cos(dyaw), math.sin(dyaw)
         return c * dx + s * dy, -s * dx + c * dy, math.remainder(ryaw - dyaw, math.tau)
 
+    def bay_yaw(self, nid):
+        """A bay's docked heading: along its one entry lane (the robot drives straight in, nose to the pedestal; the
+        lane graph's surveyed yaws agree: receiving_bay 180, outbound_bay 0). None if the bay has no single entry."""
+        preds = [a for a, succ in self.graph.succ.items() if nid in succ]
+        return self.graph.heading(preds[0], nid) if len(preds) == 1 else None
+
     def bay_pose_from_dock(self):
-        """Docked at a bay: (x, y, yaw) in map from the bay's lane-graph pose and the marker-measured dock error (the
-        error is in the dock's frame; its heading is taken from the current yaw, enough for an error of millimetres)."""
+        """Docked at a bay: (x, y, yaw) in map from the bay's lane-graph pose and the marker-measured dock error (in
+        the dock's frame). The heading is the bay's plus the marker-measured yaw error, never AMCL's own (review
+        2026-11-05 finding 3); without a bay heading, AMCL's yaw as before."""
         nid = self.graph.by_name.get(self.dock_name)
         err = self.dock_error()
         if nid is None or self.graph.kind.get(nid) != 'bay' or err is None or self.pose is None:
             return None
-        (bx, by), yaw = self.graph.pos[nid][:2], self.pose[2]
-        dyaw = yaw - err[2]
-        c, s = math.cos(dyaw), math.sin(dyaw)
-        return bx + c * err[0] - s * err[1], by + s * err[0] + c * err[1], yaw
+        (bx, by), byaw = self.graph.pos[nid][:2], self.bay_yaw(nid)
+        if byaw is None:
+            byaw = self.pose[2] - err[2]
+        c, s = math.cos(byaw), math.sin(byaw)
+        return bx + c * err[0] - s * err[1], by + s * err[0] + c * err[1], math.remainder(byaw + err[2], math.tau)
 
     def localize_at_bay(self, name):
         """Accurately docked, before reporting it: AMCL within reloc_tol of the bay's pose and the robot still -> docked.
@@ -1395,16 +1464,19 @@ class SwarmAgent(Node):
         interlock then shows what is wrong). Not at a bay (a charger), or a suspect dock: docked at once."""
         p = self.bay_pose_from_dock()
         off = None if p is None else math.hypot(p[0] - self.pose[0], p[1] - self.pose[1])
+        yaw_off = 0.0 if p is None else abs(math.remainder(p[2] - self.pose[2], math.tau))
         if off is not None and off > self.reloc_max:
             self.get_logger().error(f'{self.rid}: docked at {name} but AMCL is {off:.2f} m from the bay: not '
                                     f're-localizing (check the dock and the map)')
             off = None
-        if off is None or (off <= self.reloc_tol and self.speed_est == 0.0):
+        close = off is not None and off <= self.reloc_tol and yaw_off <= self.reloc_tol_yaw
+        if off is None or (close and self.speed_est == 0.0):
             return self.mark_docked(name)
-        if off <= self.reloc_tol or self.now() - self.reloc_at < self.reloc_every:
+        if close or self.now() - self.reloc_at < self.reloc_every:
             return                                       # reset applied, the speed estimate settling; or reset in flight
         if self.reloc_tries >= 3:
-            self.get_logger().warn(f'{self.rid}: AMCL still {off:.2f} m off {name} after 3 resets: reporting docked')
+            self.get_logger().warn(f'{self.rid}: AMCL still {off:.2f} m / {math.degrees(yaw_off):.1f} deg off {name} '
+                                   f'after 3 resets: reporting docked')
             return self.mark_docked(name)
         self.reloc_tries, self.reloc_at = self.reloc_tries + 1, self.now()
         m = PoseWithCovarianceStamped()
@@ -1414,8 +1486,8 @@ class SwarmAgent(Node):
         m.pose.covariance[0] = m.pose.covariance[7] = 0.02 ** 2
         m.pose.covariance[35] = math.radians(2.0) ** 2
         self.pub_initialpose.publish(m)
-        self.get_logger().info(f'{self.rid}: re-localizing at {name} before reporting docked: AMCL {off:.2f} m off the '
-                               f'bay (marker-measured pose)')
+        self.get_logger().info(f'{self.rid}: re-localizing at {name} before reporting docked: AMCL {off:.2f} m / '
+                               f'{math.degrees(yaw_off):.1f} deg off the bay (marker-measured pose)')
 
     def back_out(self, name, why):
         """Reverse out of the bay to its staging pose (the docking server's undock, ≤ 0.15 m/s inside the bay's marked
@@ -1464,6 +1536,11 @@ class SwarmAgent(Node):
 
     def backed_out(self, name):
         self.backout_t0 = None
+        if self.phase == 'bay_leave':                    # out of a bay whose task was dropped: idle at the staging pose
+            self.get_logger().info(f'{self.rid}: backed out of {name} ({self.backout_why}): idle')
+            self.dock_state, self.status, self.idle_since = None, RobotState.IDLE, self.now()
+            self.phase = 'idle'
+            return
         self.get_logger().info(f'{self.rid}: backed out of {name} ({self.backout_why}): docking again')
         self.dock_state, self.dock_retry_at = 'retry', self.now() + 1.0
 
@@ -1486,13 +1563,21 @@ class SwarmAgent(Node):
         b = self.graph.pos[self.route[-1]] if self.route else None
         return b is not None and self.pose is not None and math.hypot(self.pose[0] - b[0], self.pose[1] - b[1]) < 0.5
 
-    def dock_failed(self, name, why, code=None):
+    def dock_failed(self, name, why, code=None, msg=''):
         """The docking server gave up (after its own retries). Its recovery can leave the robot anywhere near the bay
         (fleet run 2026-10-03: 1.8 m off, facing away, the marker out of view) and docking from there fails at once —
         it was retried 79 times. So: drive back to the staging node along the lanes (or, from inside the bay, back out
         to it) and dock again from there; after 3 attempts stop and report STUCK until an operator acknowledges
-        (OperatorCommand.ACK_FAULT) — as an AMR pauses its mission and calls for a person."""
-        if code == DockRobot.Result.FAILED_TO_CONTROL and self.control_fails < self.control_fail_budget:
+        (OperatorCommand.ACK_FAULT) — as an AMR pauses its mission and calls for a person.
+        A 905 (FAILED_TO_CONTROL) uses the control budget, not an attempt, only when it is a late transform: every 905
+        seen (63 in c51-c58) came with the server's 'Could not get transform'. A 905 whose error_msg names something
+        else (an obstacle, a stuck caster) counts as an attempt (review 2026-11-05 finding 4). Nav2 Jazzy 1.3.13 sends
+        an empty error_msg, which is read as a late transform, the only cause seen."""
+        late_tf = code == DockRobot.Result.FAILED_TO_CONTROL and (not msg or 'transform' in msg.lower())
+        if code == DockRobot.Result.FAILED_TO_CONTROL and not late_tf:
+            self.get_logger().warn(f'{self.rid}: docking at {name}: control failure not caused by a late transform '
+                                   f'({msg}): counted as an attempt')
+        if late_tf and self.control_fails < self.control_fail_budget:
             self.control_fails += 1
             self.get_logger().warn(f'{self.rid}: docking at {name} failed ({why}): control failure '
                                    f'{self.control_fails}/{self.control_fail_budget}, not counted as an attempt')
@@ -1597,7 +1682,7 @@ class SwarmAgent(Node):
         if self.bay_exit_backup <= 0.0 or self.graph.kind.get(n) != 'bay' or self.pose is None:
             return self.next_leg()
         if not retry or self.exitbk_from is None:
-            self.exitbk_from = self.pose
+            self.exitbk_from = (self.pose, self.odom_pose())
         left = self.bay_exit_backup - self.moved_since(self.exitbk_from)
         if left < 0.03:
             return self.next_leg()
@@ -1644,7 +1729,21 @@ class SwarmAgent(Node):
         self.next_leg()
 
     def moved_since(self, p):
-        return math.hypot(self.pose[0] - p[0], self.pose[1] - p[1])
+        """Distance driven since p = (map pose, odom pose): in the odom frame, which is continuous, when both ends are
+        known (AMCL resumes updating once the robot moves and can jump by centimetres: review 2026-11-05 finding 6),
+        else in AMCL's map pose."""
+        start_map, start_odom = p
+        now_odom = self.odom_pose() if start_odom is not None else None
+        a, b = (start_odom, now_odom) if now_odom is not None else (start_map, self.pose)
+        return math.hypot(b[0] - a[0], b[1] - a[1])
+
+    def odom_pose(self):
+        """(x, y) of base_footprint in odom, None if the transform is unavailable."""
+        try:
+            t = self.tf.lookup_transform('odom', 'base_footprint', Time())
+        except Exception:
+            return None
+        return t.transform.translation.x, t.transform.translation.y
 
     def backed_off_bay(self, n):
         """Last at bay node n and leave_bay backed out more than 0.05 m: a route from n starts at its one exit instead,

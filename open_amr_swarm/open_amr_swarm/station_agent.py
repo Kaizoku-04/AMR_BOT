@@ -27,8 +27,8 @@ from open_amr_msgs.msg import ArmCellState, RobotState, StationState, Transfer
 from .agent import EVENT_QOS, STATE_QOS
 from .lane_graph import LaneGraph
 from .liveness import Pending
-from .station import C_NONE, DEPALLETIZE, FAULT, JOB_NAMES, PREPARE, STARVED, STATE_NAMES, CellStation, Station, \
-    StationParams
+from .station import C_DECK, C_NONE, C_PALLET, C_TOOL, DEPALLETIZE, FAULT, JOB_NAMES, PALLETIZE, PREPARE, STARVED, \
+    STATE_NAMES, CellStation, Station, StationParams
 
 
 class StationAgent(Node):
@@ -57,6 +57,9 @@ class StationAgent(Node):
             self.ack_timeout = dp('ack_timeout_s', 3.0).value
             self.result_poll = dp('result_poll_s', 30.0).value
             self.req, self.sent_job, self.polled_at = Pending(), None, 0.0
+            # a resent goal the busy cell rejected: the first one may be running with its acceptance lost (the cell
+            # takes one goal at a time). Settled from the cell's heartbeat, never booked as failed on the rejection
+            self.orphan, self.orphan_t, self.cycles_at_send = None, 0.0, None
             self.create_subscription(ArmCellState, f'/{self.sid}/cell/state', self.on_cell, 10)
         self.fault_at, self.fault_for = dp('fault_at_s', 0.0).value, dp('fault_for_s', 0.0).value
         self.peer_timeout = dp('peer_timeout_s', 3.0).value
@@ -87,8 +90,10 @@ class StationAgent(Node):
             c.state, f'cell fault: {c.fault}')
 
     # ---------------------------------------------------------------- cell jobs (ArmTransfer)
-    def send(self, job):
+    def send(self, job, retry=False):
         self.phase, self.left_since = '', None
+        if not retry:                        # the cell's completed-transfer count before this job ran
+            self.cycles_at_send = self.cell_state.cycles if self.cell_state is not None else None
         g = ArmTransfer.Goal(kind=job.kind, pallet=job.pallet, slot=job.slot, stock=[int(n) for n in self.st.pallets],
                              robot_id=job.robot, task_id=job.task)
         if job.kind == PREPARE:              # the station already took the carton off its count: the scene must hold it
@@ -96,7 +101,7 @@ class StationAgent(Node):
         elif job.kind == DEPALLETIZE and not job.held:
             g.stock[job.pallet] += 1
         self.goal, self.sending, self.sent_job = None, True, job
-        tok = self.req.send(wallclock.monotonic())
+        tok = self.req.send(wallclock.monotonic(), retry)
         if not self.client.server_is_ready():
             return                           # not discovered yet: guard_lost() sends it again after ack_timeout
         fut = self.client.send_goal_async(g, feedback_callback=self.on_feedback)
@@ -109,6 +114,14 @@ class StationAgent(Node):
                 gh.cancel_goal_async()       # abandoned (resent after a lost acceptance): the arm must not run it
             return
         self.sending = False
+        if not gh.accepted and self.req.tries > 1:
+            # a resend rejected: the first goal may run on the cell with only its acceptance lost (the cell rejects a
+            # goal while another runs). Booking it failed put the carton back on the count and started a new job while
+            # the first one ran (review 2026-11-05 finding 2): wait for the cell's heartbeat to say how it ended
+            self.get_logger().warn(f'{self.sid}: cell rejected the resent {JOB_NAMES[job.kind]} pallet {job.pallet} '
+                                   f'slot {job.slot}: the first goal may be running; settling it from the cell state')
+            self.orphan, self.orphan_t = job, wallclock.monotonic()
+            return
         if not gh.accepted:
             self.get_logger().warn(f'{self.sid}: cell rejected {JOB_NAMES[job.kind]} pallet {job.pallet} slot {job.slot}')
             if job.kind == DEPALLETIZE and job.held:
@@ -147,15 +160,47 @@ class StationAgent(Node):
         elif self.req.overdue(t, self.ack_timeout):
             self.get_logger().warn(f'{self.sid}: {JOB_NAMES[self.sent_job.kind]} goal not acknowledged in '
                                    f'{self.ack_timeout:.0f} s; resending')
-            self.send(self.sent_job)
+            self.send(self.sent_job, retry=True)
         elif self.goal is not None and t - self.polled_at > self.result_poll:
             self.polled_at, gh, job = t, self.goal, self.sent_job
             self.get_logger().info(f'{self.sid}: no {JOB_NAMES[job.kind]} result after {self.result_poll:.0f} s; '
                                    'requesting it again')
             gh.get_result_async().add_done_callback(lambda f, j=job, gh=gh: self.on_result(f, j, gh))
 
+    CARTON_AFTER = {PREPARE: C_TOOL, DEPALLETIZE: C_DECK, PALLETIZE: C_PALLET}   # where a successful job leaves it
+
+    def settle_orphan(self, now):
+        """A job whose resend the busy cell rejected: follow the cell's heartbeat (newer than the rejection). BUSY: the
+        first goal runs (its 'deck_clear' serves the robot); then done with the transfer count up = succeeded; idle with
+        the count unchanged = it never ran: send it again; faulted / stopped = failed."""
+        j, c = self.orphan, self.cell_state
+        if j is None:
+            return
+        if self.st.job is not j:
+            self.orphan = None               # the station dropped it meanwhile (a fault)
+            return
+        if c is None or self.cell_rx <= self.orphan_t + 0.3:
+            return                           # no heartbeat sent after the rejection yet
+        if c.state == ArmCellState.BUSY:
+            if c.phase == 'deck_clear':
+                self.st.deck_clear(now)
+            return
+        self.orphan = None
+        if self.cycles_at_send is not None and c.cycles > self.cycles_at_send:
+            self.get_logger().info(f'{self.sid}: the unacknowledged {JOB_NAMES[j.kind]} pallet {j.pallet} slot '
+                                   f'{j.slot} completed on the cell (transfers {self.cycles_at_send} -> {c.cycles})')
+            self.st.finished(now, True, self.CARTON_AFTER[j.kind])
+        elif c.state in (ArmCellState.READY, ArmCellState.HOLDING):
+            self.get_logger().warn(f'{self.sid}: the cell is idle and never ran {JOB_NAMES[j.kind]} pallet {j.pallet} '
+                                   f'slot {j.slot}: sending it again')
+            self.send(j)
+        else:
+            self.st.finished(now, False, C_TOOL if c.carton_on_tool else C_NONE,
+                             f'cell {c.fault or "stopped"} while running an unacknowledged goal')
+
     def cell_tick(self, now, at_bay, fault):
         self.guard_lost()
+        self.settle_orphan(now)
         if fault is None and self.cell_state is not None and self.cell_state.state == ArmCellState.READY \
                 and self.st.held and self.st.job is None:
             self.st.tool_cleared(now)                        # reset with the gripper empty: a person took it off

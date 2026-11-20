@@ -104,3 +104,23 @@ def test_no_reset_when_the_dock_is_suspect_or_not_a_bay(agent):
     agent.pose = (0.4, 0.0, 0.0)
     agent.check_dock('charge_0')
     assert agent.docked and agent.sent == []
+
+
+def test_amcl_heading_off_at_the_bay_is_reset_to_the_bay_heading(agent):
+    """Review 2026-11-05 finding 3: AMCL within 0.10 m but 12 deg off (c45_truth had a 37.9 deg outlier). The cell's
+    interlock checks the heading too (10 deg), so the agent resets AMCL to the bay's heading (its entry lane: 180 deg)
+    plus the marker-measured yaw error, before reporting docked."""
+    agent.pose = (BAY[0] - 0.002, BAY[1], math.radians(180.0 - 12.0))
+    agent.check_dock('receiving_bay')
+    assert len(agent.sent) == 1 and not agent.docked
+    q = agent.sent[0].pose.pose.orientation
+    yaw = 2 * math.atan2(q.z, q.w)
+    assert abs(math.remainder(yaw - math.radians(180.5), math.tau)) < math.radians(0.1)
+    p = agent.sent[0].pose.pose.position
+    assert abs(p.x - (-14.002)) < 0.003 and abs(p.y - (7.0 + 0.001)) < 0.003   # error rotated by the bay's heading
+
+
+def test_heading_within_tolerance_is_docked_without_a_reset(agent):
+    agent.pose = (BAY[0] - 0.002, BAY[1], math.radians(180.0 - 1.5))
+    agent.check_dock('receiving_bay')
+    assert agent.sent == [] and agent.docked
