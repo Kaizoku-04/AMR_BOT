@@ -51,6 +51,7 @@ from . import auction as rules
 from .energy import (ChargeParams, ChargerPeer, DrainEstimator, bid_penalty_s, can_take, evictions, pick_charger,
                      task_need, waiting_for_charger)
 from .lane_graph import LaneGraph
+from .localization import LocWatch
 from .liveness import (LivenessParams, Pending, acked, announcer, ghost_hold, outranks, quorum, reclaimable)
 from .traffic import Peer, TrafficParams, plan_reservations, wait_chain
 
@@ -98,6 +99,13 @@ class Leg:
         self.target, self.dwell_s, self.drive_status, self.precise = target, dwell_s, drive_status, final_precise
         self.station = station           # an arm bay: the transfer ends when the station reports the task served
         self.transfer = transfer         # Transfer kind the robot's own deck performs here (bins), announced on arrival
+
+
+def _pose2d(t):
+    """(x, y, yaw) of a TransformStamped."""
+    q = t.transform.rotation
+    return (t.transform.translation.x, t.transform.translation.y,
+            math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z)))
 
 
 class SwarmAgent(Node):
@@ -285,6 +293,7 @@ class SwarmAgent(Node):
         self.retry_at = 0.0
         self.dwell_until, self.idle_since = 0.0, 0.0
         self.follow_handle, self.follow_end, self.follow_state = None, None, None
+        self.sent_path = None    # (first, last, n, nearest m, believed pose) of the last FollowPath goal
         self.route_pending, self.bid_pending = False, False
         self.route_req, self.bid_req, self.follow_req = Pending(), Pending(), Pending()
         # the dock and back-out goals: the same lost-ack resend and lost-result re-poll as FollowPath
@@ -313,6 +322,20 @@ class SwarmAgent(Node):
         self.recover_clear = dp('recover_clear_m', 2.5).value         # no robot closer than this (map frame)
         self.recover_forward = dp('recover_forward_m', 0.4).value
         self.recover_blocked_frac = 0.5
+        # A straight back-up (or forward drive) that turns the chassis is pivoting about a contact (B5r3/B5r4/B5r5: corner
+        # caught on a rack upright, +89 -> +4 deg while backing, and AMCL walked 3-4 m off meanwhile): beyond
+        # recover_pivot_deg of odometry yaw the recovery is cancelled and counts as blocked (the next one drives forward).
+        self.recover_pivot = math.radians(dp('recover_pivot_deg', 20.0).value)    # 0 = off
+        self.recov_yaw0 = None
+        # Localization watch (stall reproducer B5r3, 2026-11-21): backing out of the stall pinned on a rack upright, the
+        # robot pivoted 85 deg and AMCL walked its estimate 4 m away in 20 s (recovery_alpha 0: it never came back); every
+        # path was then rejected as 'Resulting plan has 0 poses in it' and the recoveries ran blind on the wrong pose.
+        # An AMCL correction at the robot's position above loc_jump_m within loc_window_s means the pose is lost: stop,
+        # give an empty-deck task back, report STUCK and drive nothing until an initialpose (an operator relocalizing,
+        # or the agent's own bay relocalization) arrives. 0 = off.
+        self.loc_watch = LocWatch(dp('loc_window_s', 20.0).value, dp('loc_jump_m', 1.0).value)
+        self.loc_lost, self.loc_holdoff_until = None, 0.0
+        self.create_subscription(PoseWithCovarianceStamped, 'initialpose', self.on_initialpose, 10)
         self.recoveries, self.recov_t0 = {}, None                    # leg target node -> recoveries used
         self.recov_blocked = {}                                      # leg target node -> its last recovery was blocked
         self.recov_dist, self.recov_forward_on, self.recov_ok = 0.0, False, False
@@ -614,6 +637,10 @@ class SwarmAgent(Node):
         if not self.check_peers():
             self.publish_state()           # heartbeat only until every peer is heard
             return
+        if self.loc_lost is not None:      # no bids, no driving, no energy moves on a lost pose
+            self.status = RobotState.STUCK
+            self.publish_state()
+            return
         self.check_quorum()
         self.check_requests()
         if self.has_quorum:                # isolated: no new work, no re-auctions, no energy moves (liveness rule 2)
@@ -630,6 +657,8 @@ class SwarmAgent(Node):
             self.dwell()
         elif self.phase == 'retry' and self.now() >= self.retry_at:
             self.next_leg(first=True)
+        elif self.phase == 'recovering':
+            self.watch_recovery()
         elif self.phase == 'bay_leave':                  # backing out of a bay after its task was dropped
             if self.dock_state == 'backout_wait' and self.now() >= self.dock_retry_at and not self.paused():
                 self.back_out(self.graph.name[self.route[-1]], self.backout_why)
@@ -842,7 +871,54 @@ class SwarmAgent(Node):
             # cells' 0.02 m/s interlock threshold after every dock, fleet run 2026-10-02)
             self.speed_est = 0.0 if step < 0.001 else 0.7 * self.speed_est + 0.3 * step / 0.2
         self.pose = (x, y, yaw)
+        try:
+            mo = self.tf.lookup_transform('map', 'odom', Time())
+            ob = self.tf.lookup_transform('odom', 'base_footprint', Time())
+        except Exception:
+            return True
+        self.check_localization(self.now(), _pose2d(mo), _pose2d(ob))
         return True
+
+    def check_localization(self, t, map_odom, odom_base):
+        """Feed the localization watch one sample; a correction beyond loc_jump_m -> localization_lost()."""
+        if self.loc_lost is not None:
+            return
+        if t < self.loc_holdoff_until:              # an initialpose is being applied: that jump is wanted
+            self.loc_watch.reset()
+            return
+        d = self.loc_watch.update(t, map_odom, odom_base)
+        if self.loc_watch.lost(d):
+            self.localization_lost(f'AMCL moved my pose {d:.2f} m within {self.loc_watch.window_s:.0f} s without odometry '
+                                   f'moving there')
+
+    def localization_lost(self, why):
+        """Stop on a lost pose: a path, a recovery or a reservation computed from it would be wrong (B5r3)."""
+        self.loc_lost = why
+        x, y, yaw = self.pose
+        self.get_logger().error(f'{self.rid}: localization lost: {why}; believed ({x:.2f},{y:.2f},'
+                                f'{math.degrees(yaw):+.0f}); stopping until relocalized (initialpose)')
+        self.cancel_recovery()
+        self.stop_following()
+        if self.task is not None and not self.loaded:
+            self.give_back('localization lost', stuck=True)
+        elif self.leg is not None:
+            self.legs.insert(0, self.leg); self.leg = None
+        self.phase, self.status = 'lost', RobotState.STUCK
+
+    def on_initialpose(self, m):
+        """Any initialpose (an operator in RViz, or the agent's own bay relocalization) restarts the watch; it also
+        ends a 'localization lost' stop."""
+        self.loc_watch.reset()
+        self.loc_holdoff_until = self.now() + 2.0
+        if self.loc_lost is None:
+            return
+        self.get_logger().warn(f'{self.rid}: relocalized (initialpose): resuming after "{self.loc_lost}"')
+        self.loc_lost = None
+        self.leg_fail = 0
+        if self.task is not None and self.legs:
+            self.phase, self.retry_at, self.status = 'retry', self.now(), RobotState.IDLE
+        else:
+            self.phase, self.status, self.idle_since = 'idle', RobotState.IDLE, self.now()
 
     # ------------------------------------------------------------------ auction
     def pending_tasks(self):
@@ -1709,6 +1785,9 @@ class SwarmAgent(Node):
         p.poses = self.path.poses[max(0, i0 - 1): i1 + 1]
         if len(p.poses) < 2:
             return False
+        self.sent_path = (p.poses[0].pose.position, p.poses[-1].pose.position, len(p.poses),
+                          min(math.hypot(q.pose.position.x - self.pose[0], q.pose.position.y - self.pose[1])
+                              for q in p.poses), self.pose)
         g = FollowPath.Goal(); g.path = p; g.controller_id = 'FollowPath'
         g.goal_checker_id = 'precise_goal_checker' if precise else 'general_goal_checker'
         self.follow_state = GoalStatus.STATUS_EXECUTING
@@ -1731,6 +1810,16 @@ class SwarmAgent(Node):
     def on_follow_done(self, h, r):
         if h is self.follow_handle:
             self.follow_state = r.result().status
+            res = r.result().result
+            if res.error_code == FollowPath.Result.INVALID_PATH and self.sent_path:
+                # MPPI's 'Resulting plan has 0 poses in it': the path's nearest pose lies outside the local costmap
+                # around the believed pose. Tell a wrong belief (AMCL) from a wrong slice (agent) from a stale costmap
+                # window: the believed pose at send time and the slice's nearest distance to it (B5r2, 2026-11-21).
+                a, b, n, d, (x, y, yaw) = self.sent_path
+                self.get_logger().warn(
+                    f'{self.rid}: FollowPath rejected the path (error {res.error_code} {res.error_msg}): believed '
+                    f'({x:.2f},{y:.2f},{math.degrees(yaw):+.0f}), sent {n} poses ({a.x:.2f},{a.y:.2f}) -> '
+                    f'({b.x:.2f},{b.y:.2f}), nearest {d:.2f} m', throttle_duration_sec=5.0)
 
     def stop_following(self):
         if self.follow_handle is not None:
@@ -1808,6 +1897,7 @@ class SwarmAgent(Node):
         if self.clear_local.service_is_ready():
             self.clear_local.call_async(ClearEntireCostmap.Request())
         self.phase, self.recov_t0, self.recov_from = 'recovering', self.now(), (self.pose, self.odom_pose())
+        self.recov_yaw0 = self.odom_yaw()
         self.recov_dist, self.recov_forward_on, self.recov_ok = back, forward, False
         g = (DriveOnHeading if forward else BackUp).Goal(
             speed=self.backout_speed, time_allowance=Duration(sec=int(back / self.backout_speed) + 10))
@@ -1846,17 +1936,41 @@ class SwarmAgent(Node):
             self.recov_blocked[self.leg.target] = not self.recov_ok or d < self.recover_blocked_frac * self.recov_dist
         self.recov_ok = False
         self.recov_req.clear(); self.recov_handle, self.recov_t0, self.recov_from = None, None, None
+        self.recov_yaw0 = None
         self.get_logger().info(f'{self.rid}: recovery: {why}, moved {d:.2f} m; planning the leg again')
         self.moved_gate = None
         if self.leg is not None:
             self.legs.insert(0, self.leg); self.leg = None
         self.phase, self.retry_at = 'retry', self.now()
 
+    def watch_recovery(self):
+        """Cancel a straight recovery whose chassis turns more than recover_pivot_deg (pivoting on a contact)."""
+        if self.recover_pivot <= 0.0 or self.recov_yaw0 is None:
+            return
+        yaw = self.odom_yaw()
+        if yaw is None:
+            return
+        turned = abs(math.atan2(math.sin(yaw - self.recov_yaw0), math.cos(yaw - self.recov_yaw0)))
+        if turned > self.recover_pivot:
+            if self.recov_handle is not None:
+                self.recov_handle.cancel_goal_async()
+            self.recov_ok = False
+            self.recovery_done(f'the chassis turned {math.degrees(turned):.0f} deg on a straight recovery (pivoting on a '
+                               f'contact): stopped')
+
+    def odom_yaw(self):
+        """Yaw of base_footprint in odom, None if the transform is unavailable."""
+        try:
+            t = self.tf.lookup_transform('odom', 'base_footprint', Time())
+        except Exception:
+            return None
+        return _pose2d(t)[2]
+
     def cancel_recovery(self):
         if self.recov_handle is not None:
             self.recov_handle.cancel_goal_async()
         self.recov_req.clear()
-        self.recov_handle, self.recov_t0, self.recov_from = None, None, None
+        self.recov_handle, self.recov_t0, self.recov_from, self.recov_yaw0 = None, None, None, None
 
     def leave_bay(self, retry=False):
         """Leave the transfer spot. From an arm bay, first back straight out bay_exit_backup_m, then next_leg() plans
