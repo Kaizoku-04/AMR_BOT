@@ -285,6 +285,7 @@ class SwarmAgent(Node):
         self.retry_at = 0.0
         self.dwell_until, self.idle_since = 0.0, 0.0
         self.follow_handle, self.follow_end, self.follow_state = None, None, None
+        self.sent_path = None    # (first, last, n, nearest m, believed pose) of the last FollowPath goal
         self.route_pending, self.bid_pending = False, False
         self.route_req, self.bid_req, self.follow_req = Pending(), Pending(), Pending()
         # the dock and back-out goals: the same lost-ack resend and lost-result re-poll as FollowPath
@@ -1709,6 +1710,9 @@ class SwarmAgent(Node):
         p.poses = self.path.poses[max(0, i0 - 1): i1 + 1]
         if len(p.poses) < 2:
             return False
+        self.sent_path = (p.poses[0].pose.position, p.poses[-1].pose.position, len(p.poses),
+                          min(math.hypot(q.pose.position.x - self.pose[0], q.pose.position.y - self.pose[1])
+                              for q in p.poses), self.pose)
         g = FollowPath.Goal(); g.path = p; g.controller_id = 'FollowPath'
         g.goal_checker_id = 'precise_goal_checker' if precise else 'general_goal_checker'
         self.follow_state = GoalStatus.STATUS_EXECUTING
@@ -1731,6 +1735,16 @@ class SwarmAgent(Node):
     def on_follow_done(self, h, r):
         if h is self.follow_handle:
             self.follow_state = r.result().status
+            res = r.result().result
+            if res.error_code == FollowPath.Result.INVALID_PATH and self.sent_path:
+                # MPPI's 'Resulting plan has 0 poses in it': the path's nearest pose lies outside the local costmap
+                # around the believed pose. Tell a wrong belief (AMCL) from a wrong slice (agent) from a stale costmap
+                # window: the believed pose at send time and the slice's nearest distance to it (B5r2, 2026-11-21).
+                a, b, n, d, (x, y, yaw) = self.sent_path
+                self.get_logger().warn(
+                    f'{self.rid}: FollowPath rejected the path (error {res.error_code} {res.error_msg}): believed '
+                    f'({x:.2f},{y:.2f},{math.degrees(yaw):+.0f}), sent {n} poses ({a.x:.2f},{a.y:.2f}) -> '
+                    f'({b.x:.2f},{b.y:.2f}), nearest {d:.2f} m', throttle_duration_sec=5.0)
 
     def stop_following(self):
         if self.follow_handle is not None:
