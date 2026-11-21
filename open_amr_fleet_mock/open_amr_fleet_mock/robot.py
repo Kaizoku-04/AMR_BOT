@@ -128,6 +128,7 @@ class MockRobot:
         self.stuck_since, self.station_down_since = None, None
         # views from messages
         self.tasks, self.bids, self.my_bids, self.decided = {}, {}, set(), set()
+        self.first_seen = {}                 # task_id -> stamp of the first offer heard (as the agent: a re-offer renews it)
         self.claims, self.claim_round, self.done, self.reclaimed = {}, {}, set(), set()
         self.peers, self.stations, self.released = {}, {}, {}
         # failure injection
@@ -191,6 +192,7 @@ class MockRobot:
         cur = self.tasks.get(m.task_id)
         if cur is None or m.round >= cur.round:
             self.tasks[m.task_id] = m
+        self.first_seen.setdefault(m.task_id, stamp_s(m.stamp))
         if self.task is not None and m.task_id == self.task.task_id and m.dest_id and \
                 m.dest_id != self.task.dest_id and self.loaded:
             self.say(f'WMS re-targets {m.task_id} to {m.dest_id} (was {self.task.dest_id})')
@@ -288,7 +290,7 @@ class MockRobot:
         if not self.available():
             return
         pending = sorted((t for t in self.tasks.values() if t.task_id not in self.claims and t.task_id not in self.done),
-                         key=lambda t: rules.task_order(t.priority, stamp_s(t.stamp), t.task_id))
+                         key=lambda t: rules.task_order(t.priority, self.first_seen.get(t.task_id, stamp_s(t.stamp)), t.task_id))
         cut = None
         for t in pending:
             key = (t.task_id, t.round)
