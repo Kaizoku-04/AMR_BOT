@@ -51,6 +51,7 @@ from . import auction as rules
 from .energy import (ChargeParams, ChargerPeer, DrainEstimator, bid_penalty_s, can_take, evictions, pick_charger,
                      task_need, waiting_for_charger)
 from .lane_graph import LaneGraph
+from .localization import LocWatch
 from .liveness import (LivenessParams, Pending, acked, announcer, ghost_hold, outranks, quorum, reclaimable)
 from .traffic import Peer, TrafficParams, plan_reservations, wait_chain
 
@@ -98,6 +99,13 @@ class Leg:
         self.target, self.dwell_s, self.drive_status, self.precise = target, dwell_s, drive_status, final_precise
         self.station = station           # an arm bay: the transfer ends when the station reports the task served
         self.transfer = transfer         # Transfer kind the robot's own deck performs here (bins), announced on arrival
+
+
+def _pose2d(t):
+    """(x, y, yaw) of a TransformStamped."""
+    q = t.transform.rotation
+    return (t.transform.translation.x, t.transform.translation.y,
+            math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z)))
 
 
 class SwarmAgent(Node):
@@ -314,6 +322,15 @@ class SwarmAgent(Node):
         self.recover_clear = dp('recover_clear_m', 2.5).value         # no robot closer than this (map frame)
         self.recover_forward = dp('recover_forward_m', 0.4).value
         self.recover_blocked_frac = 0.5
+        # Localization watch (stall reproducer B5r3, 2026-11-21): backing out of the stall pinned on a rack upright, the
+        # robot pivoted 85 deg and AMCL walked its estimate 4 m away in 20 s (recovery_alpha 0: it never came back); every
+        # path was then rejected as 'Resulting plan has 0 poses in it' and the recoveries ran blind on the wrong pose.
+        # An AMCL correction at the robot's position above loc_jump_m within loc_window_s means the pose is lost: stop,
+        # give an empty-deck task back, report STUCK and drive nothing until an initialpose (an operator relocalizing,
+        # or the agent's own bay relocalization) arrives. 0 = off.
+        self.loc_watch = LocWatch(dp('loc_window_s', 20.0).value, dp('loc_jump_m', 1.0).value)
+        self.loc_lost, self.loc_holdoff_until = None, 0.0
+        self.create_subscription(PoseWithCovarianceStamped, 'initialpose', self.on_initialpose, 10)
         self.recoveries, self.recov_t0 = {}, None                    # leg target node -> recoveries used
         self.recov_blocked = {}                                      # leg target node -> its last recovery was blocked
         self.recov_dist, self.recov_forward_on, self.recov_ok = 0.0, False, False
@@ -615,6 +632,10 @@ class SwarmAgent(Node):
         if not self.check_peers():
             self.publish_state()           # heartbeat only until every peer is heard
             return
+        if self.loc_lost is not None:      # no bids, no driving, no energy moves on a lost pose
+            self.status = RobotState.STUCK
+            self.publish_state()
+            return
         self.check_quorum()
         self.check_requests()
         if self.has_quorum:                # isolated: no new work, no re-auctions, no energy moves (liveness rule 2)
@@ -843,7 +864,54 @@ class SwarmAgent(Node):
             # cells' 0.02 m/s interlock threshold after every dock, fleet run 2026-10-02)
             self.speed_est = 0.0 if step < 0.001 else 0.7 * self.speed_est + 0.3 * step / 0.2
         self.pose = (x, y, yaw)
+        try:
+            mo = self.tf.lookup_transform('map', 'odom', Time())
+            ob = self.tf.lookup_transform('odom', 'base_footprint', Time())
+        except Exception:
+            return True
+        self.check_localization(self.now(), _pose2d(mo), _pose2d(ob))
         return True
+
+    def check_localization(self, t, map_odom, odom_base):
+        """Feed the localization watch one sample; a correction beyond loc_jump_m -> localization_lost()."""
+        if self.loc_lost is not None:
+            return
+        if t < self.loc_holdoff_until:              # an initialpose is being applied: that jump is wanted
+            self.loc_watch.reset()
+            return
+        d = self.loc_watch.update(t, map_odom, odom_base)
+        if self.loc_watch.lost(d):
+            self.localization_lost(f'AMCL moved my pose {d:.2f} m within {self.loc_watch.window_s:.0f} s without odometry '
+                                   f'moving there')
+
+    def localization_lost(self, why):
+        """Stop on a lost pose: a path, a recovery or a reservation computed from it would be wrong (B5r3)."""
+        self.loc_lost = why
+        x, y, yaw = self.pose
+        self.get_logger().error(f'{self.rid}: localization lost: {why}; believed ({x:.2f},{y:.2f},'
+                                f'{math.degrees(yaw):+.0f}); stopping until relocalized (initialpose)')
+        self.cancel_recovery()
+        self.stop_following()
+        if self.task is not None and not self.loaded:
+            self.give_back('localization lost', stuck=True)
+        elif self.leg is not None:
+            self.legs.insert(0, self.leg); self.leg = None
+        self.phase, self.status = 'lost', RobotState.STUCK
+
+    def on_initialpose(self, m):
+        """Any initialpose (an operator in RViz, or the agent's own bay relocalization) restarts the watch; it also
+        ends a 'localization lost' stop."""
+        self.loc_watch.reset()
+        self.loc_holdoff_until = self.now() + 2.0
+        if self.loc_lost is None:
+            return
+        self.get_logger().warn(f'{self.rid}: relocalized (initialpose): resuming after "{self.loc_lost}"')
+        self.loc_lost = None
+        self.leg_fail = 0
+        if self.task is not None and self.legs:
+            self.phase, self.retry_at, self.status = 'retry', self.now(), RobotState.IDLE
+        else:
+            self.phase, self.status, self.idle_since = 'idle', RobotState.IDLE, self.now()
 
     # ------------------------------------------------------------------ auction
     def pending_tasks(self):
