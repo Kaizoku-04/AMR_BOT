@@ -322,6 +322,11 @@ class SwarmAgent(Node):
         self.recover_clear = dp('recover_clear_m', 2.5).value         # no robot closer than this (map frame)
         self.recover_forward = dp('recover_forward_m', 0.4).value
         self.recover_blocked_frac = 0.5
+        # A straight back-up (or forward drive) that turns the chassis is pivoting about a contact (B5r3/B5r4/B5r5: corner
+        # caught on a rack upright, +89 -> +4 deg while backing, and AMCL walked 3-4 m off meanwhile): beyond
+        # recover_pivot_deg of odometry yaw the recovery is cancelled and counts as blocked (the next one drives forward).
+        self.recover_pivot = math.radians(dp('recover_pivot_deg', 20.0).value)    # 0 = off
+        self.recov_yaw0 = None
         # Localization watch (stall reproducer B5r3, 2026-11-21): backing out of the stall pinned on a rack upright, the
         # robot pivoted 85 deg and AMCL walked its estimate 4 m away in 20 s (recovery_alpha 0: it never came back); every
         # path was then rejected as 'Resulting plan has 0 poses in it' and the recoveries ran blind on the wrong pose.
@@ -652,6 +657,8 @@ class SwarmAgent(Node):
             self.dwell()
         elif self.phase == 'retry' and self.now() >= self.retry_at:
             self.next_leg(first=True)
+        elif self.phase == 'recovering':
+            self.watch_recovery()
         elif self.phase == 'bay_leave':                  # backing out of a bay after its task was dropped
             if self.dock_state == 'backout_wait' and self.now() >= self.dock_retry_at and not self.paused():
                 self.back_out(self.graph.name[self.route[-1]], self.backout_why)
@@ -1890,6 +1897,7 @@ class SwarmAgent(Node):
         if self.clear_local.service_is_ready():
             self.clear_local.call_async(ClearEntireCostmap.Request())
         self.phase, self.recov_t0, self.recov_from = 'recovering', self.now(), (self.pose, self.odom_pose())
+        self.recov_yaw0 = self.odom_yaw()
         self.recov_dist, self.recov_forward_on, self.recov_ok = back, forward, False
         g = (DriveOnHeading if forward else BackUp).Goal(
             speed=self.backout_speed, time_allowance=Duration(sec=int(back / self.backout_speed) + 10))
@@ -1928,17 +1936,41 @@ class SwarmAgent(Node):
             self.recov_blocked[self.leg.target] = not self.recov_ok or d < self.recover_blocked_frac * self.recov_dist
         self.recov_ok = False
         self.recov_req.clear(); self.recov_handle, self.recov_t0, self.recov_from = None, None, None
+        self.recov_yaw0 = None
         self.get_logger().info(f'{self.rid}: recovery: {why}, moved {d:.2f} m; planning the leg again')
         self.moved_gate = None
         if self.leg is not None:
             self.legs.insert(0, self.leg); self.leg = None
         self.phase, self.retry_at = 'retry', self.now()
 
+    def watch_recovery(self):
+        """Cancel a straight recovery whose chassis turns more than recover_pivot_deg (pivoting on a contact)."""
+        if self.recover_pivot <= 0.0 or self.recov_yaw0 is None:
+            return
+        yaw = self.odom_yaw()
+        if yaw is None:
+            return
+        turned = abs(math.atan2(math.sin(yaw - self.recov_yaw0), math.cos(yaw - self.recov_yaw0)))
+        if turned > self.recover_pivot:
+            if self.recov_handle is not None:
+                self.recov_handle.cancel_goal_async()
+            self.recov_ok = False
+            self.recovery_done(f'the chassis turned {math.degrees(turned):.0f} deg on a straight recovery (pivoting on a '
+                               f'contact): stopped')
+
+    def odom_yaw(self):
+        """Yaw of base_footprint in odom, None if the transform is unavailable."""
+        try:
+            t = self.tf.lookup_transform('odom', 'base_footprint', Time())
+        except Exception:
+            return None
+        return _pose2d(t)[2]
+
     def cancel_recovery(self):
         if self.recov_handle is not None:
             self.recov_handle.cancel_goal_async()
         self.recov_req.clear()
-        self.recov_handle, self.recov_t0, self.recov_from = None, None, None
+        self.recov_handle, self.recov_t0, self.recov_from, self.recov_yaw0 = None, None, None, None
 
     def leave_bay(self, retry=False):
         """Leave the transfer spot. From an arm bay, first back straight out bay_exit_backup_m, then next_leg() plans

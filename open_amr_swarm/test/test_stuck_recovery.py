@@ -313,3 +313,51 @@ def test_the_watchdog_uses_the_distance_actually_sent(agent):
     a.t = a.recov_t0 + 0.4 / a.backout_speed + 26.0
     a.check_requests()
     assert a.phase == 'retry'
+
+
+# B5r3/B5r4/B5r5 (2026-11-21): recovery 1's straight back-up turned the chassis +89 -> +4 deg (corner caught on a rack
+# upright) and AMCL walked 3-4 m off meanwhile. A straight recovery that turns the chassis more than recover_pivot_deg
+# is cancelled and counts as blocked, so the next one drives forward.
+class _Handle:
+    def __init__(self):
+        self.cancelled = False
+
+    def cancel_goal_async(self):
+        self.cancelled = True
+
+
+def test_back_up_that_pivots_the_chassis_is_cancelled_and_counts_as_blocked(agent):
+    a = agent
+    yaw = [1.55]
+    a.odom_yaw = lambda: yaw[0]
+    drive_to_bay(a)
+    a.drive()
+    assert a.phase == 'recovering' and a.recov_yaw0 == 1.55
+    a.recov_handle = h = _Handle()
+    yaw[0] = 1.55 - math.radians(15.0)
+    a.watch_recovery()
+    assert a.phase == 'recovering' and not h.cancelled          # 15 deg: still backing
+    yaw[0] = 1.55 - math.radians(25.0)
+    a.watch_recovery()
+    assert h.cancelled and a.phase == 'retry' and a.recov_blocked[4] and a.recov_yaw0 is None
+    a.t += 1.0
+    a.leg_fail = a.recover_after
+    a.next_leg = lambda first=False: None
+    a.leg, a.phase, a.follow_state = a.legs.pop(0), 'driving', GoalStatus.STATUS_ABORTED
+    a.drive()
+    assert a.phase == 'recovering' and len(a.forwards) == 1      # the next recovery drives forward
+
+
+def test_pivot_watch_off_and_without_odometry(agent):
+    a = agent
+    a.recover_pivot = 0.0
+    a.odom_yaw = lambda: 0.0
+    drive_to_bay(a)
+    a.drive()
+    a.recov_yaw0 = 1.5
+    a.watch_recovery()
+    assert a.phase == 'recovering'
+    a.recover_pivot = math.radians(20.0)
+    a.odom_yaw = lambda: None
+    a.watch_recovery()
+    assert a.phase == 'recovering'
