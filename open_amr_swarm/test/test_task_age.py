@@ -56,7 +56,13 @@ def test_a_reoffered_old_task_sorts_before_a_newer_one(agent):
     assert [t.task_id for t in agent.pending_tasks()] == ['t_old', 't_new']
 
 
-def test_default_bids_on_any_open_round(agent):
+def test_strict_order_is_the_default(agent):
+    """ADR-049: on unless a launch says bid_strict_order:=false (the fixture sets no such parameter)."""
+    assert agent.strict_order is True
+
+
+def test_off_bids_on_any_open_round(agent):
+    agent.strict_order = False
     offer(agent, 't_old', 'n3', 100.0)
     offer(agent, 't_old', 'n3', 149.0, rnd=12)    # its round closed at 150.5
     offer(agent, 't_new', 'n5', 150.8)            # open until 152.3

@@ -102,7 +102,9 @@ class SwarmAgent(Node):
         # round result or re-offer instead of bidding on later ones (a freed robot bid on every open round and took the one
         # that closed first, so old tasks starved: c65 t0013 open 682 s of 900 s while robots bid eligibly on it and won
         # newer tasks). A task whose round closed more than strict_wait_s ago (the WMS stopped offering it) is skipped.
-        self.strict_order = dp('bid_strict_order', False).value
+        # Default on since ADR-049 (2026-11-21): two strict shifts held the offered -> claimed max at 262 / 261 s against
+        # 398-682 s without it, at 76/h both times (c68_strict, c69_strict2 vs c65, c67: 72/h); the median wait rose.
+        self.strict_order = dp('bid_strict_order', True).value
         self.strict_wait = dp('strict_wait_s', 6.0).value
         self.station_dwell = dp('station_dwell_s', 8.0).value
         self.bin_dwell = dp('bin_dwell_s', 4.0).value
